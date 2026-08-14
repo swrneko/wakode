@@ -1,0 +1,13 @@
+[workspace]
+resolver = "3"
+members = ["crates/wakode-core"]
+
+[workspace.package]
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[workspace.dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+chrono-tz = "0.10"
+serde = { version = "1", features = ["derive"] }
+proptest = "1"
