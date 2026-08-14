@@ -516,7 +516,9 @@ git commit -m "feat(core): конфигурация движка длитель�
 
 **Interfaces:**
 - Consumes: `Heartbeat`, `Attrs`, `Micros`, `DurationConfig`.
-- Produces: `Interval { start: Micros, end: Micros, attrs: Attrs }` с методом `duration(self) -> Micros`; функция `build_intervals(heartbeats: &[Heartbeat], cfg: DurationConfig) -> Vec<Interval>`.
+- Produces: `Interval { start: Micros, end: Micros, attrs: Attrs }` с методом `duration(self) -> Micros`; функция `build_intervals(heartbeats: &[Heartbeat], _cfg: DurationConfig) -> Vec<Interval>`.
+
+Параметр конфигурации в этой задаче ещё не используется — отсюда подчёркивание в имени. Разрыв сессии по таймауту появится в Task 5 вместе с тестами, которые его требуют.
 
 - [ ] **Step 1: Написать падающий тест**
 
@@ -630,9 +632,9 @@ impl Interval {
 
 /// Превращает поток отметок в непересекающиеся интервалы.
 ///
-/// Каждая пара соседних по времени отметок даёт интервал, если разрыв между
-/// ними не превышает таймаута. Интервал наследует атрибуты более ранней из пары.
-pub fn build_intervals(heartbeats: &[Heartbeat], cfg: DurationConfig) -> Vec<Interval> {
+/// Каждая пара соседних по времени отметок даёт интервал; интервал наследует
+/// атрибуты более ранней из пары.
+pub fn build_intervals(heartbeats: &[Heartbeat], _cfg: DurationConfig) -> Vec<Interval> {
     if heartbeats.is_empty() {
         return Vec::new();
     }
@@ -643,9 +645,6 @@ pub fn build_intervals(heartbeats: &[Heartbeat], cfg: DurationConfig) -> Vec<Int
     let mut out = Vec::with_capacity(sorted.len());
     for (i, hb) in sorted.iter().enumerate() {
         let Some(next) = sorted.get(i + 1) else { continue };
-        if next.time.saturating_sub(hb.time) > cfg.timeout() {
-            continue;
-        }
         if next.time > hb.time {
             out.push(Interval { start: hb.time, end: next.time, attrs: hb.attrs });
         }
@@ -716,16 +715,50 @@ git commit -m "feat(core): склейка соседних отметок в и�
     }
 ```
 
-- [ ] **Step 2: Запустить тесты**
+- [ ] **Step 2: Запустить тесты и убедиться, что они падают**
 
 Run: `cargo test -p wakode-core`
-Expected: PASS — поведение уже реализовано в Task 4 через `continue` при превышении таймаута. Если хоть один тест падает, значит граница сравнения перепутана: должно быть `> cfg.timeout()`, а не `>=`.
+Expected: FAIL на `gap_longer_than_timeout_breaks_the_session` — пауза в 901 секунду пока даёт интервал, потому что таймаут ещё не учитывается
 
-- [ ] **Step 3: Коммит**
+- [ ] **Step 3: Реализовать разрыв сессии**
+
+В `crates/wakode-core/src/intervals.rs` переименовать параметр `_cfg` в `cfg` и добавить проверку внутрь цикла:
+
+```rust
+pub fn build_intervals(heartbeats: &[Heartbeat], cfg: DurationConfig) -> Vec<Interval> {
+    if heartbeats.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sorted = heartbeats.to_vec();
+    sorted.sort_unstable();
+
+    let mut out = Vec::with_capacity(sorted.len());
+    for (i, hb) in sorted.iter().enumerate() {
+        let Some(next) = sorted.get(i + 1) else { continue };
+        // Пауза длиннее таймаута означает, что пользователь ушёл: это время не
+        // засчитывается никому. Граница включительная — ровно таймаут ещё считается.
+        if next.time.saturating_sub(hb.time) > cfg.timeout() {
+            continue;
+        }
+        if next.time > hb.time {
+            out.push(Interval { start: hb.time, end: next.time, attrs: hb.attrs });
+        }
+    }
+    out
+}
+```
+
+- [ ] **Step 4: Запустить тесты**
+
+Run: `cargo test -p wakode-core`
+Expected: PASS, восемнадцать тестов
+
+- [ ] **Step 5: Коммит**
 
 ```bash
 git add crates/wakode-core
-git commit -m "test(core): разрыв сессии по таймауту"
+git commit -m "feat(core): разрыв сессии по таймауту"
 ```
 
 ---
