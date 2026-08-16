@@ -22,7 +22,9 @@ impl Interval {
 /// Каждая пара соседних по времени отметок даёт интервал, если разрыв между
 /// ними не превышает `cfg.timeout()`; интервал наследует атрибуты более
 /// ранней из пары. Разрыв длиннее таймаута обрывает сессию — время паузы не
-/// засчитывается никому. Хвостовая добавка последней отметке появится позже.
+/// засчитывается никому. Последняя отметка сессии (та, у которой нет пары в
+/// пределах таймаута) получает хвостовую добавку `cfg.tail_padding()` — при
+/// нулевой добавке интервал не порождается, так же как без неё.
 pub fn build_intervals(heartbeats: &[Heartbeat], cfg: DurationConfig) -> Vec<Interval> {
     if heartbeats.is_empty() {
         return Vec::new();
@@ -33,14 +35,15 @@ pub fn build_intervals(heartbeats: &[Heartbeat], cfg: DurationConfig) -> Vec<Int
 
     let mut out = Vec::with_capacity(sorted.len());
     for (i, hb) in sorted.iter().enumerate() {
-        let Some(next) = sorted.get(i + 1) else { continue };
-        // Пауза длиннее таймаута означает, что пользователь ушёл: это время не
-        // засчитывается никому. Граница включительная — ровно таймаут ещё считается.
-        if next.time.saturating_sub(hb.time) > cfg.timeout() {
-            continue;
-        }
-        if next.time > hb.time {
-            out.push(Interval { start: hb.time, end: next.time, attrs: hb.attrs });
+        let end = match sorted.get(i + 1) {
+            // Следующая отметка в пределах таймаута — интервал тянется до неё.
+            // Граница включительная — ровно таймаут ещё та же сессия.
+            Some(next) if next.time.saturating_sub(hb.time) <= cfg.timeout() => next.time,
+            // Иначе это последняя отметка сессии: ей начисляется хвостовая добавка.
+            _ => hb.time.saturating_add(cfg.tail_padding()),
+        };
+        if end > hb.time {
+            out.push(Interval { start: hb.time, end, attrs: hb.attrs });
         }
     }
     out
@@ -143,5 +146,46 @@ mod tests {
         assert_eq!(intervals[0].duration(), Micros::from_secs(60));
         assert_eq!(intervals[1].start, Micros::from_secs(5000));
         assert_eq!(intervals[1].duration(), Micros::from_secs(60));
+    }
+
+    #[test]
+    fn last_heartbeat_of_a_session_gets_tail_padding() {
+        // У последней отметки сессии нет пары, поэтому ей начисляется добавка.
+        // Величина, которую использует WakaTime, неизвестна — здесь она задана явно.
+        let cfg = DurationConfig::new(Micros::from_secs(900), Micros::from_secs(120)).unwrap();
+        let intervals = build_intervals(&[hb(0, 1), hb(60, 1)], cfg);
+
+        assert_eq!(intervals.len(), 2);
+        assert_eq!(intervals[1].start, Micros::from_secs(60));
+        assert_eq!(intervals[1].end, Micros::from_secs(180));
+        assert_eq!(intervals[1].attrs.project, Some(Sid(1)));
+    }
+
+    #[test]
+    fn each_session_gets_its_own_tail_padding() {
+        let cfg = DurationConfig::new(Micros::from_secs(900), Micros::from_secs(60)).unwrap();
+        let intervals = build_intervals(&[hb(0, 1), hb(5000, 2)], cfg);
+
+        assert_eq!(intervals.len(), 2);
+        assert_eq!(intervals[0].end, Micros::from_secs(60));
+        assert_eq!(intervals[1].end, Micros::from_secs(5060));
+    }
+
+    #[test]
+    fn zero_padding_produces_no_tail_interval() {
+        let cfg = DurationConfig::new(Micros::from_secs(900), Micros::ZERO).unwrap();
+        let intervals = build_intervals(&[hb(0, 1), hb(60, 1)], cfg);
+
+        assert_eq!(intervals.len(), 1);
+    }
+
+    #[test]
+    fn single_heartbeat_produces_only_padding() {
+        let cfg = DurationConfig::new(Micros::from_secs(900), Micros::from_secs(30)).unwrap();
+        let intervals = build_intervals(&[hb(100, 7)], cfg);
+
+        assert_eq!(intervals.len(), 1);
+        assert_eq!(intervals[0].start, Micros::from_secs(100));
+        assert_eq!(intervals[0].end, Micros::from_secs(130));
     }
 }
