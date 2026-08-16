@@ -20,14 +20,15 @@ where
     K: Copy + Eq + Hash + Ord,
     F: Fn(&Attrs) -> K,
 {
-    let mut totals: HashMap<K, i64> = HashMap::new();
+    let mut totals: HashMap<K, Micros> = HashMap::new();
     for iv in intervals {
-        *totals.entry(key_of(&iv.attrs)).or_insert(0) += iv.duration().get();
+        let entry = totals.entry(key_of(&iv.attrs)).or_insert(Micros::ZERO);
+        *entry = entry.saturating_add(iv.duration());
     }
 
     let mut out: Vec<Bucket<K>> = totals
         .into_iter()
-        .map(|(key, total)| Bucket { key, total: Micros::new(total) })
+        .map(|(key, total)| Bucket { key, total })
         .collect();
     // Сначала по убыванию времени, при равенстве — по ключу: результат обязан
     // быть детерминированным, иначе снапшот-тесты совместимого слоя поплывут.
@@ -37,7 +38,10 @@ where
 
 /// Суммарная длительность всех интервалов без группировки.
 pub fn grand_total(intervals: &[Interval]) -> Micros {
-    Micros::new(intervals.iter().map(|iv| iv.duration().get()).sum())
+    intervals
+        .iter()
+        .map(|iv| iv.duration())
+        .fold(Micros::ZERO, Micros::saturating_add)
 }
 
 /// Доля `part` от `whole` в процентах.
@@ -61,6 +65,26 @@ mod tests {
         Interval {
             start: Micros::from_secs(start),
             end: Micros::from_secs(end),
+            attrs: Attrs {
+                entity: Sid(project),
+                kind: EntityKind::File,
+                category: Category::Coding,
+                project: Some(Sid(project)),
+                branch: None,
+                language: None,
+                editor: None,
+                os: None,
+                machine: None,
+            },
+        }
+    }
+
+    /// Интервал длиной почти в `i64::MAX` микросекунд — используется для проверки
+    /// того, что суммирование не переполняется, а насыщается.
+    fn huge_interval(project: u32) -> Interval {
+        Interval {
+            start: Micros::ZERO,
+            end: Micros::new(i64::MAX),
             attrs: Attrs {
                 entity: Sid(project),
                 kind: EntityKind::File,
@@ -172,5 +196,22 @@ mod tests {
 
         let sum: i64 = buckets.iter().map(|b| b.total.get()).sum();
         assert_eq!(sum, grand_total(&intervals).get());
+    }
+
+    #[test]
+    fn aggregate_by_saturates_instead_of_overflowing() {
+        // Две длительности, каждая почти i64::MAX, попадают в один бакет.
+        // Сырое сложение i64 переполнилось бы; Micros обязан насытиться.
+        let intervals = [huge_interval(1), huge_interval(1)];
+        let buckets = aggregate_by(&intervals, |a| a.project);
+
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].total, Micros::new(i64::MAX));
+    }
+
+    #[test]
+    fn grand_total_saturates_instead_of_overflowing() {
+        let intervals = [huge_interval(1), huge_interval(2)];
+        assert_eq!(grand_total(&intervals), Micros::new(i64::MAX));
     }
 }
