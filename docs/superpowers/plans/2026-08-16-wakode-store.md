@@ -1024,6 +1024,41 @@ mod tests {
             dedup_hash(user, time, &none, true),
             dedup_hash(user, time, &zero, true)
         );
+
+        // То же самое для ветки: механизм у неё общий с проектом, значит и
+        // сломать его можно одной правкой на оба поля сразу.
+        let mut none = attrs();
+        none.branch = None;
+        let mut zero = attrs();
+        zero.branch = Some(Sid(0));
+
+        assert_ne!(
+            dedup_hash(user, time, &none, true),
+            dedup_hash(user, time, &zero, true)
+        );
+    }
+
+    #[test]
+    fn client_environment_stays_out_of_the_hash() {
+        // Язык, редактор, ОС и машина в хеш не идут: одну и ту же работу cli
+        // может дослать из другой сборки плагина, и отметка не должна из-за
+        // этого стать «новой». Инвариант проверяется тестом, а не только
+        // комментарием: случайно скормить лишнее поле — однострочная правка,
+        // после которой перестанут узнаваться все уже записанные отметки.
+        let user = Uuid::now_v7();
+        let time = Micros::from_secs(1);
+        let base = dedup_hash(user, time, &attrs(), true);
+
+        for mutate in [
+            (|a: &mut Attrs| a.language = Some(Sid(777))) as fn(&mut Attrs),
+            |a: &mut Attrs| a.editor = Some(Sid(777)),
+            |a: &mut Attrs| a.os = Some(Sid(777)),
+            |a: &mut Attrs| a.machine = Some(Sid(777)),
+        ] {
+            let mut changed = attrs();
+            mutate(&mut changed);
+            assert_eq!(dedup_hash(user, time, &changed, true), base);
+        }
     }
 }
 ```
