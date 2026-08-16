@@ -444,7 +444,16 @@ fn the_marked_day_is_local_not_utc() {
 }
 
 #[test]
-fn a_duplicate_does_not_widen_the_marked_days() {
+fn resending_a_batch_does_not_multiply_marked_days() {
+    // Внимание: этот тест НЕ проверяет фильтр по `Outcome::Inserted` в
+    // `insert_heartbeats` — и никакой тест волны 0 его не проверит. Повтор
+    // по определению несёт то же время, что и уже вставленная отметка,
+    // значит и тот же локальный день, а тот помечен ещё при первой вставке.
+    // Снимать пометки будет волна 1; до неё разницы между «мерить по всему
+    // батчу» и «мерить по вставленному» снаружи не видно.
+    //
+    // Что тест правда проверяет: повторная доставка очереди cli — штатный
+    // сценарий, она не падает и не плодит вторую строку на тот же день.
     let mut conn = open_in_memory().unwrap();
     migrate(&mut conn).unwrap();
     let user = insert_user(&conn, &a_user("swrneko")).unwrap();
@@ -453,10 +462,6 @@ fn a_duplicate_does_not_widen_the_marked_days() {
     let batch = [incoming(1_755_000_000, "src/main.rs", Some("wakode"))];
     insert_heartbeats(&mut conn, &interner, user.id, &batch, user.timezone).unwrap();
 
-    // Отправка того же батча второй раз ничего не вставляет — только это и
-    // проверяется здесь: список помеченных дней не расширяется сверх уже
-    // помеченного. Снятие пометки (например, после пересчёта волной 1) —
-    // не забота этого теста и не забота этой функции.
     let second = insert_heartbeats(&mut conn, &interner, user.id, &batch, user.timezone).unwrap();
     assert_eq!(second.outcomes, vec![Outcome::Duplicate]);
 

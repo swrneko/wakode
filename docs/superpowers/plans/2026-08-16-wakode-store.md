@@ -1933,11 +1933,16 @@ fn the_marked_day_is_local_not_utc() {
 }
 
 #[test]
-fn a_duplicate_does_not_widen_the_marked_days() {
-    // Дни помечаются по вставленному, а не по всему батчу. Прямо проверить
-    // это нечем: снятие пометки — работа волны 1, а без него «день уже
-    // пересчитали, пришёл повтор» не воспроизвести. Проверяем то, что
-    // наблюдаемо: повтор не добавляет дней сверх уже помеченных.
+fn resending_a_batch_does_not_multiply_marked_days() {
+    // Внимание: этот тест НЕ проверяет фильтр по `Outcome::Inserted` в
+    // `insert_heartbeats` — и никакой тест волны 0 его не проверит. Повтор
+    // по определению несёт то же время, что и уже вставленная отметка,
+    // значит и тот же локальный день, а тот помечен ещё при первой вставке.
+    // Снимать пометки будет волна 1; до неё разницы между «мерить по всему
+    // батчу» и «мерить по вставленному» снаружи не видно.
+    //
+    // Что тест правда проверяет: повторная доставка очереди cli — штатный
+    // сценарий, она не падает и не плодит вторую строку на тот же день.
     let mut conn = open_in_memory().unwrap();
     migrate(&mut conn).unwrap();
     let user = insert_user(&conn, &a_user("swrneko")).unwrap();
@@ -2271,7 +2276,7 @@ fn take_next(ids: &[Sid], cursor: &mut usize, present: bool) -> Option<Sid> {
 В `lib.rs`: `pub mod dirty;`, `pub mod heartbeats;`, `pub use dirty::dirty_days_for;`, `pub use heartbeats::{insert_heartbeats, IncomingHeartbeat, InsertReport, Outcome};`.
 
 Run: `cargo test -p wakode-store`
-Expected: PASS, девять новых тестов.
+Expected: PASS, десять новых тестов.
 
 - [ ] **Step 6: Коммит**
 
