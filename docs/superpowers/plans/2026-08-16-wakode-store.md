@@ -1225,7 +1225,48 @@ fn dictionary_survives_reopening_the_database() {
     assert_eq!(&*interner.resolve(sid).unwrap(), "постоянная строка");
     assert_eq!(interner.lookup("постоянная строка"), Some(sid));
 }
+
+#[test]
+fn intern_batch_commits_before_it_returns() {
+    // Доказательство того, что коммит произошёл **внутри** `intern_batch`, а
+    // не когда-нибудь потом: второе соединение — независимый наблюдатель, и
+    // незакоммиченную запись первого оно увидеть не может в принципе.
+    // Переоткрытие базы этого не показывает: там коммит мог случиться и на
+    // закрытии соединения.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wakode.db");
+
+    let mut writer = wakode_store::open(&path).unwrap();
+    migrate(&mut writer).unwrap();
+    let interner = Interner::load(&writer).unwrap();
+
+    let sid = interner.intern_batch(&writer, &["видно снаружи"]).unwrap()[0];
+
+    let observer = wakode_store::open(&path).unwrap();
+    let seen = Interner::load(&observer).unwrap();
+
+    assert_eq!(seen.lookup("видно снаружи"), Some(sid));
+    assert_eq!(&*seen.resolve(sid).unwrap(), "видно снаружи");
+}
+
+#[test]
+fn interning_inside_an_open_transaction_is_refused() {
+    // Контракт метода — «зовётся вне открытой транзакции». Нарушение обязано
+    // быть ошибкой, а не тихой вложенностью: словарь, записавший в память
+    // номера из чужой транзакции, переживёт её откат и начнёт врать.
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
+    let tx = conn.transaction().unwrap();
+    assert!(interner.intern_batch(&tx, &["внутри транзакции"]).is_err());
+    drop(tx);
+
+    assert_eq!(interner.lookup("внутри транзакции"), None);
+}
 ```
+
+В последнем тесте `&tx` подставляется в параметр типа `&Connection` через разыменование: `Transaction` реализует `Deref<Target = Connection>`. Отдельного импорта не нужно.
 
 - [ ] **Step 2: Запустить и убедиться, что падает**
 
@@ -1305,6 +1346,10 @@ impl Interner {
     /// Возвращает номера **в том же порядке и той же длины**, что вход:
     /// вызывающий подставляет их в колонки отметки по позиции. Повторы
     /// внутри одного батча дают один номер.
+    ///
+    /// **Зовётся вне открытой транзакции.** Метод открывает свою и
+    /// коммитит её сам: словарь обязан быть долговечнее любой операции,
+    /// которая им пользуется.
     pub fn intern_batch(&self, conn: &Connection, values: &[&str]) -> StoreResult<Vec<Sid>> {
         // Сначала пробуем закрыть всё, что уже известно, под лёгким замком.
         let known: Vec<Option<Sid>> = {
@@ -1319,32 +1364,54 @@ impl Interner {
             return Ok(known.into_iter().map(Option::unwrap).collect());
         }
 
-        let mut stmt = conn.prepare_cached(
-            "INSERT INTO strings(value) VALUES (?1)
-             ON CONFLICT(value) DO UPDATE SET value = value
-             RETURNING id",
-        )?;
-
-        let mut maps = self.inner.write().expect("словарь отравлен паникой");
+        // Своя транзакция, а не транзакция вызывающего: иначе её откат унёс
+        // бы строки из базы, но не из памяти, и словарь начал бы выдавать
+        // номера, которым в `strings` ничего не соответствует. Следующая же
+        // отметка с таким номером упёрлась бы во внешний ключ.
+        let tx = conn.unchecked_transaction()?;
+        // Повторы внутри батча закрываются этой картой, а не повторным
+        // запросом: батч отметок приносит имя проекта по разу на отметку, и
+        // `DO UPDATE` — это настоящая перезапись строки, а не холостой ход.
+        // Заодно карта держит по одной `Arc` на значение, чтобы обе карты
+        // словаря делили одну копию текста.
+        let mut fresh: HashMap<&str, (Arc<str>, Sid)> = HashMap::new();
         let mut out = Vec::with_capacity(values.len());
 
-        for (value, cached) in values.iter().zip(known) {
-            if let Some(sid) = cached {
-                out.push(sid);
-                continue;
-            }
-            // Между чтением и записью строку мог вставить этот же батч.
-            if let Some(sid) = maps.by_value.get(*value) {
-                out.push(*sid);
-                continue;
-            }
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO strings(value) VALUES (?1)
+                 ON CONFLICT(value) DO UPDATE SET value = value
+                 RETURNING id",
+            )?;
 
-            let id: i64 = stmt.query_row([value], |row| row.get(0))?;
-            let sid = i64_to_sid(id)?;
-            let text: Arc<str> = Arc::from(*value);
-            maps.by_value.insert(Arc::clone(&text), sid);
-            maps.by_id.insert(sid, text);
-            out.push(sid);
+            for (value, cached) in values.iter().zip(known) {
+                if let Some(sid) = cached {
+                    out.push(sid);
+                    continue;
+                }
+                if let Some((_, sid)) = fresh.get(*value) {
+                    out.push(*sid);
+                    continue;
+                }
+
+                let id: i64 = stmt.query_row([value], |row| row.get(0))?;
+                let sid = i64_to_sid(id)?;
+                out.push(sid);
+                fresh.insert(*value, (Arc::from(*value), sid));
+            }
+        }
+
+        tx.commit()?;
+
+        // Замок берётся только теперь — на вписывание уже разрешённых
+        // номеров, без единого запроса к базе под ним. Любая ошибка выше
+        // оставляет словарь ровно таким, каким он был.
+        {
+            let mut maps = self.inner.write().expect("словарь отравлен паникой");
+            for (text, sid) in fresh.into_values() {
+                maps.by_value.insert(Arc::clone(&text), sid);
+                maps.by_id.insert(sid, text);
+            }
         }
 
         let _ = sid_to_i64;
@@ -1355,6 +1422,8 @@ impl Interner {
 
 `ON CONFLICT ... DO UPDATE SET value = value` вместо `DO NOTHING` — потому что `RETURNING` при `DO NOTHING` не отдаёт строку, и получить номер уже существующего значения одним запросом не выйдет. Присваивание самому себе — стандартный приём, чтобы конфликт считался обновлением.
 
+`unchecked_transaction` вместо `transaction` — потому что второй требует `&mut Connection`, а интернер держит соединение по `&`. «Unchecked» здесь значит лишь то, что компилятор не проверяет отсутствие другой открытой транзакции на этом же соединении; за это отвечает контракт метода, записанный в его документации.
+
 - [ ] **Step 4: Убрать заглушку и подключить модуль**
 
 Строка `let _ = sid_to_i64;` в коде выше — временная, чтобы импорт не давал предупреждения на промежуточном шаге. Удали её вместе с `sid_to_i64` из списка импортов: в финальном виде функция тут не нужна.
@@ -1364,7 +1433,7 @@ impl Interner {
 - [ ] **Step 5: Запустить тесты**
 
 Run: `cargo test -p wakode-store`
-Expected: PASS, четыре новых теста. Предупреждений нет.
+Expected: PASS, шесть новых тестов. Предупреждений нет.
 
 - [ ] **Step 6: Коммит**
 
@@ -1651,7 +1720,9 @@ git commit -m "feat(store): пользователи"
 - Consumes: `Interner`, `dedup_hash`, `codec`, пользователи из задачи 7.
 - Produces: `IncomingHeartbeat` (сырая отметка со строками), `Outcome` (`Inserted` | `Duplicate`), `InsertReport { outcomes: Vec<Outcome> }` с методами `inserted()` и `duplicates()`, `insert_heartbeats(conn: &mut Connection, interner: &Interner, user: Uuid, batch: &[IncomingHeartbeat], tz: Tz) -> StoreResult<InsertReport>`, `mark_dirty(tx, user, days, now) -> StoreResult<()>`, `dirty_days_for(conn, user) -> StoreResult<Vec<NaiveDate>>`.
 
-**Ключевое требование спеки §6:** успех отдаётся только после коммита транзакции. wakatime-cli, получив успех, удаляет отметки из своей очереди — ответ до коммита плюс падение равен безвозвратной потере. Поэтому вставка отметок, интернирование строк и пометка грязных дней происходят **в одной транзакции**.
+**Ключевое требование спеки §6:** успех отдаётся только после коммита транзакции. wakatime-cli, получив успех, удаляет отметки из своей очереди — ответ до коммита плюс падение равен безвозвратной потере. Поэтому вставка отметок и пометка грязных дней происходят **в одной транзакции**, и ответ уходит только после её коммита.
+
+Интернирование строк в эту транзакцию **не входит** и делается до неё, своей собственной. Словарь монотонен — попавшая в него строка оттуда не уходит, — а его копия в памяти отката не знает: общий с отметками откат вынул бы строки из базы, оставив номера в памяти, и следующая отметка с таким номером упёрлась бы во внешний ключ. Осиротевшая строка в `strings`, на которую в итоге никто не сослался, стоит нескольких байт и будет переиспользована при следующей же попытке. Это единственное место плана, где две операции сознательно разведены по разным транзакциям.
 
 **Почему отчёт пер-элементный, а не два счётчика.** Спека §6 требует пер-элементных статусов в ответе bulk-эндпоинта. Валидацию делает план 3 и до хранилища доводит только годные отметки, но собрать ответ он сможет лишь зная, что случилось с каждой позицией. Пара `(inserted, duplicates)` этого не даёт: по ней нельзя восстановить, какая именно отметка оказалась повтором. `outcomes` выровнен с входом по индексу.
 
@@ -1958,7 +2029,6 @@ pub fn insert_heartbeats(
     }
 
     let now = crate::clock::now();
-    let tx = conn.transaction()?;
 
     // Все строки батча одним заходом: меньше запросов и меньше времени под
     // замком словаря.
@@ -1974,8 +2044,15 @@ pub fn insert_heartbeats(
             }
         }
     }
-    let ids = interner.intern_batch(&tx, &texts)?;
+    // Строки интернируются **до** открытия транзакции и коммитятся своей.
+    // Словарь монотонен: строка, попавшая в него, оттуда уже не уходит, и
+    // держать её в одной транзакции с отметками нельзя — откат вставки унёс
+    // бы строки из базы, но не из памяти интернера. Осиротевшая строка в
+    // `strings`, на которую в итоге никто не сослался, стоит нескольких
+    // байт и будет переиспользована при следующей же попытке.
+    let ids = interner.intern_batch(conn, &texts)?;
 
+    let tx = conn.transaction()?;
     let mut cursor = 0usize;
     let mut outcomes = Vec::with_capacity(batch.len());
 
