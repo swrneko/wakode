@@ -146,13 +146,35 @@ fn arb_scenario_with_permutation(
     })
 }
 
-/// Куба — зона, где обе ловушки перевода часов приходятся ровно на полночь:
-/// 8 марта 2026 местных 00:00 не существует вовсе (часы прыгают на 01:00), а
-/// 1 ноября они случаются дважды. Свойства ниже проверяются на ней.
-const HAVANA: &str = "America/Havana";
+/// Зоны для календарных свойств и моменты переводов часов, вокруг которых
+/// сгущается генератор: равномерной случайностью в перевод почти не попасть.
+///
+/// Набор подобран по типам ловушек, а не по красоте названий: одной зоны мало
+/// — именно нехватка второй зоны в этом наборе однажды пропустила ошибку с
+/// отматыванием часов за полночь.
+const CALENDAR_CASES: &[(&str, &str)] = &[
+    // Летнее время кончается в местные 00:01 и отматывает часы за полночь:
+    // локальная дата снова становится вчерашней уже внутри новых суток.
+    ("America/Goose_Bay", "2009-11-01T03:01:00Z"),
+    ("America/St_Johns", "2010-11-07T02:31:00Z"),
+    // Обе полуночные ловушки сразу: 8 марта полуночи нет вовсе, 1 ноября она
+    // случается дважды.
+    ("America/Havana", "2026-03-08T05:00:00Z"),
+    ("America/Havana", "2026-11-01T05:00:00Z"),
+    // Полночь пропущена переводом вперёд.
+    ("America/Santiago", "2026-09-06T04:00:00Z"),
+    // Дыра кончается на нецелой минуте: отказ от смещения −0:44:30.
+    ("Africa/Monrovia", "1972-01-07T00:44:30Z"),
+    // Постоянное смещение без переводов вовсе — контрольная зона.
+    ("Asia/Kolkata", "2026-08-15T00:00:00Z"),
+];
 
-fn tz() -> chrono_tz::Tz {
-    HAVANA.parse().expect("зона есть в базе IANA")
+/// Зона, на которой проверяются времена у краёв `i64`: с переводами часов,
+/// чтобы насыщение календаря сталкивалось ещё и с ними.
+const WILD_ZONE: &str = "America/Goose_Bay";
+
+fn zone(name: &str) -> chrono_tz::Tz {
+    name.parse().expect("зона есть в базе IANA")
 }
 
 fn at(iso: &str) -> i64 {
@@ -161,32 +183,31 @@ fn at(iso: &str) -> i64 {
         .timestamp_micros()
 }
 
-/// Времена для календарных свойств. В отличие от `arb_start`, края `i64` сюда
-/// не попадают: у таких времён локальной даты не существует вовсе. Зато
-/// диапазон намеренно сгущён вокруг переводов часов — иначе генератор почти
-/// никогда бы в них не попал.
-fn arb_calendar_start() -> impl Strategy<Value = i64> {
-    let spring_forward = at("2026-03-08T05:00:00Z");
-    let fall_back = at("2026-11-01T05:00:00Z");
-    let window = 6 * 3600 * SEC;
-    prop_oneof![
-        2 => (1_577_836_800i64 * SEC)..=(1_893_456_000i64 * SEC), // 2020..2030
-        3 => (spring_forward - window)..=(spring_forward + window),
-        3 => (fall_back - window)..=(fall_back + window),
-    ]
+/// Зона и время начала серии: рядом с её переводом часов либо просто в
+/// двадцатых годах.
+fn arb_calendar_case() -> impl Strategy<Value = (chrono_tz::Tz, i64)> {
+    prop::sample::select(CALENDAR_CASES.to_vec()).prop_flat_map(|(name, anchor)| {
+        let anchor = at(anchor);
+        let window = 6 * 3600 * SEC;
+        (
+            Just(zone(name)),
+            prop_oneof![
+                3 => (anchor - window)..=(anchor + window),
+                1 => (1_577_836_800i64 * SEC)..=(1_893_456_000i64 * SEC), // 2020..2030
+            ],
+        )
+    })
 }
 
-/// Тот же сценарий, что и `arb_scenario`, но во временах, у которых есть
-/// календарная дата.
-fn arb_calendar_scenario() -> impl Strategy<Value = (DurationConfig, Vec<Heartbeat>)> {
-    arb_config().prop_flat_map(|cfg| {
+/// Тот же сценарий, что и `arb_scenario`, но привязанный к конкретной зоне и
+/// к окрестностям её перевода часов.
+fn arb_calendar_scenario() -> impl Strategy<Value = (chrono_tz::Tz, DurationConfig, Vec<Heartbeat>)>
+{
+    (arb_calendar_case(), arb_config()).prop_flat_map(|((tz, start), cfg)| {
         let timeout = cfg.timeout().get();
         let padding = cfg.tail_padding().get();
-        let stream = (
-            arb_calendar_start(),
-            prop::collection::vec((arb_delta(timeout, padding), arb_attrs()), 0..64),
-        )
-            .prop_map(|(start, steps)| {
+        let stream = prop::collection::vec((arb_delta(timeout, padding), arb_attrs()), 0..64)
+            .prop_map(move |steps| {
                 let mut out = Vec::with_capacity(steps.len());
                 let mut time = Micros::new(start);
                 for (delta, attrs) in steps {
@@ -196,7 +217,7 @@ fn arb_calendar_scenario() -> impl Strategy<Value = (DurationConfig, Vec<Heartbe
                 out
             })
             .prop_shuffle();
-        (Just(cfg), stream)
+        (Just(tz), Just(cfg), stream)
     })
 }
 
@@ -363,10 +384,10 @@ proptest! {
     /// Сумма по дням равна сумме за весь период. Это тот самый инвариант,
     /// который ловит потерю времени на границе полуночи.
     #[test]
-    fn daily_totals_sum_to_period_total((cfg, hbs) in arb_calendar_scenario()) {
+    fn daily_totals_sum_to_period_total((tz, cfg, hbs) in arb_calendar_scenario()) {
         let intervals = build_intervals(&hbs, cfg);
         let whole = total(&intervals);
-        let by_days: i64 = wakode_core::split_by_local_day(&intervals, tz())
+        let by_days: i64 = wakode_core::split_by_local_day(&intervals, tz)
             .values()
             .flatten()
             .map(|piece| piece.duration().get())
@@ -375,16 +396,26 @@ proptest! {
         prop_assert_eq!(whole, by_days);
     }
 
-    /// Каждый кусок целиком лежит внутри тех суток, под которыми записан.
+    /// Каждый кусок целиком лежит внутри тех суток, под которыми записан, и ни
+    /// один не вывернут наизнанку.
     ///
-    /// Без этого свойства сходимость суммы ничего не доказывает: движок,
-    /// сваливающий всё в одну дату, сумму сохраняет, а цифры дня врут.
+    /// Без этого свойства сходимость суммы не доказывает ничего: и движок,
+    /// сваливающий всё в одну дату, и движок, выдающий кусок с концом раньше
+    /// начала (а соседу отдающий лишнее), сумму сохраняют — врут только цифры
+    /// дня. Проверка порядка тут не педантизм: ровно так выглядела ошибка на
+    /// зонах, отматывающих часы за полночь.
     #[test]
-    fn every_piece_stays_within_its_local_day((cfg, hbs) in arb_calendar_scenario()) {
+    fn every_piece_stays_within_its_local_day((tz, cfg, hbs) in arb_calendar_scenario()) {
         let intervals = build_intervals(&hbs, cfg);
-        for (date, pieces) in wakode_core::split_by_local_day(&intervals, tz()) {
-            let (day_start, day_end) = wakode_core::local_day_bounds(date, tz());
+        for (date, pieces) in wakode_core::split_by_local_day(&intervals, tz) {
+            let (day_start, day_end) = wakode_core::local_day_bounds(date, tz);
             for piece in pieces {
+                prop_assert!(
+                    piece.start < piece.end,
+                    "кусок {:?} вывернут наизнанку в сутках {}",
+                    piece,
+                    date
+                );
                 prop_assert!(
                     piece.start >= day_start && piece.end <= day_end,
                     "кусок {:?} выходит за границы суток {} ({:?}..{:?})",
@@ -393,8 +424,36 @@ proptest! {
                     day_start,
                     day_end
                 );
-                prop_assert_eq!(wakode_core::local_date_of(piece.start, tz()), date);
+                // Дата куска выводится из вложенности, а `local_date_of` даёт
+                // для неё лишь нижнюю оценку: заново прожитый конец вчерашней
+                // даты лежит уже внутри новых суток.
+                prop_assert!(
+                    wakode_core::local_date_of(piece.start, tz) <= date,
+                    "дата момента {:?} опережает сутки {}",
+                    piece.start,
+                    date
+                );
             }
         }
+    }
+
+    /// Нарезка переживает времена у краёв `i64`.
+    ///
+    /// Здесь намеренно берётся `arb_scenario` — тот самый злой генератор, что
+    /// доходит до `i64::MIN` и `i64::MAX`. Календарь уже туда не дотягивается,
+    /// но крайние значения крейт насыщает, а не отвергает, и роняться на них
+    /// он не имеет права: обходить свой же вход стороной — значит не проверять
+    /// его вовсе.
+    #[test]
+    fn splitting_survives_timestamps_outside_the_calendar((cfg, hbs) in arb_scenario()) {
+        let intervals = build_intervals(&hbs, cfg);
+        let days = wakode_core::split_by_local_day(&intervals, zone(WILD_ZONE));
+        let mut counted = 0i64;
+        for piece in days.values().flatten() {
+            prop_assert!(piece.start < piece.end, "кусок {:?} вывернут наизнанку", piece);
+            counted += piece.duration().get();
+        }
+
+        prop_assert_eq!(total(&intervals), counted);
     }
 }
