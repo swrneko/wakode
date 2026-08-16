@@ -120,7 +120,10 @@ mod tests {
     #[test]
     fn absent_and_zero_are_different() {
         // `None` и `Some(Sid(0))` обязаны разойтись: иначе отметка без проекта
-        // склеится с отметкой, у которой проект под номером ноль.
+        // склеится с отметкой, у которой проект под номером ноль. У `branch`
+        // тот же маркер присутствия в `feed_optional`, что и у `project`, —
+        // одна правка в `feed_optional` ломает оба поля сразу, поэтому обе
+        // половины проверяются в одном тесте.
         let user = Uuid::now_v7();
         let time = Micros::from_secs(1);
 
@@ -131,7 +134,48 @@ mod tests {
 
         assert_ne!(
             dedup_hash(user, time, &none, true),
-            dedup_hash(user, time, &zero, true)
+            dedup_hash(user, time, &zero, true),
+            "проект"
         );
+
+        let mut none = attrs();
+        none.branch = None;
+        let mut zero = attrs();
+        zero.branch = Some(Sid(0));
+
+        assert_ne!(
+            dedup_hash(user, time, &none, true),
+            dedup_hash(user, time, &zero, true),
+            "ветка"
+        );
+    }
+
+    #[test]
+    fn client_environment_stays_out_of_the_hash() {
+        // `language`, `editor`, `os`, `machine` выводятся из user-agent
+        // клиента, а не описывают саму отметку. Если случайная правка
+        // затянет любое из них в хеш, у всех уже сохранённых отметок
+        // сменится dedup-хеш: очередь wakatime-cli досылает их заново,
+        // уникальный индекс перестаёт их узнавать, и база тихо наполняется
+        // дублями задним числом — без единой ошибки в логах.
+        let user = Uuid::now_v7();
+        let time = Micros::from_secs(1_755_000_000);
+        let base = dedup_hash(user, time, &attrs(), true);
+
+        let mut a = attrs();
+        a.language = Some(Sid(777));
+        assert_eq!(base, dedup_hash(user, time, &a, true), "язык");
+
+        let mut a = attrs();
+        a.editor = Some(Sid(777));
+        assert_eq!(base, dedup_hash(user, time, &a, true), "редактор");
+
+        let mut a = attrs();
+        a.os = Some(Sid(777));
+        assert_eq!(base, dedup_hash(user, time, &a, true), "ОС");
+
+        let mut a = attrs();
+        a.machine = Some(Sid(777));
+        assert_eq!(base, dedup_hash(user, time, &a, true), "машина");
     }
 }
