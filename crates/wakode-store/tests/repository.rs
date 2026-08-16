@@ -1,4 +1,4 @@
-use wakode_store::{migrate, open_in_memory, schema_version};
+use wakode_store::{migrate, open_in_memory, schema_version, Interner};
 
 /// Единственный тест в этом файле, которому позволено знать про SQL:
 /// он проверяет саму схему, а не поведение поверх неё.
@@ -47,4 +47,66 @@ fn heartbeat_dedup_index_is_unique() {
         )
         .unwrap();
     assert_eq!(unique, 1, "без уникальности индекса дедупликация не работает");
+}
+
+#[test]
+fn interning_the_same_value_twice_gives_the_same_number() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
+    let first = interner.intern_batch(&conn, &["src/main.rs"]).unwrap();
+    let second = interner.intern_batch(&conn, &["src/main.rs"]).unwrap();
+
+    assert_eq!(first, second);
+}
+
+#[test]
+fn interned_value_resolves_back_to_the_original_string() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
+    let ids = interner.intern_batch(&conn, &["wakode", "rust"]).unwrap();
+
+    assert_eq!(&*interner.resolve(ids[0]).unwrap(), "wakode");
+    assert_eq!(&*interner.resolve(ids[1]).unwrap(), "rust");
+    assert_eq!(interner.lookup("rust"), Some(ids[1]));
+    assert_eq!(interner.lookup("не интернировали"), None);
+}
+
+#[test]
+fn a_batch_with_repeats_inside_it_stays_consistent() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
+    let ids = interner
+        .intern_batch(&conn, &["a", "b", "a", "b", "a"])
+        .unwrap();
+
+    assert_eq!(ids.len(), 5);
+    assert_eq!(ids[0], ids[2]);
+    assert_eq!(ids[0], ids[4]);
+    assert_eq!(ids[1], ids[3]);
+    assert_ne!(ids[0], ids[1]);
+}
+
+#[test]
+fn dictionary_survives_reopening_the_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wakode.db");
+
+    let sid = {
+        let mut conn = wakode_store::open(&path).unwrap();
+        migrate(&mut conn).unwrap();
+        let interner = Interner::load(&conn).unwrap();
+        interner.intern_batch(&conn, &["постоянная строка"]).unwrap()[0]
+    };
+
+    let conn = wakode_store::open(&path).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
+    assert_eq!(&*interner.resolve(sid).unwrap(), "постоянная строка");
+    assert_eq!(interner.lookup("постоянная строка"), Some(sid));
 }
