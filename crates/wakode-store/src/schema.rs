@@ -52,7 +52,7 @@ CREATE TABLE sessions (
 ) WITHOUT ROWID;
 
 CREATE TABLE heartbeats (
-  id                 BLOB PRIMARY KEY,
+  id                 BLOB NOT NULL PRIMARY KEY,
   user_id            BLOB NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   time               INTEGER NOT NULL,
   received_at        INTEGER NOT NULL,
@@ -78,7 +78,7 @@ CREATE TABLE heartbeats (
   human_line_changes INTEGER,
   ai_meta            TEXT,
   dedup_hash         INTEGER NOT NULL
-) WITHOUT ROWID;
+);
 
 CREATE UNIQUE INDEX hb_dedup ON heartbeats(user_id, dedup_hash);
 CREATE INDEX hb_time ON heartbeats(user_id, time);
@@ -104,4 +104,9 @@ CREATE TABLE team_members (
   joined_at INTEGER NOT NULL,
   PRIMARY KEY (team_id, user_id)
 ) WITHOUT ROWID;
+
+CREATE INDEX api_keys_user ON api_keys(user_id);
+CREATE INDEX sessions_user ON sessions(user_id);
+CREATE INDEX teams_owner ON teams(owner_id);
+CREATE INDEX team_members_user ON team_members(user_id);
 "#;
