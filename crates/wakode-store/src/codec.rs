@@ -111,10 +111,33 @@ mod tests {
 
     #[test]
     fn category_round_trips_and_unknown_survives() {
+        // Перечислены все двадцать два варианта, а не горстка: `match` в
+        // `i64_to_category` — независимая копия дискриминантов из core, и
+        // перепутанные соседние номера в ней выборочная проверка не поймает.
+        // Список даёт этому тесту вторую работу помимо кругового обхода —
+        // при добавлении варианта в `Category` сюда придётся дописать строку.
         for category in [
             Category::Unknown,
-            Category::Coding,
+            Category::Advising,
+            Category::AiCoding,
+            Category::Browsing,
+            Category::Building,
             Category::CodeReviewing,
+            Category::Coding,
+            Category::Communicating,
+            Category::Debugging,
+            Category::Designing,
+            Category::Indexing,
+            Category::Learning,
+            Category::ManualTesting,
+            Category::Meeting,
+            Category::Notes,
+            Category::Planning,
+            Category::Researching,
+            Category::RunningTests,
+            Category::Supporting,
+            Category::Translating,
+            Category::WritingDocs,
             Category::WritingTests,
         ] {
             let number = category_to_i64(category);
@@ -122,6 +145,7 @@ mod tests {
         }
         assert_eq!(category_to_i64(Category::Unknown), 0);
         assert_eq!(category_to_i64(Category::Coding), 6);
+        assert_eq!(category_to_i64(Category::WritingTests), 21);
     }
 
     #[test]
