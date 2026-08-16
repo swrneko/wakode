@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+chrono-tz.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "macros"] }

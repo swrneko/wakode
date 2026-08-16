@@ -1,6 +1,5 @@
 //! Слой хранения wakode: SQLite за репозиторным трейтом.
 
-#[allow(dead_code)]
 pub(crate) mod clock;
 pub mod codec;
 pub mod conn;
@@ -9,8 +8,10 @@ pub mod error;
 pub mod interner;
 pub mod migrate;
 pub mod schema;
+pub mod users;
 
 pub use conn::{open, open_in_memory};
 pub use error::{StoreError, StoreResult};
 pub use interner::Interner;
 pub use migrate::{migrate, schema_version};
+pub use users::{find_user_by_id, find_user_by_login, insert_user, NewUser, User};

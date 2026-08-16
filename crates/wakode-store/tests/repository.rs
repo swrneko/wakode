@@ -1,4 +1,20 @@
-use wakode_store::{migrate, open_in_memory, schema_version, Interner};
+use chrono_tz::Tz;
+use wakode_store::{
+    find_user_by_id, find_user_by_login, insert_user, migrate, open_in_memory, schema_version,
+    Interner, NewUser,
+};
+
+fn a_user(login: &str) -> NewUser {
+    NewUser {
+        login: login.to_owned(),
+        email: None,
+        password_hash: "непрозрачные байты из плана 3".to_owned(),
+        display_name: None,
+        timezone: "Europe/Moscow".parse().unwrap(),
+        timeout_secs: 900,
+        is_admin: false,
+    }
+}
 
 /// Единственный тест в этом файле, которому позволено знать про SQL:
 /// он проверяет саму схему, а не поведение поверх неё.
@@ -148,4 +164,50 @@ fn interning_inside_an_open_transaction_is_refused() {
     drop(tx);
 
     assert_eq!(interner.lookup("внутри транзакции"), None);
+}
+
+#[test]
+fn inserted_user_is_found_by_login() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+
+    let created = insert_user(&conn, &a_user("swrneko")).unwrap();
+    let found = find_user_by_login(&conn, "swrneko").unwrap().unwrap();
+
+    assert_eq!(found.id, created.id);
+    assert_eq!(found.login, "swrneko");
+    assert_eq!(found.timezone, Tz::Europe__Moscow);
+    assert_eq!(found.timeout_secs, 900);
+    assert!(!found.is_admin);
+}
+
+#[test]
+fn missing_user_is_none_not_an_error() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+
+    assert!(find_user_by_login(&conn, "нет такого").unwrap().is_none());
+    assert!(find_user_by_id(&conn, uuid::Uuid::now_v7()).unwrap().is_none());
+}
+
+#[test]
+fn duplicate_login_is_refused() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+
+    insert_user(&conn, &a_user("swrneko")).unwrap();
+    assert!(insert_user(&conn, &a_user("swrneko")).is_err());
+}
+
+#[test]
+fn timezone_survives_the_round_trip() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+
+    let mut user = a_user("havana");
+    user.timezone = "America/Havana".parse().unwrap();
+    let created = insert_user(&conn, &user).unwrap();
+
+    let found = find_user_by_id(&conn, created.id).unwrap().unwrap();
+    assert_eq!(found.timezone, Tz::America__Havana);
 }
