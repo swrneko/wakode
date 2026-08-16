@@ -1493,6 +1493,41 @@ fn inserted_user_is_found_by_login() {
 }
 
 #[test]
+fn every_field_survives_the_round_trip() {
+    // Проверяются **все** поля, а не показательные. Отображение колонок —
+    // ровно то место, где индекс `row.get(N)` съезжает на единицу между
+    // двумя колонками одного типа: ни компилятор, ни тест по логину такого
+    // не заметят. Необязательные поля заполнены намеренно: `None` в них
+    // прошёл бы и при полностью потерянной колонке.
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+
+    let new = NewUser {
+        login: "полный".to_owned(),
+        email: Some("почта@пример.рф".to_owned()),
+        password_hash: "непрозрачные байты из плана 3".to_owned(),
+        display_name: Some("Отображаемое имя".to_owned()),
+        timezone: "America/St_Johns".parse().unwrap(),
+        timeout_secs: 1800,
+        is_admin: true,
+    };
+
+    let created = insert_user(&conn, &new).unwrap();
+    let found = find_user_by_id(&conn, created.id).unwrap().unwrap();
+
+    assert_eq!(found.id, created.id);
+    assert_eq!(found.login, "полный");
+    assert_eq!(found.email.as_deref(), Some("почта@пример.рф"));
+    assert_eq!(found.password_hash, "непрозрачные байты из плана 3");
+    assert_eq!(found.display_name.as_deref(), Some("Отображаемое имя"));
+    assert_eq!(found.timezone, Tz::America__St_Johns);
+    assert_eq!(found.timeout_secs, 1800);
+    assert!(found.is_admin);
+    assert_eq!(found.created_at, created.created_at);
+    assert_eq!(found.updated_at, created.updated_at);
+}
+
+#[test]
 fn missing_user_is_none_not_an_error() {
     let mut conn = open_in_memory().unwrap();
     migrate(&mut conn).unwrap();
