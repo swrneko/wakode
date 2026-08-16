@@ -32,6 +32,9 @@ pub fn build_intervals(heartbeats: &[Heartbeat], cfg: DurationConfig) -> Vec<Int
 
     let mut sorted = heartbeats.to_vec();
     sorted.sort_unstable();
+    // После сортировки полные дубликаты стоят рядом. Повторная доставка того же
+    // батча не должна менять результат.
+    sorted.dedup();
 
     let mut out = Vec::with_capacity(sorted.len());
     for (i, hb) in sorted.iter().enumerate() {
@@ -187,5 +190,35 @@ mod tests {
         assert_eq!(intervals.len(), 1);
         assert_eq!(intervals[0].start, Micros::from_secs(100));
         assert_eq!(intervals[0].end, Micros::from_secs(130));
+    }
+
+    #[test]
+    fn input_order_does_not_affect_the_result() {
+        let cfg = DurationConfig::default();
+        let ordered = build_intervals(&[hb(0, 1), hb(60, 1), hb(120, 1)], cfg);
+        let shuffled = build_intervals(&[hb(120, 1), hb(0, 1), hb(60, 1)], cfg);
+
+        assert_eq!(ordered, shuffled);
+    }
+
+    #[test]
+    fn duplicate_heartbeats_do_not_inflate_totals() {
+        // Полный дубликат — это повтор доставки, а не новая активность.
+        let cfg = DurationConfig::default();
+        let clean = build_intervals(&[hb(0, 1), hb(60, 1)], cfg);
+        let duplicated = build_intervals(&[hb(0, 1), hb(0, 1), hb(60, 1), hb(60, 1)], cfg);
+
+        assert_eq!(clean, duplicated);
+    }
+
+    #[test]
+    fn simultaneous_heartbeats_with_different_attributes_produce_no_zero_intervals() {
+        let cfg = DurationConfig::new(Micros::from_secs(900), Micros::ZERO).unwrap();
+        let intervals = build_intervals(&[hb(0, 1), hb(0, 2), hb(60, 1)], cfg);
+
+        assert!(
+            intervals.iter().all(|iv| iv.duration().get() > 0),
+            "интервалы нулевой длины не должны попадать в результат"
+        );
     }
 }
