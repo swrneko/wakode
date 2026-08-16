@@ -110,3 +110,33 @@ fn dictionary_survives_reopening_the_database() {
     assert_eq!(&*interner.resolve(sid).unwrap(), "постоянная строка");
     assert_eq!(interner.lookup("постоянная строка"), Some(sid));
 }
+
+/// `dictionary_survives_reopening_the_database` доказывает, что строка
+/// пережила закрытие базы, но не доказывает, что коммит сделал именно
+/// `intern_batch` — с автокоммитом SQLite это выглядело бы точно так же.
+/// Здесь после интернирования на том же соединении открывается и
+/// откатывается посторонняя транзакция: если бы `intern_batch` полагался на
+/// коммит вызывающего (или вовсе не коммитил), откат унёс бы интернированную
+/// строку вместе со своей.
+#[test]
+fn intern_batch_commits_on_its_own_even_if_a_later_transaction_on_the_same_connection_rolls_back()
+{
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
+    let sid = interner.intern_batch(&conn, &["src/main.rs"]).unwrap()[0];
+
+    {
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute("INSERT INTO strings(value) VALUES ('постороннее значение')", [])
+            .unwrap();
+        // Транзакция откатывается здесь, при выходе из области видимости,
+        // без вызова `commit`.
+    }
+
+    let reloaded = Interner::load(&conn).unwrap();
+    assert_eq!(&*reloaded.resolve(sid).unwrap(), "src/main.rs");
+    assert_eq!(reloaded.lookup("src/main.rs"), Some(sid));
+    assert_eq!(reloaded.lookup("постороннее значение"), None);
+}

@@ -67,10 +67,12 @@ impl Interner {
     /// вызывающий подставляет их в колонки отметки по позиции. Повторы
     /// внутри одного батча дают один номер.
     ///
-    /// Запрос к базе идёт вне замка: замок берётся дважды и ненадолго —
-    /// сперва на чтение, чтобы понять, чего не хватает, потом на запись,
-    /// чтобы вписать найденное. Само обращение к SQLite между ними держит
-    /// только `Connection`, а не `RwLock`.
+    /// **Зовётся вне открытой транзакции.** Метод открывает свою и коммитит
+    /// её сам, прежде чем вписать что-либо в память: словарь монотонен —
+    /// попавшая в него строка оттуда не уходит — и обязан быть долговечнее
+    /// любой операции, которая им пользуется. Замок на запись берётся только
+    /// после коммита и только чтобы вписать уже разрешённые номера — ни
+    /// одного обращения к базе под ним.
     pub fn intern_batch(&self, conn: &Connection, values: &[&str]) -> StoreResult<Vec<Sid>> {
         // Сначала пробуем закрыть всё, что уже известно, под лёгким замком.
         let known: Vec<Option<Sid>> = {
@@ -85,44 +87,47 @@ impl Interner {
             return Ok(known.into_iter().map(Option::unwrap).collect());
         }
 
-        // Разрешаем недостающие значения через базу, замок при этом не
-        // держим вовсе. Повторы внутри батча дедуплицируем заранее, чтобы не
-        // слать лишние запросы за одним и тем же значением.
-        let mut stmt = conn.prepare_cached(
-            "INSERT INTO strings(value) VALUES (?1)
-             ON CONFLICT(value) DO UPDATE SET value = value
-             RETURNING id",
-        )?;
+        // Своя транзакция, а не транзакция вызывающего: иначе её откат унёс
+        // бы строки из базы, но не из памяти, и словарь начал бы выдавать
+        // номера, которым в `strings` ничего не соответствует. Следующая же
+        // отметка с таким номером упёрлась бы во внешний ключ.
+        let tx = conn.unchecked_transaction()?;
+        let mut fresh: Vec<(Arc<str>, Sid)> = Vec::new();
+        let mut out = Vec::with_capacity(values.len());
 
-        let mut resolved: HashMap<&str, Sid> = HashMap::new();
-        for (value, cached) in values.iter().zip(&known) {
-            if cached.is_some() || resolved.contains_key(*value) {
-                continue;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO strings(value) VALUES (?1)
+                 ON CONFLICT(value) DO UPDATE SET value = value
+                 RETURNING id",
+            )?;
+
+            for (value, cached) in values.iter().zip(known) {
+                if let Some(sid) = cached {
+                    out.push(sid);
+                    continue;
+                }
+                // Повтор внутри батча отдельно не ловим: второй запрос
+                // упрётся в тот же конфликт и вернёт тот же номер.
+                let id: i64 = stmt.query_row([value], |row| row.get(0))?;
+                let sid = i64_to_sid(id)?;
+                out.push(sid);
+                fresh.push((Arc::from(*value), sid));
             }
-            let id: i64 = stmt.query_row([value], |row| row.get(0))?;
-            let sid = i64_to_sid(id)?;
-            resolved.insert(value, sid);
         }
-        drop(stmt);
 
-        // Короткая запись только для того, чтобы вписать разрешённое в карты
-        // — никакого обращения к базе под замком.
+        tx.commit()?;
+
+        // Замок берётся только теперь — на вписывание уже разрешённых
+        // номеров, без единого запроса к базе под ним. Любая ошибка выше
+        // оставляет словарь ровно таким, каким он был.
         {
             let mut maps = self.inner.write().expect("словарь отравлен паникой");
-            for (value, sid) in &resolved {
-                if !maps.by_value.contains_key(*value) {
-                    let text: Arc<str> = Arc::from(*value);
-                    maps.by_value.insert(Arc::clone(&text), *sid);
-                    maps.by_id.insert(*sid, text);
-                }
+            for (text, sid) in fresh {
+                maps.by_value.insert(Arc::clone(&text), sid);
+                maps.by_id.insert(sid, text);
             }
         }
-
-        let out = values
-            .iter()
-            .zip(known)
-            .map(|(value, cached)| cached.unwrap_or_else(|| resolved[value]))
-            .collect();
 
         Ok(out)
     }
