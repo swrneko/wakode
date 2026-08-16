@@ -4,6 +4,7 @@
 pub(crate) mod clock;
 pub mod codec;
 pub mod conn;
+pub mod dedup;
 pub mod error;
 pub mod migrate;
 pub mod schema;
