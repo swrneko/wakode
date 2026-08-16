@@ -1,7 +1,9 @@
+use chrono::NaiveDate;
 use chrono_tz::Tz;
+use wakode_core::{Category, EntityKind, Micros};
 use wakode_store::{
-    find_user_by_id, find_user_by_login, insert_user, migrate, open_in_memory, schema_version,
-    Interner, NewUser,
+    dirty_days_for, find_user_by_id, find_user_by_login, insert_heartbeats, insert_user, migrate,
+    open_in_memory, schema_version, IncomingHeartbeat, Interner, NewUser, Outcome,
 };
 
 fn a_user(login: &str) -> NewUser {
@@ -245,4 +247,187 @@ fn timezone_survives_the_round_trip() {
 
     let found = find_user_by_id(&conn, created.id).unwrap().unwrap();
     assert_eq!(found.timezone, Tz::America__Havana);
+}
+
+fn incoming(time_secs: i64, entity: &str, project: Option<&str>) -> IncomingHeartbeat {
+    IncomingHeartbeat {
+        time: Micros::from_secs(time_secs),
+        entity: entity.to_owned(),
+        kind: EntityKind::File,
+        category: Category::Coding,
+        project: project.map(str::to_owned),
+        branch: None,
+        language: None,
+        editor: None,
+        os: None,
+        machine: None,
+        plugin: None,
+        is_write: false,
+        lines: None,
+        lineno: None,
+        cursorpos: None,
+        line_additions: None,
+        line_deletions: None,
+        project_root_count: None,
+        dependencies: None,
+        ai_line_changes: None,
+        human_line_changes: None,
+        ai_meta: None,
+    }
+}
+
+#[test]
+fn heartbeats_are_stored_and_counted() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
+    let batch = [
+        incoming(1_755_000_000, "src/main.rs", Some("wakode")),
+        incoming(1_755_000_060, "src/lib.rs", Some("wakode")),
+    ];
+    let report = insert_heartbeats(&mut conn, &interner, user.id, &batch, user.timezone).unwrap();
+
+    assert_eq!(report.inserted(), 2);
+    assert_eq!(report.duplicates(), 0);
+    assert_eq!(report.outcomes, vec![Outcome::Inserted, Outcome::Inserted]);
+}
+
+#[test]
+fn two_heartbeats_with_the_same_entity_but_different_projects_are_both_inserted() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
+    // Время и сущность совпадают нарочно — единственное различие в
+    // проекте. Курсор укладки строк в `texts` и курсор их разбора должны
+    // повторять один и тот же порядок один в один: если бы отметка
+    // получила чужой номер (скажем, номер строки соседней отметки того же
+    // батча), обе отметки могли бы схлопнуться в один dedup-хеш и вторая
+    // тихо стала бы Duplicate вместо Inserted.
+    let batch = [
+        incoming(1_755_000_000, "src/main.rs", Some("alpha")),
+        incoming(1_755_000_000, "src/main.rs", Some("beta")),
+    ];
+    let report = insert_heartbeats(&mut conn, &interner, user.id, &batch, user.timezone).unwrap();
+
+    assert_eq!(report.outcomes, vec![Outcome::Inserted, Outcome::Inserted]);
+}
+
+#[test]
+fn a_repeated_heartbeat_within_the_same_batch_is_a_duplicate() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
+    // Один и тот же батч несёт одну отметку дважды подряд — не два
+    // раздельных вызова, как в остальных тестах на повтор. Дедупликация
+    // держится на уникальном индексе в базе, а не на сверке внутри
+    // батча, так что тут легко случайно получить два Inserted вместо
+    // Inserted и Duplicate.
+    let batch = [
+        incoming(1_755_000_000, "src/main.rs", Some("wakode")),
+        incoming(1_755_000_000, "src/main.rs", Some("wakode")),
+    ];
+    let report = insert_heartbeats(&mut conn, &interner, user.id, &batch, user.timezone).unwrap();
+
+    assert_eq!(report.outcomes, vec![Outcome::Inserted, Outcome::Duplicate]);
+}
+
+#[test]
+fn report_says_which_position_was_the_duplicate() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
+    let first = [incoming(1_755_000_000, "src/main.rs", None)];
+    insert_heartbeats(&mut conn, &interner, user.id, &first, user.timezone).unwrap();
+
+    // Вторая отметка новая, первая — повтор. План 3 обязан уметь отличить их
+    // по позиции, чтобы собрать пер-элементный ответ bulk-эндпоинта.
+    let second = [
+        incoming(1_755_000_000, "src/main.rs", None),
+        incoming(1_755_000_060, "src/lib.rs", None),
+    ];
+    let report = insert_heartbeats(&mut conn, &interner, user.id, &second, user.timezone).unwrap();
+
+    assert_eq!(report.outcomes, vec![Outcome::Duplicate, Outcome::Inserted]);
+}
+
+#[test]
+fn resending_the_same_batch_inserts_nothing_new() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
+    let batch = [incoming(1_755_000_000, "src/main.rs", Some("wakode"))];
+
+    let first = insert_heartbeats(&mut conn, &interner, user.id, &batch, user.timezone).unwrap();
+    let second = insert_heartbeats(&mut conn, &interner, user.id, &batch, user.timezone).unwrap();
+
+    assert_eq!(first.inserted(), 1);
+    assert_eq!(second.inserted(), 0);
+    assert_eq!(second.duplicates(), 1, "повторная доставка очереди cli — норма, не ошибка");
+}
+
+#[test]
+fn the_same_heartbeat_from_two_users_is_not_a_duplicate() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let one = insert_user(&conn, &a_user("one")).unwrap();
+    let two = insert_user(&conn, &a_user("two")).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
+    let batch = [incoming(1_755_000_000, "src/main.rs", Some("wakode"))];
+
+    let one_report = insert_heartbeats(&mut conn, &interner, one.id, &batch, one.timezone).unwrap();
+    let two_report = insert_heartbeats(&mut conn, &interner, two.id, &batch, two.timezone).unwrap();
+
+    assert_eq!(one_report.inserted(), 1);
+    assert_eq!(two_report.inserted(), 1);
+}
+
+#[test]
+fn heartbeat_for_a_missing_user_is_refused() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
+    let ghost = uuid::Uuid::now_v7();
+    let batch = [incoming(1_755_000_000, "src/main.rs", None)];
+    assert!(
+        insert_heartbeats(&mut conn, &interner, ghost, &batch, chrono_tz::UTC).is_err(),
+        "внешний ключ должен сработать: без него отметки повиснут в никуда"
+    );
+
+    // Пометка дня идёт той же транзакцией, что и вставка, и после отказа по
+    // внешнему ключу она обязана откатиться вместе со всем остальным — иначе
+    // это доказывало бы, что вставка и пометка на самом деле разъехались по
+    // разным транзакциям.
+    assert_eq!(
+        dirty_days_for(&conn, ghost).unwrap(),
+        Vec::new(),
+        "транзакция обязана откатиться целиком"
+    );
+}
+
+#[test]
+fn insertion_marks_the_affected_local_days() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
+    // 1 755 000 000 — 2025-08-12T12:40:00Z, в Москве это 12 августа.
+    let batch = [incoming(1_755_000_000, "src/main.rs", None)];
+    insert_heartbeats(&mut conn, &interner, user.id, &batch, user.timezone).unwrap();
+
+    let days = dirty_days_for(&conn, user.id).unwrap();
+
+    assert_eq!(days, vec![NaiveDate::from_ymd_opt(2025, 8, 12).unwrap()]);
 }
