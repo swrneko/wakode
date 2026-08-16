@@ -1,14 +1,23 @@
-//! Property-тесты движка длительностей.
+//! Property-тесты конвейера: склейка, нарезка по дням, агрегация.
 //!
-//! Юнит-тесты в `src/intervals.rs` проверяют придуманные примеры; здесь
-//! проверяются инварианты на сгенерированных сценариях. Генераторы намеренно
-//! злые: отметки вплотную и с нулевым шагом, шаги ровно на границе таймаута и
-//! на микросекунду мимо неё, произвольный порядок доставки, длинные серии,
-//! времена у краёв `i64` — там, где включается saturating-арифметика.
+//! Юнит-тесты в `src/` проверяют придуманные примеры; здесь проверяются
+//! инварианты на сгенерированных сценариях. Генераторы намеренно злые: отметки
+//! вплотную и с нулевым шагом, шаги ровно на границе таймаута и на микросекунду
+//! мимо неё, произвольный порядок доставки, длинные серии, времена у краёв
+//! `i64` — там, где включается saturating-арифметика.
+//!
+//! Отдельная забота — свойства, проходящие через весь конвейер целиком
+//! (`build_intervals` → `split_by_local_day` → `aggregate_by`). Ровно так его
+//! будут звать планы 2–4, и ровно этот крейт станет эталоном, по которому план
+//! 2 сверяет свой кэш агрегатов. Инвариант, проверенный на пути, которым никто
+//! не ходит, эталоном быть не может.
+
+use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 use wakode_core::{
-    build_intervals, Attrs, Category, DurationConfig, EntityKind, Heartbeat, Interval, Micros, Sid,
+    aggregate_by, build_intervals, grand_total, Attrs, Category, DurationConfig, EntityKind,
+    Heartbeat, Interval, Micros, Sid,
 };
 
 const SEC: i64 = 1_000_000;
@@ -223,6 +232,28 @@ fn arb_calendar_scenario() -> impl Strategy<Value = (chrono_tz::Tz, DurationConf
 
 fn total(intervals: &[Interval]) -> i64 {
     intervals.iter().map(|iv| iv.duration().get()).sum()
+}
+
+/// Сходится ли сумма бакетов с общим итогом при группировке этим ключом.
+///
+/// Насыщение здесь не мешает: `aggregate_by` насыщает побакетно, а
+/// `grand_total` — глобально, и на суммах под `i64::MAX` они обязаны совпадать.
+/// Календарный генератор до края `i64` не дотягивается — времена в нём
+/// настоящие, а интервал не длиннее таймаута, — поэтому равенство точное.
+fn reassembles<K>(intervals: &[Interval], key_of: impl Fn(&Attrs) -> K) -> bool
+where
+    K: Copy + Eq + std::hash::Hash + Ord,
+{
+    let by_key: i64 = aggregate_by(intervals, key_of).iter().map(|b| b.total.get()).sum();
+    by_key == grand_total(intervals).get()
+}
+
+/// Итоги по проектам в виде карты — так их удобно складывать по дням.
+fn totals_by_project(intervals: &[Interval]) -> BTreeMap<Option<Sid>, i64> {
+    aggregate_by(intervals, |a| a.project)
+        .into_iter()
+        .map(|bucket| (bucket.key, bucket.total.get()))
+        .collect()
 }
 
 proptest! {
@@ -455,5 +486,81 @@ proptest! {
         }
 
         prop_assert_eq!(total(&intervals), counted);
+    }
+
+    /// Сумма по бакетам равна общему итогу — при группировке по любому ключу.
+    ///
+    /// Это первый названный инвариант спеки, и до сих пор его держал один
+    /// юнит-тест на трёх интервалах, написанных руками. Ключи взяты разные не
+    /// для симметрии: измерения различаются тем, теряется ли время у
+    /// интервалов без значения. `editor` в генераторе всегда `None`, `project`
+    /// и `language` бывают пустыми через раз, а `kind` не пуст никогда —
+    /// движок, роняющий безымянные интервалы, обязан провалиться хотя бы на
+    /// одном из них.
+    #[test]
+    fn bucket_totals_always_reassemble_into_the_grand_total(
+        (_tz, cfg, hbs) in arb_calendar_scenario(),
+    ) {
+        let intervals = build_intervals(&hbs, cfg);
+
+        prop_assert!(reassembles(&intervals, |a| a.project), "разъехалось по проектам");
+        prop_assert!(reassembles(&intervals, |a| a.language), "разъехалось по языкам");
+        prop_assert!(reassembles(&intervals, |a| a.editor), "разъехалось по редакторам");
+        prop_assert!(reassembles(&intervals, |a| a.category), "разъехалось по категориям");
+        prop_assert!(reassembles(&intervals, |a| a.kind), "разъехалось по типу сущности");
+    }
+
+    /// Посуточная агрегация складывается в агрегацию за период.
+    ///
+    /// Это ровно то число, ради которого план 2 заводит кэш: «сколько времени
+    /// в проекте X за день D». Сумма таких чисел по дням обязана дать итог
+    /// проекта X за весь период — иначе недельная сводка не сойдётся с семью
+    /// дневными, и разойдутся они молча.
+    ///
+    /// Свойство строго сильнее сходимости общих итогов (её проверяет
+    /// `daily_totals_sum_to_period_total`): совпадение сумм переживает и
+    /// перепутанные при нарезке атрибуты, а совпадение по каждому ключу — нет.
+    #[test]
+    fn per_day_aggregation_reassembles_into_the_period_aggregation(
+        (tz, cfg, hbs) in arb_calendar_scenario(),
+    ) {
+        let intervals = build_intervals(&hbs, cfg);
+        let over_the_period = totals_by_project(&intervals);
+
+        let mut summed_over_days: BTreeMap<Option<Sid>, i64> = BTreeMap::new();
+        for pieces in wakode_core::split_by_local_day(&intervals, tz).values() {
+            for (key, total) in totals_by_project(pieces) {
+                *summed_over_days.entry(key).or_insert(0) += total;
+            }
+        }
+        // Проекты с нулевым итогом за период в карте не появляются вовсе, а по
+        // дням могут дать нулевую запись — сравниваются ненулевые части.
+        summed_over_days.retain(|_, total| *total != 0);
+
+        prop_assert_eq!(summed_over_days, over_the_period);
+    }
+
+    /// Куски одного дня идут по возрастанию и не наезжают друг на друга.
+    ///
+    /// Непересечение интервалов проверяется до нарезки, но нарезка способна его
+    /// потерять сама: достаточно отдать в день кусок, начинающийся раньше
+    /// предыдущего. Сумма при этом сойдётся, а лента дня и любой расчёт
+    /// «сколько времени подряд» соврут.
+    #[test]
+    fn pieces_of_a_day_are_ordered_and_never_overlap(
+        (tz, cfg, hbs) in arb_calendar_scenario(),
+    ) {
+        let intervals = build_intervals(&hbs, cfg);
+        for (date, pieces) in wakode_core::split_by_local_day(&intervals, tz) {
+            for pair in pieces.windows(2) {
+                prop_assert!(
+                    pair[0].end <= pair[1].start,
+                    "в сутках {} куски {:?} и {:?} идут не по порядку или пересекаются",
+                    date,
+                    pair[0],
+                    pair[1]
+                );
+            }
+        }
     }
 }
