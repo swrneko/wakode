@@ -91,6 +91,14 @@ mod tests {
     }
 
     #[test]
+    fn accepts_padding_equal_to_timeout() {
+        // Граница инварианта tail_padding <= timeout: равенство допустимо,
+        // строго больше — нет (см. rejects_padding_larger_than_timeout).
+        let cfg = DurationConfig::new(Micros::from_secs(60), Micros::from_secs(60)).unwrap();
+        assert_eq!(cfg.tail_padding(), cfg.timeout());
+    }
+
+    #[test]
     fn accepts_valid_configuration() {
         let cfg = DurationConfig::new(Micros::from_secs(300), Micros::from_secs(30)).unwrap();
         assert_eq!(cfg.timeout(), Micros::from_secs(300));
