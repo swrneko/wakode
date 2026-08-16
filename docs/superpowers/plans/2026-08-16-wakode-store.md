@@ -572,7 +572,7 @@ CREATE TABLE sessions (
 ) WITHOUT ROWID;
 
 CREATE TABLE heartbeats (
-  id                 BLOB PRIMARY KEY,
+  id                 BLOB NOT NULL PRIMARY KEY,
   user_id            BLOB NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   time               INTEGER NOT NULL,
   received_at        INTEGER NOT NULL,
@@ -598,7 +598,7 @@ CREATE TABLE heartbeats (
   human_line_changes INTEGER,
   ai_meta            TEXT,
   dedup_hash         INTEGER NOT NULL
-) WITHOUT ROWID;
+);
 
 CREATE UNIQUE INDEX hb_dedup ON heartbeats(user_id, dedup_hash);
 CREATE INDEX hb_time ON heartbeats(user_id, time);
@@ -624,10 +624,19 @@ CREATE TABLE team_members (
   joined_at INTEGER NOT NULL,
   PRIMARY KEY (team_id, user_id)
 ) WITHOUT ROWID;
+
+CREATE INDEX api_keys_user ON api_keys(user_id);
+CREATE INDEX sessions_user ON sessions(user_id);
+CREATE INDEX teams_owner ON teams(owner_id);
+CREATE INDEX team_members_user ON team_members(user_id);
 "#;
 ```
 
-`WITHOUT ROWID` стоит там, где первичный ключ уже есть и скрытый rowid был бы лишним удвоением. У `strings` его нет намеренно: там PK и есть rowid, автоинкремент нужен для выдачи номеров.
+`WITHOUT ROWID` стоит там, где строки узкие и первичный ключ действительно используется для поиска. У `strings` его нет намеренно: там PK и есть rowid, автоинкремент нужен для выдачи номеров.
+
+**Почему `heartbeats` — обычная rowid-таблица, вопреки спеке §5.** WITHOUT ROWID окупается на узких строках, к которым ходят по первичному ключу. Здесь не выполнено ни одно из условий: `dependencies` и `ai_meta` — TEXT произвольной длины, и в WITHOUT ROWID их overflow-цепочки лягут внутрь того самого B-дерева, по которому идут сканы диапазона; а по `id` не ищет никто — все запросы идут через `(user_id, time)`. Вдобавок каждая запись `hb_time` тащила бы 16-байтовый blob первичного ключа вместо короткого rowid. `id` остаётся `NOT NULL PRIMARY KEY`: `NOT NULL` тут выписан явно, потому что в rowid-таблице `PRIMARY KEY` на не-INTEGER колонке его не подразумевает — давняя особенность SQLite, сохранённая ради совместимости.
+
+**Почему на внешние ключи заведены индексы.** При `foreign_keys=ON` каждое `DELETE FROM users` заставляет SQLite искать детей во всех ссылающихся таблицах; без индекса это полный скан. У `heartbeats` и `dirty_days` проблемы нет — там `user_id` уже левый префикс `hb_dedup` и первичного ключа соответственно. У остальных четырёх колонок индекса не было.
 
 - [ ] **Step 4: Запустить тесты**
 
