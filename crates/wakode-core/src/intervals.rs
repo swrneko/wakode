@@ -19,10 +19,11 @@ impl Interval {
 
 /// Превращает поток отметок в непересекающиеся интервалы.
 ///
-/// Каждая пара соседних по времени отметок даёт интервал; интервал наследует
-/// атрибуты более ранней из пары. Разрыв сессии по таймауту и хвостовая
-/// добавка последней отметке появятся позже — здесь склейка безусловная.
-pub fn build_intervals(heartbeats: &[Heartbeat], _cfg: DurationConfig) -> Vec<Interval> {
+/// Каждая пара соседних по времени отметок даёт интервал, если разрыв между
+/// ними не превышает `cfg.timeout()`; интервал наследует атрибуты более
+/// ранней из пары. Разрыв длиннее таймаута обрывает сессию — время паузы не
+/// засчитывается никому. Хвостовая добавка последней отметке появится позже.
+pub fn build_intervals(heartbeats: &[Heartbeat], cfg: DurationConfig) -> Vec<Interval> {
     if heartbeats.is_empty() {
         return Vec::new();
     }
@@ -33,6 +34,11 @@ pub fn build_intervals(heartbeats: &[Heartbeat], _cfg: DurationConfig) -> Vec<In
     let mut out = Vec::with_capacity(sorted.len());
     for (i, hb) in sorted.iter().enumerate() {
         let Some(next) = sorted.get(i + 1) else { continue };
+        // Пауза длиннее таймаута означает, что пользователь ушёл: это время не
+        // засчитывается никому. Граница включительная — ровно таймаут ещё считается.
+        if next.time.saturating_sub(hb.time) > cfg.timeout() {
+            continue;
+        }
         if next.time > hb.time {
             out.push(Interval { start: hb.time, end: next.time, attrs: hb.attrs });
         }
@@ -104,5 +110,38 @@ mod tests {
         assert_eq!(intervals.len(), 2);
         assert_eq!(intervals[1].start, Micros::from_secs(60));
         assert_eq!(intervals[1].end, Micros::from_secs(120));
+    }
+
+    #[test]
+    fn gap_longer_than_timeout_breaks_the_session() {
+        // Пауза длиннее таймаута не засчитывается никому: пользователь ушёл.
+        let cfg = DurationConfig::new(Micros::from_secs(900), Micros::ZERO).unwrap();
+        let intervals = build_intervals(&[hb(0, 1), hb(901, 1)], cfg);
+
+        assert!(intervals.is_empty(), "пауза в 901 секунду не должна давать интервал");
+    }
+
+    #[test]
+    fn gap_exactly_equal_to_timeout_is_still_counted() {
+        // Граница включительная: ровно таймаут — ещё та же сессия.
+        let cfg = DurationConfig::new(Micros::from_secs(900), Micros::ZERO).unwrap();
+        let intervals = build_intervals(&[hb(0, 1), hb(900, 1)], cfg);
+
+        assert_eq!(intervals.len(), 1);
+        assert_eq!(intervals[0].duration(), Micros::from_secs(900));
+    }
+
+    #[test]
+    fn two_sessions_separated_by_a_long_pause() {
+        let cfg = DurationConfig::new(Micros::from_secs(900), Micros::ZERO).unwrap();
+        let intervals = build_intervals(
+            &[hb(0, 1), hb(60, 1), hb(5000, 1), hb(5060, 1)],
+            cfg,
+        );
+
+        assert_eq!(intervals.len(), 2);
+        assert_eq!(intervals[0].duration(), Micros::from_secs(60));
+        assert_eq!(intervals[1].start, Micros::from_secs(5000));
+        assert_eq!(intervals[1].duration(), Micros::from_secs(60));
     }
 }
