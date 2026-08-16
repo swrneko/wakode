@@ -1877,32 +1877,87 @@ fn heartbeat_for_a_missing_user_is_refused() {
     migrate(&mut conn).unwrap();
     let interner = Interner::load(&conn).unwrap();
 
+    let ghost = uuid::Uuid::now_v7();
     let batch = [incoming(1_755_000_000, "src/main.rs", None)];
     assert!(
-        insert_heartbeats(&mut conn, &interner, uuid::Uuid::now_v7(), &batch, chrono_tz::UTC)
-            .is_err(),
+        insert_heartbeats(&mut conn, &interner, ghost, &batch, chrono_tz::UTC).is_err(),
         "внешний ключ должен сработать: без него отметки повиснут в никуда"
     );
+
+    // Атомарность этот тест НЕ доказывает: внешний ключ срабатывает на первой
+    // же вставке, то есть до `mark_dirty`, и пустой список дней получился бы
+    // и вовсе без транзакции. Прямая проверка отката появится в задаче 9,
+    // когда отметки можно будет прочитать.
+    assert!(dirty_days_for(&conn, ghost).unwrap().is_empty());
 }
 
 #[test]
-fn insertion_marks_the_affected_local_days() {
+fn an_empty_batch_touches_nothing() {
     let mut conn = open_in_memory().unwrap();
     migrate(&mut conn).unwrap();
     let user = insert_user(&conn, &a_user("swrneko")).unwrap();
     let interner = Interner::load(&conn).unwrap();
 
-    // 1 755 000 000 — 2025-08-12T12:40:00Z, в Москве это 12 августа.
+    let report = insert_heartbeats(&mut conn, &interner, user.id, &[], user.timezone).unwrap();
+
+    assert!(report.outcomes.is_empty());
+    assert!(dirty_days_for(&conn, user.id).unwrap().is_empty());
+}
+
+#[test]
+fn the_marked_day_is_local_not_utc() {
+    // 1 755 036 000 — 2025-08-12T22:00:00Z. В Москве это уже 13 августа, в
+    // UTC — ещё 12-е. Момент выбран именно так: на любом времени внутри
+    // суток обеих зон реализация, считающая день по UTC, прошла бы тест
+    // незамеченной, а ключ пометки обязан совпадать с ключом будущей сводки.
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let moscow = insert_user(&conn, &a_user("москвич")).unwrap();
+    let mut greenwich = a_user("гринвич");
+    greenwich.timezone = chrono_tz::UTC;
+    let greenwich = insert_user(&conn, &greenwich).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
+    let batch = [incoming(1_755_036_000, "src/main.rs", None)];
+    insert_heartbeats(&mut conn, &interner, moscow.id, &batch, moscow.timezone).unwrap();
+    insert_heartbeats(&mut conn, &interner, greenwich.id, &batch, greenwich.timezone).unwrap();
+
+    assert_eq!(
+        dirty_days_for(&conn, moscow.id).unwrap(),
+        vec![NaiveDate::from_ymd_opt(2025, 8, 13).unwrap()]
+    );
+    assert_eq!(
+        dirty_days_for(&conn, greenwich.id).unwrap(),
+        vec![NaiveDate::from_ymd_opt(2025, 8, 12).unwrap()]
+    );
+}
+
+#[test]
+fn a_duplicate_does_not_widen_the_marked_days() {
+    // Дни помечаются по вставленному, а не по всему батчу. Прямо проверить
+    // это нечем: снятие пометки — работа волны 1, а без него «день уже
+    // пересчитали, пришёл повтор» не воспроизвести. Проверяем то, что
+    // наблюдаемо: повтор не добавляет дней сверх уже помеченных.
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
     let batch = [incoming(1_755_000_000, "src/main.rs", None)];
     insert_heartbeats(&mut conn, &interner, user.id, &batch, user.timezone).unwrap();
+    let after_first = dirty_days_for(&conn, user.id).unwrap();
 
-    let days = dirty_days_for(&conn, user.id).unwrap();
+    let report =
+        insert_heartbeats(&mut conn, &interner, user.id, &batch, user.timezone).unwrap();
 
-    assert_eq!(days, vec![NaiveDate::from_ymd_opt(2025, 8, 12).unwrap()]);
+    assert_eq!(report.duplicates(), 1);
+    assert_eq!(dirty_days_for(&conn, user.id).unwrap(), after_first);
 }
 ```
 
 Тесту нужны `use chrono::NaiveDate;` и `use wakode_store::dirty_days_for;` в шапке файла.
+
+Сырого SQL в этих тестах нет и не должно появиться: трёх мест, разрешённых глобальными ограничениями, по-прежнему ровно три, и все три проверяют схему.
 
 - [ ] **Step 2: Запустить и убедиться, что падает**
 
@@ -1930,7 +1985,7 @@ use crate::error::{StoreError, StoreResult};
 /// День берётся через `local_day_of`, а не через смещение UTC: у зон с
 /// переходом времени эти два ответа расходятся, и ключ пометки должен
 /// совпадать с ключом, по которому потом будет считаться сводка.
-pub fn affected_days(times: impl IntoIterator<Item = Micros>, tz: Tz) -> BTreeSet<NaiveDate> {
+pub(crate) fn affected_days(times: impl IntoIterator<Item = Micros>, tz: Tz) -> BTreeSet<NaiveDate> {
     times.into_iter().map(|t| local_day_of(t, tz)).collect()
 }
 
@@ -2049,9 +2104,13 @@ impl InsertReport {
 
 /// Записать батч отметок.
 ///
-/// Интернирование строк, вставка и пометка затронутых дней идут **в одной
-/// транзакции**: успех сообщается только после коммита, потому что cli,
-/// получив успех, стирает отметки из своей очереди.
+/// Вставка отметок и пометка затронутых дней идут **в одной транзакции**:
+/// успех сообщается только после коммита, потому что cli, получив успех,
+/// стирает отметки из своей очереди.
+///
+/// Интернирование строк в эту транзакцию **не входит** — оно делается до
+/// неё и коммитит свою. Словарь монотонен, а его копия в памяти про откат
+/// не знает: общий откат вынул бы строки из базы, оставив номера в памяти.
 pub fn insert_heartbeats(
     conn: &mut Connection,
     interner: &Interner,
@@ -2160,6 +2219,11 @@ pub fn insert_heartbeats(
             ])?;
             // `INSERT OR IGNORE` возвращает 0, если строку отбил уникальный
             // индекс по (user_id, dedup_hash) — это и есть признак повтора.
+            //
+            // Осторожно при правках схемы: `OR IGNORE` глушит не только
+            // конфликт уникальности, но и `NOT NULL` с `CHECK`. Колонка или
+            // ограничение, добавленные будущей миграцией, превратят потерю
+            // отметки в тихий `Duplicate`, и наружу это не всплывёт никак.
             outcomes.push(if affected == 1 {
                 Outcome::Inserted
             } else {
@@ -2168,7 +2232,16 @@ pub fn insert_heartbeats(
         }
     }
 
-    let days = affected_days(batch.iter().map(|hb| hb.time), tz);
+    // Дни только от реально вставленных отметок. Повторная доставка очереди
+    // cli — штатный сценарий, и если помечать по всему батчу, каждый такой
+    // повтор будет заново пачкать уже пересчитанные дни и гонять пересчёт
+    // сводок вхолостую. Ничего не вставили — ничего и не изменилось.
+    let inserted_times = batch
+        .iter()
+        .zip(&outcomes)
+        .filter(|(_, outcome)| **outcome == Outcome::Inserted)
+        .map(|(hb, _)| hb.time);
+    let days = affected_days(inserted_times, tz);
     mark_dirty(&tx, user, &days, now)?;
 
     tx.commit()?;
@@ -2198,7 +2271,7 @@ fn take_next(ids: &[Sid], cursor: &mut usize, present: bool) -> Option<Sid> {
 В `lib.rs`: `pub mod dirty;`, `pub mod heartbeats;`, `pub use dirty::dirty_days_for;`, `pub use heartbeats::{insert_heartbeats, IncomingHeartbeat, InsertReport, Outcome};`.
 
 Run: `cargo test -p wakode-store`
-Expected: PASS, шесть новых тестов.
+Expected: PASS, девять новых тестов.
 
 - [ ] **Step 6: Коммит**
 
@@ -2220,6 +2293,11 @@ git commit -m "feat(store): вставка отметок с дедуплика�
 - Produces: `load_heartbeats(conn: &Connection, user: Uuid, from: Micros, to: Micros) -> StoreResult<Vec<wakode_core::Heartbeat>>`.
 
 Возвращается ровно тот тип, который потребляет `wakode_core::build_intervals`. Границы — полуинтервал `[from, to)`, как их отдаёт `wakode_core::heartbeat_window`.
+
+**Два долга задачи 8, которые закрываются здесь и нигде больше.** До этой задачи отметку нельзя было прочитать, поэтому две вещи остались недоказанными:
+
+1. **Соответствие полей.** Тесты задачи 8 оставляли все необязательные поля пустыми, кроме проекта. При пустом поле курсор разбора не двигается — значит перестановка соседних полей в разборе (проект получает номер ветки) не ловилась ничем, и то же верно для десяти числовых и текстовых колонок, которые всюду были `None`. Тест `every_field_survives_the_round_trip` ниже обязателен: **все** поля заполнены **различимыми** значениями, и каждое проверяется после чтения. Без него порядок 26 параметров `INSERT` держится только на внимательности.
+2. **Атомарность отката.** Тест на несуществующего пользователя в задаче 8 доказывал не то, что заявлял: внешний ключ срабатывает на первой же вставке, до `mark_dirty`, и пустой список дней получился бы и вовсе без транзакции. Тест `a_failed_batch_leaves_nothing_behind` ниже проверяет настоящий инвариант: после отказа число отметок не изменилось.
 
 - [ ] **Step 1: Написать падающие тесты**
 
@@ -2314,7 +2392,87 @@ fn empty_range_gives_an_empty_vector_not_an_error() {
     let loaded = load_heartbeats(&conn, user.id, Micros::from_secs(0), Micros::from_secs(1)).unwrap();
     assert!(loaded.is_empty());
 }
+
+#[test]
+fn every_attribute_survives_the_round_trip() {
+    // Долг задачи 8. Все необязательные поля заполнены **различимыми**
+    // значениями: только так ловится перестановка соседних полей при
+    // разборе. Пустое поле не двигает курсор, поэтому на `None` подмена
+    // проекта веткой выглядит точно так же, как её отсутствие.
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
+    let full = IncomingHeartbeat {
+        time: Micros::from_secs(1_755_000_000),
+        entity: "сущность".to_owned(),
+        kind: EntityKind::App,
+        category: Category::Debugging,
+        project: Some("проект".to_owned()),
+        branch: Some("ветка".to_owned()),
+        language: Some("язык".to_owned()),
+        editor: Some("редактор".to_owned()),
+        os: Some("ос".to_owned()),
+        machine: Some("машина".to_owned()),
+        plugin: Some("плагин".to_owned()),
+        is_write: true,
+        lines: Some(1),
+        lineno: Some(2),
+        cursorpos: Some(3),
+        line_additions: Some(4),
+        line_deletions: Some(5),
+        project_root_count: Some(6),
+        dependencies: Some("зависимости".to_owned()),
+        ai_line_changes: Some(7),
+        human_line_changes: Some(8),
+        ai_meta: Some("мета".to_owned()),
+    };
+
+    insert_heartbeats(&mut conn, &interner, user.id, &[full], user.timezone).unwrap();
+    let loaded = load_heartbeats(
+        &conn,
+        user.id,
+        Micros::from_secs(1_755_000_000),
+        Micros::from_secs(1_755_000_001),
+    )
+    .unwrap();
+
+    let attrs = loaded[0].attrs;
+    let text = |sid| interner.resolve(sid).unwrap().to_string();
+
+    assert_eq!(loaded[0].time, Micros::from_secs(1_755_000_000));
+    assert_eq!(attrs.kind, EntityKind::App);
+    assert_eq!(attrs.category, Category::Debugging);
+    assert_eq!(text(attrs.entity), "сущность");
+    assert_eq!(text(attrs.project.unwrap()), "проект");
+    assert_eq!(text(attrs.branch.unwrap()), "ветка");
+    assert_eq!(text(attrs.language.unwrap()), "язык");
+    assert_eq!(text(attrs.editor.unwrap()), "редактор");
+    assert_eq!(text(attrs.os.unwrap()), "ос");
+    assert_eq!(text(attrs.machine.unwrap()), "машина");
+}
+
+#[test]
+fn a_refused_batch_stores_no_heartbeats_at_all() {
+    // Долг задачи 8, закрытый ровно настолько, насколько он закрываем.
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
+    let ghost = uuid::Uuid::now_v7();
+    let doomed = [incoming(200, "b.rs", None), incoming(300, "c.rs", None)];
+    assert!(insert_heartbeats(&mut conn, &interner, ghost, &doomed, chrono_tz::UTC).is_err());
+
+    let loaded =
+        load_heartbeats(&conn, ghost, Micros::from_secs(0), Micros::from_secs(1_000)).unwrap();
+    assert!(loaded.is_empty());
+}
 ```
+
+Первому тесту нужны `IncomingHeartbeat`, `EntityKind` и `Category` в импортах. Поле `category` в нём — `Category::Debugging`: категория, отличная и от `Coding` из хелпера `incoming`, и от `Unknown`, чтобы утверждение не прошло по совпадению с любым из дефолтов.
+
+**Про второй тест — честно о его пределах.** Он проверяет, что после отказа отметок не осталось, но атомарности связки «вставка + `mark_dirty`» не доказывает и доказать не может. Все отметки батча идут одному пользователю, поэтому внешний ключ либо отвергает их все на первой же вставке, либо не отвергает ни одной; сценария «половина вставилась, потом упало» текущая схема не допускает вовсе. Настоящая проверка потребовала бы подмены соединения ради сбоя ровно между вставкой и `mark_dirty` — инфраструктуры, несоразмерной риску. Инвариант держится формой кода: обе операции идут по одному `tx`, и `commit` один.
 
 - [ ] **Step 2: Запустить и убедиться, что падает**
 
@@ -2396,7 +2554,7 @@ pub fn load_heartbeats(
 В `lib.rs` добавь `load_heartbeats` в реэкспорт.
 
 Run: `cargo test -p wakode-store`
-Expected: PASS, четыре новых теста.
+Expected: PASS, шесть новых тестов.
 
 - [ ] **Step 5: Коммит**
 

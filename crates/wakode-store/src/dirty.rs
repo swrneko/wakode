@@ -14,7 +14,7 @@ use crate::error::{StoreError, StoreResult};
 /// День берётся через `local_day_of`, а не через смещение UTC: у зон с
 /// переходом времени эти два ответа расходятся, и ключ пометки должен
 /// совпадать с ключом, по которому потом будет считаться сводка.
-pub fn affected_days(times: impl IntoIterator<Item = Micros>, tz: Tz) -> BTreeSet<NaiveDate> {
+pub(crate) fn affected_days(times: impl IntoIterator<Item = Micros>, tz: Tz) -> BTreeSet<NaiveDate> {
     times.into_iter().map(|t| local_day_of(t, tz)).collect()
 }
 

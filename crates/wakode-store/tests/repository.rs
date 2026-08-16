@@ -405,29 +405,77 @@ fn heartbeat_for_a_missing_user_is_refused() {
         "внешний ключ должен сработать: без него отметки повиснут в никуда"
     );
 
-    // Пометка дня идёт той же транзакцией, что и вставка, и после отказа по
-    // внешнему ключу она обязана откатиться вместе со всем остальным — иначе
-    // это доказывало бы, что вставка и пометка на самом деле разъехались по
-    // разным транзакциям.
+    // Внешний ключ срабатывает на первой же вставке — то есть до
+    // `mark_dirty`, так что пустой список дней получился бы и вовсе без
+    // транзакции. Атомарность отката этот тест не доказывает: отказ
+    // происходит раньше того места, которое должно было бы откатываться.
+    // Прямая проверка атомарности появится в задаче 9, когда будет чем
+    // подтвердить наличие или отсутствие самих отметок.
+    assert!(dirty_days_for(&conn, ghost).unwrap().is_empty());
+}
+
+#[test]
+fn the_marked_day_is_local_not_utc() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let moscow = insert_user(&conn, &a_user("swrneko")).unwrap();
+    let mut utc = a_user("гринвич");
+    utc.timezone = chrono_tz::UTC;
+    let utc = insert_user(&conn, &utc).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
+    // 1 755 036 000 — 2025-08-12T22:00:00Z. В Москве (UTC+3) это уже
+    // 2025-08-13, в UTC — ещё 2025-08-12. Реализация, считающая день по
+    // смещению UTC вместо `local_day_of`, прошла бы старый тест
+    // незамеченной — здесь для одного и того же момента у двух зон разные
+    // авторитетные дни, и это видно прямо в утверждениях.
+    let batch = [incoming(1_755_036_000, "src/main.rs", None)];
+    insert_heartbeats(&mut conn, &interner, moscow.id, &batch, moscow.timezone).unwrap();
+    insert_heartbeats(&mut conn, &interner, utc.id, &batch, utc.timezone).unwrap();
+
     assert_eq!(
-        dirty_days_for(&conn, ghost).unwrap(),
-        Vec::new(),
-        "транзакция обязана откатиться целиком"
+        dirty_days_for(&conn, moscow.id).unwrap(),
+        vec![NaiveDate::from_ymd_opt(2025, 8, 13).unwrap()]
+    );
+    assert_eq!(
+        dirty_days_for(&conn, utc.id).unwrap(),
+        vec![NaiveDate::from_ymd_opt(2025, 8, 12).unwrap()]
     );
 }
 
 #[test]
-fn insertion_marks_the_affected_local_days() {
+fn a_duplicate_does_not_widen_the_marked_days() {
     let mut conn = open_in_memory().unwrap();
     migrate(&mut conn).unwrap();
     let user = insert_user(&conn, &a_user("swrneko")).unwrap();
     let interner = Interner::load(&conn).unwrap();
 
-    // 1 755 000 000 — 2025-08-12T12:40:00Z, в Москве это 12 августа.
-    let batch = [incoming(1_755_000_000, "src/main.rs", None)];
+    let batch = [incoming(1_755_000_000, "src/main.rs", Some("wakode"))];
     insert_heartbeats(&mut conn, &interner, user.id, &batch, user.timezone).unwrap();
 
-    let days = dirty_days_for(&conn, user.id).unwrap();
+    // Отправка того же батча второй раз ничего не вставляет — только это и
+    // проверяется здесь: список помеченных дней не расширяется сверх уже
+    // помеченного. Снятие пометки (например, после пересчёта волной 1) —
+    // не забота этого теста и не забота этой функции.
+    let second = insert_heartbeats(&mut conn, &interner, user.id, &batch, user.timezone).unwrap();
+    assert_eq!(second.outcomes, vec![Outcome::Duplicate]);
 
-    assert_eq!(days, vec![NaiveDate::from_ymd_opt(2025, 8, 12).unwrap()]);
+    assert_eq!(
+        dirty_days_for(&conn, user.id).unwrap(),
+        vec![NaiveDate::from_ymd_opt(2025, 8, 12).unwrap()]
+    );
+}
+
+#[test]
+fn an_empty_batch_touches_nothing() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
+    // Пустой батч — единственный путь выхода без открытия транзакции.
+    let report = insert_heartbeats(&mut conn, &interner, user.id, &[], user.timezone).unwrap();
+
+    assert_eq!(report.outcomes, Vec::new());
+    assert!(dirty_days_for(&conn, user.id).unwrap().is_empty());
 }
