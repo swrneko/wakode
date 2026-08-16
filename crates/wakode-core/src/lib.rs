@@ -1,7 +1,9 @@
 pub mod config;
 pub mod domain;
+pub mod intervals;
 pub mod time;
 
 pub use config::{ConfigError, DurationConfig};
 pub use domain::{Attrs, Category, EntityKind, Heartbeat, Sid};
+pub use intervals::{build_intervals, Interval};
 pub use time::Micros;
