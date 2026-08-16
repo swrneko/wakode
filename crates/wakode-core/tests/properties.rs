@@ -8,7 +8,7 @@
 
 use proptest::prelude::*;
 use wakode_core::{
-    build_intervals, Attrs, Category, DurationConfig, EntityKind, Heartbeat, Micros, Sid,
+    build_intervals, Attrs, Category, DurationConfig, EntityKind, Heartbeat, Interval, Micros, Sid,
 };
 
 const SEC: i64 = 1_000_000;
@@ -65,7 +65,9 @@ fn arb_config() -> impl Strategy<Value = DurationConfig> {
 
 /// Шаг между соседними отметками. Смещён к границам, а не к «приличной»
 /// равномерной случайности: равномерный шаг почти никогда не попадёт ровно в
-/// таймаут, а именно там живут ошибки на единицу.
+/// таймаут, а именно там живут ошибки на единицу. При нулевой добавке шаг
+/// `padding - 1` даёт `-1` — время идёт назад; это допустимый вход, движок
+/// обязан сортировать сам.
 fn arb_delta(timeout: i64, padding: i64) -> impl Strategy<Value = i64> {
     prop_oneof![
         3 => Just(0i64),                        // дубликат по времени
@@ -74,6 +76,8 @@ fn arb_delta(timeout: i64, padding: i64) -> impl Strategy<Value = i64> {
         4 => Just(timeout.saturating_add(1)),   // на микросекунду больше — разрыв
         2 => Just(timeout.saturating_sub(1)),
         2 => Just(padding),
+        2 => Just(padding.saturating_add(1)),
+        2 => Just(padding.saturating_sub(1)),
         4 => 0i64..=timeout.saturating_mul(3),
         2 => 0i64..=(86_400 * SEC),             // длинные простои
     ]
@@ -142,7 +146,7 @@ fn arb_scenario_with_permutation(
     })
 }
 
-fn total(intervals: &[wakode_core::Interval]) -> i64 {
+fn total(intervals: &[Interval]) -> i64 {
     intervals.iter().map(|iv| iv.duration().get()).sum()
 }
 
@@ -221,6 +225,57 @@ proptest! {
                 hbs.iter().any(|hb| hb.time == iv.start && hb.attrs == iv.attrs),
                 "интервал {:?} не соответствует ни одной входной отметке",
                 iv
+            );
+        }
+    }
+
+    /// Хвост сессии равен ровно настроенной добавке — ни больше, ни меньше.
+    ///
+    /// Без этого свойства `tail_padding` не проверялся вообще: движок, который
+    /// игнорирует настройку и добивает хвост полным таймаутом, и движок,
+    /// который молча выбрасывает добавку, проходят все остальные свойства.
+    /// Оценка снизу тут не помогает: `padding <= timeout` всегда, поэтому
+    /// раздутый до таймаута хвост любую нижнюю границу удовлетворяет. Нужна
+    /// именно двусторонняя привязка, то есть точный интервал.
+    ///
+    /// Границы сессий тест не вычисляет: условие «следующей отметки нет или до
+    /// неё дальше таймаута» — это определение разрыва из контракта
+    /// `build_intervals`, а не деталь его реализации.
+    #[test]
+    fn session_tail_is_exactly_the_configured_padding((cfg, hbs) in arb_scenario()) {
+        let padding = cfg.tail_padding();
+        if padding == Micros::ZERO {
+            // Нулевая добавка хвостовых интервалов не порождает вовсе —
+            // это проверяет юнит-тест `zero_padding_produces_no_tail_interval`.
+            return Ok(());
+        }
+
+        let mut sorted = hbs.clone();
+        sorted.sort();
+        let intervals = build_intervals(&hbs, cfg);
+
+        for (i, hb) in sorted.iter().enumerate() {
+            let closes_session = match sorted.get(i + 1) {
+                Some(next) => next.time.saturating_sub(hb.time) > cfg.timeout(),
+                None => true,
+            };
+            // У самого края `i64` добавка не помещается и хвост укорачивается
+            // насыщением; точное значение там не определено, а непревышение
+            // таймаута проверяет соседнее свойство.
+            let Some(end) = hb.time.get().checked_add(padding.get()) else {
+                continue;
+            };
+            if !closes_session {
+                continue;
+            }
+
+            let expected = Interval { start: hb.time, end: Micros::new(end), attrs: hb.attrs };
+            prop_assert!(
+                intervals.contains(&expected),
+                "сессия, закрытая отметкой {:?}, не получила хвост ровно в {:?}; получено {:?}",
+                hb,
+                padding,
+                intervals.iter().filter(|iv| iv.start == hb.time).collect::<Vec<_>>()
             );
         }
     }
