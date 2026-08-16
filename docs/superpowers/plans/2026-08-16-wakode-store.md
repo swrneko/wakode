@@ -48,6 +48,7 @@ crates/wakode-store/
     dedup.rs         # детерминированный хеш отметки
     interner.rs      # словарь строк в памяти
     heartbeats.rs    # вставка с дедупом, чтение диапазона
+    dirty.rs         # пометка затронутых локальных дней
     users.rs         # пользователи
     keys.rs          # API-ключи
     sessions.rs      # сессии
