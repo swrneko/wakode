@@ -421,6 +421,25 @@ mod tests {
     }
 
     #[test]
+    fn inverted_interval_counts_the_same_whole_and_by_days() {
+        // Нарезка вывернутый интервал просто не берёт — цикл `cursor < iv.end`
+        // не делает ни шага. Значит и общий итог обязан считать его нулём,
+        // иначе ломается ровно тот инвариант, ради которого этот модуль
+        // существует: сумма по дням равна сумме за период.
+        let tz: Tz = "Europe/Moscow".parse().unwrap();
+        let inverted = interval("2026-08-15T12:00:00Z", "2026-08-15T11:00:00Z");
+
+        let by_days: i64 = split_by_local_day(&[inverted], tz)
+            .values()
+            .flatten()
+            .map(|piece| piece.duration().get())
+            .sum();
+
+        assert_eq!(crate::grand_total(&[inverted]).get(), by_days);
+        assert_eq!(by_days, 0);
+    }
+
+    #[test]
     fn splitting_preserves_total_duration() {
         let tz: Tz = "Europe/Moscow".parse().unwrap();
         let iv = interval("2026-08-14T20:30:00Z", "2026-08-14T21:30:00Z");

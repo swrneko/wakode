@@ -3,6 +3,14 @@ use serde::{Deserialize, Serialize};
 use crate::{Attrs, DurationConfig, Heartbeat, Micros};
 
 /// Отрезок времени с атрибутами отметки, которой он принадлежит.
+///
+/// Предусловие типа — `start <= end`. Поля публичны намеренно: ручные записи
+/// пользователя вливаются в расчёт готовыми интервалами, минуя движок. Ценой
+/// этого тип не может проверить себя в конструкторе, поэтому вывернутый
+/// интервал (`start > end`) не запрещён, а обесценен: он стоит ноль времени, а
+/// не отрицательное. Иначе три модуля разошлись бы во мнениях — суммирование
+/// вычло бы такой интервал из чужого времени, а нарезка по дням пропустила бы
+/// его вовсе, и «сумма по дням равна сумме за период» перестало бы выполняться.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[derive(Serialize, Deserialize)]
 pub struct Interval {
@@ -12,8 +20,9 @@ pub struct Interval {
 }
 
 impl Interval {
+    /// Длительность интервала; у вывернутого интервала — ноль.
     pub fn duration(self) -> Micros {
-        self.end.saturating_sub(self.start)
+        self.end.saturating_sub(self.start).max(Micros::ZERO)
     }
 }
 
@@ -74,6 +83,22 @@ mod tests {
 
     fn hb(secs: i64, project: u32) -> Heartbeat {
         Heartbeat { time: Micros::from_secs(secs), attrs: attrs(project) }
+    }
+
+    #[test]
+    fn inverted_interval_is_worth_no_time() {
+        // Поля `Interval` публичны, и спека прямо обещает, что ручные записи
+        // «вливаются как готовые интервалы», — значит вывернутый интервал
+        // построит не движок, а вызывающая сторона. Отрицательная длительность
+        // не бывает полезной ни в одном сценарии: она вычитается из чужого
+        // времени и уводит итог ниже суммы слагаемых.
+        let iv = Interval {
+            start: Micros::from_secs(3600),
+            end: Micros::from_secs(0),
+            attrs: attrs(1),
+        };
+
+        assert_eq!(iv.duration(), Micros::ZERO);
     }
 
     #[test]
