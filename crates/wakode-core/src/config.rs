@@ -1,13 +1,38 @@
+use std::fmt;
+
 use crate::Micros;
 
+/// Таймаут по умолчанию в секундах — тот же, что у WakaTime.
+///
+/// Значение публично не только ради `Default`: совместимый эндпоинт
+/// `all_time_since_today` обязан вернуть поле `timeout`, и брать его неоткуда,
+/// кроме как отсюда.
 pub const DEFAULT_TIMEOUT_SECS: i64 = 900;
 
+/// Чем плоха отвергнутая конфигурация.
+///
+/// Значения приходят из пользовательского TOML, поэтому у ошибки есть `Display`
+/// с человеческим текстом и `std::error::Error` — слой загрузки поднимает её
+/// через `?` и печатает как есть.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ConfigError {
     NonPositiveTimeout,
     NegativePadding,
     PaddingExceedsTimeout,
 }
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            ConfigError::NonPositiveTimeout => "таймаут должен быть положительным",
+            ConfigError::NegativePadding => "хвостовая добавка не может быть отрицательной",
+            ConfigError::PaddingExceedsTimeout => "хвостовая добавка не может превышать таймаут",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for ConfigError {}
 
 /// Параметры склейки отметок в интервалы.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -96,6 +121,32 @@ mod tests {
         // строго больше — нет (см. rejects_padding_larger_than_timeout).
         let cfg = DurationConfig::new(Micros::from_secs(60), Micros::from_secs(60)).unwrap();
         assert_eq!(cfg.tail_padding(), cfg.timeout());
+    }
+
+    #[test]
+    fn every_error_explains_itself_to_the_user() {
+        // Конфигурацию читает человек из TOML, и «NonPositiveTimeout» в консоли
+        // ему не поможет. Display нужен не для красоты, а чтобы слой загрузки
+        // мог поднять ошибку через `?` и напечатать её как есть.
+        assert_eq!(
+            ConfigError::NonPositiveTimeout.to_string(),
+            "таймаут должен быть положительным"
+        );
+        assert_eq!(
+            ConfigError::NegativePadding.to_string(),
+            "хвостовая добавка не может быть отрицательной"
+        );
+        assert_eq!(
+            ConfigError::PaddingExceedsTimeout.to_string(),
+            "хвостовая добавка не может превышать таймаут"
+        );
+    }
+
+    #[test]
+    fn config_error_is_a_std_error() {
+        // Признак пригодности для `?` в функции, возвращающей Box<dyn Error>.
+        let boxed: Box<dyn std::error::Error> = Box::new(ConfigError::PaddingExceedsTimeout);
+        assert_eq!(boxed.to_string(), "хвостовая добавка не может превышать таймаут");
     }
 
     #[test]
