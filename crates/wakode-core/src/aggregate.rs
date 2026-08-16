@@ -1,10 +1,18 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{Attrs, Interval, Micros};
 
 /// Сумма длительности интервалов, попавших в одну группу.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// Бакеты уезжают в массивы `summaries` совместимого слоя как есть, поэтому тип
+/// сериализуем. Производные реализации условны по `K`: ключ, который сам не
+/// умеет сравниваться или сериализоваться, просто не даёт бакету этих
+/// возможностей.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Serialize, Deserialize)]
 pub struct Bucket<K> {
     pub key: K,
     pub total: Micros,
@@ -213,5 +221,16 @@ mod tests {
     fn grand_total_saturates_instead_of_overflowing() {
         let intervals = [huge_interval(1), huge_interval(2)];
         assert_eq!(grand_total(&intervals), Micros::new(i64::MAX));
+    }
+
+    #[test]
+    fn bucket_survives_a_json_round_trip() {
+        // Бакеты уезжают в массивы `summaries` совместимого эндпоинта, поэтому
+        // их проволочное представление — контракт, а не удобство.
+        let bucket = Bucket { key: Some(Sid(3)), total: Micros::from_secs(60) };
+        let json = serde_json::to_string(&bucket).unwrap();
+
+        assert_eq!(json, r#"{"key":3,"total":60000000}"#);
+        assert_eq!(serde_json::from_str::<Bucket<Option<Sid>>>(&json).unwrap(), bucket);
     }
 }

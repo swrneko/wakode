@@ -11,7 +11,11 @@ use crate::{Attrs, DurationConfig, Heartbeat, Micros};
 /// не отрицательное. Иначе три модуля разошлись бы во мнениях — суммирование
 /// вычло бы такой интервал из чужого времени, а нарезка по дням пропустила бы
 /// его вовсе, и «сумма по дням равна сумме за период» перестало бы выполняться.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// Порядок — хронологический: сначала по началу, затем по концу, затем по
+/// атрибутам. Он нужен слою выше, который сливает ручные записи пользователя с
+/// посчитанными движком и сортирует общий вектор.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 #[derive(Serialize, Deserialize)]
 pub struct Interval {
     pub start: Micros,
@@ -83,6 +87,20 @@ mod tests {
 
     fn hb(secs: i64, project: u32) -> Heartbeat {
         Heartbeat { time: Micros::from_secs(secs), attrs: attrs(project) }
+    }
+
+    #[test]
+    fn intervals_sort_chronologically() {
+        // Слой выше сливает ручные записи пользователя с посчитанными движком и
+        // обязан уметь просто отсортировать вектор — без своего компаратора.
+        let mut ivs = vec![
+            Interval { start: Micros::from_secs(60), end: Micros::from_secs(120), attrs: attrs(1) },
+            Interval { start: Micros::ZERO, end: Micros::from_secs(60), attrs: attrs(2) },
+        ];
+        ivs.sort();
+
+        assert_eq!(ivs[0].start, Micros::ZERO);
+        assert_eq!(ivs[1].start, Micros::from_secs(60));
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeDelta, TimeZone, Utc};
 use chrono_tz::Tz;
 
-use crate::{Interval, Micros};
+use crate::{DurationConfig, Interval, Micros};
 
 /// Ширина окна поиска первого существующего момента суток, в минутах.
 const MINUTES_IN_DAY: i64 = 24 * 60;
@@ -180,6 +180,33 @@ pub fn local_day_of(t: Micros, tz: Tz) -> NaiveDate {
     // дня и останавливается.
     let t = Micros::new(t.get().clamp(CALENDAR_MIN, CALENDAR_MAX));
     containing_day(t, local_date_of(t, tz), tz).0
+}
+
+/// Окно, за которое нужно поднять отметки, чтобы посчитать один локальный день.
+///
+/// Это **не** границы суток: их даёт [`local_day_bounds`]. Границы суток
+/// отвечают на вопрос «какое время принадлежит дню», а здесь ответ на другой —
+/// «какие отметки нужно прочитать, чтобы это время сосчитать», и он шире на
+/// таймаут в обе стороны.
+///
+/// Разница не косметическая. Интервал рождается парой отметок, и время после
+/// полуночи приносит пара, у которой ранняя отметка лежит во вчерашнем дне:
+/// сессия с 23:55 до 00:05 отдаёт новому дню пять минут, но выборка ровно по
+/// границам суток отсечёт отметку в 23:55, пара не составится, и день получит
+/// не пять минут, а ноль. Симметрично на конце: отметка сразу после полуночи
+/// закрывает вчерашнюю сессию.
+///
+/// Ширина запаса — ровно таймаут, потому что дальше него отметка уже не
+/// способна составить пару с отметкой внутри суток: такой разрыв обрывает
+/// сессию по определению. Хвостовая добавка запаса не требует — инвариант
+/// `tail_padding <= timeout` держит её внутри того же окна.
+///
+/// Лишние отметки на краях безвредны: интервалы, целиком лежащие вне суток,
+/// [`split_by_local_day`] разложит по своим дням, а вызывающая сторона возьмёт
+/// нужный ключ.
+pub fn heartbeat_window(date: NaiveDate, tz: Tz, cfg: DurationConfig) -> (Micros, Micros) {
+    let (start, end) = local_day_bounds(date, tz);
+    (start.saturating_sub(cfg.timeout()), end.saturating_add(cfg.timeout()))
 }
 
 /// Разрезает интервалы по границам локальных суток.
@@ -491,6 +518,60 @@ mod tests {
 
         assert_eq!(local_day_of(Micros::new(i64::MAX), tz), last_day());
         assert_eq!(local_day_of(Micros::new(i64::MIN), tz), first_day());
+    }
+
+    #[test]
+    fn heartbeat_window_saves_the_session_that_starts_before_midnight() {
+        // Сессия 23:55 → 00:05 по Москве. Пять минут после полуночи
+        // принадлежат пятнадцатому августа, но интервал их порождает только в
+        // паре с отметкой, лежащей в четырнадцатом. Выборка ровно по границам
+        // суток эту отметку не захватывает, и день теряет всё время целиком.
+        let tz: Tz = "Europe/Moscow".parse().unwrap();
+        let day = date(2026, 8, 15);
+        let cfg = crate::DurationConfig::default();
+        let hbs = [
+            crate::Heartbeat { time: at("2026-08-14T23:55:00+03:00"), attrs: attrs() },
+            crate::Heartbeat { time: at("2026-08-15T00:05:00+03:00"), attrs: attrs() },
+        ];
+
+        let counted_for_day = |(from, to): (Micros, Micros)| -> i64 {
+            let picked: Vec<_> =
+                hbs.iter().copied().filter(|hb| hb.time >= from && hb.time < to).collect();
+            split_by_local_day(&crate::build_intervals(&picked, cfg), tz)
+                .get(&day)
+                .map(|pieces| pieces.iter().map(|piece| piece.duration().get()).sum())
+                .unwrap_or(0)
+        };
+
+        assert_eq!(counted_for_day(local_day_bounds(day, tz)), 0, "выборка ровно по суткам врёт");
+        assert_eq!(
+            counted_for_day(heartbeat_window(day, tz, cfg)),
+            Micros::from_secs(300).get(),
+            "с запасом день получает свои пять минут"
+        );
+    }
+
+    #[test]
+    fn heartbeat_window_widens_the_day_by_exactly_one_timeout() {
+        // Запас именно в таймаут, а не «с походом»: дальше таймаута отметка уже
+        // не может составить пару с отметкой внутри суток, а лишние отметки
+        // пришлось бы читать из хранилища на каждый день.
+        let tz: Tz = "Europe/Moscow".parse().unwrap();
+        let cfg = crate::DurationConfig::new(Micros::from_secs(900), Micros::ZERO).unwrap();
+        let (day_start, day_end) = local_day_bounds(date(2026, 8, 15), tz);
+        let (from, to) = heartbeat_window(date(2026, 8, 15), tz, cfg);
+
+        assert_eq!(day_start.saturating_sub(from), Micros::from_secs(900));
+        assert_eq!(to.saturating_sub(day_end), Micros::from_secs(900));
+    }
+
+    #[test]
+    fn heartbeat_window_saturates_at_the_edges_of_the_calendar() {
+        let tz: Tz = "Europe/Moscow".parse().unwrap();
+        let cfg = crate::DurationConfig::default();
+
+        assert_eq!(heartbeat_window(first_day(), tz, cfg).0, Micros::new(i64::MIN));
+        assert_eq!(heartbeat_window(last_day(), tz, cfg).1, Micros::new(i64::MAX));
     }
 
     #[test]

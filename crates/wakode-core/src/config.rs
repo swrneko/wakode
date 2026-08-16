@@ -35,7 +35,21 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 /// Параметры склейки отметок в интервалы.
+///
+/// # Почему тип сериализуется, но не десериализуется
+///
+/// `Serialize` нужен совместимому эндпоинту `all_time_since_today`, который
+/// обязан вернуть поле `timeout`. Обратной реализации у типа нет намеренно, и
+/// добавлять её **нельзя**: производный `Deserialize` собирает структуру
+/// поле за полем, минуя [`DurationConfig::new`], — то есть молча обходит
+/// проверку `tail_padding <= timeout`. Инвариант перестал бы существовать
+/// ровно там, где значения приходят снаружи и доверять им нельзя больше всего.
+///
+/// Конфигурацию из TOML или JSON следует читать в свой тип-сырец и пропускать
+/// через `new()`, а ошибку показывать пользователю: у [`ConfigError`] для этого
+/// есть `Display`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(serde::Serialize)]
 pub struct DurationConfig {
     timeout: Micros,
     tail_padding: Micros,
@@ -140,6 +154,15 @@ mod tests {
             ConfigError::PaddingExceedsTimeout.to_string(),
             "хвостовая добавка не может превышать таймаут"
         );
+    }
+
+    #[test]
+    fn duration_config_serializes_for_the_compat_payload() {
+        // `all_time_since_today` обязан вернуть поле `timeout`. Обратной
+        // операции у типа сознательно нет — см. документацию DurationConfig.
+        let json = serde_json::to_value(DurationConfig::default()).unwrap();
+
+        assert_eq!(json, serde_json::json!({ "timeout": 900_000_000i64, "tail_padding": 0 }));
     }
 
     #[test]
