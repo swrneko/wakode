@@ -2,6 +2,7 @@
 
 #[allow(dead_code)]
 pub(crate) mod clock;
+pub mod codec;
 pub mod conn;
 pub mod error;
 pub mod migrate;
