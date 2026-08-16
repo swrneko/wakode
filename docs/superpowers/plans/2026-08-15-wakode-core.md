@@ -11,8 +11,9 @@
 ## Global Constraints
 
 - Спека: `docs/superpowers/specs/2026-08-15-wakode-design.md`.
-- Крейт `wakode-core` **не имеет права** зависеть от `sqlx`, `axum`, `tokio`, `reqwest` и любых I/O-библиотек. Единственные зависимости — `chrono`, `chrono-tz`, `serde` (только derive для доменных типов), `proptest` в dev.
-- Время внутри крейта — всегда микросекунды с epoch UTC, тип `Micros(i64)`. Никаких `f64` для времени: они приходят только на границе HTTP-слоя.
+- Крейт `wakode-core` **не имеет права** зависеть от `sqlx`, `axum`, `tokio`, `reqwest` и любых I/O-библиотек. Единственные зависимости — `chrono`, `chrono-tz`, `serde` (только derive для доменных типов); в dev — `proptest` и `serde_json`. Последний добавлен по итогам финального ревью: проволочный формат домена (`#[serde(rename = ...)]` на категориях) — контракт совместимости с плагинами, а закрепить его тестом без конкретного формата невозможно. В обычное дерево зависимостей крейта не попадает.
+- Фича `clock` у `chrono` **не включается**: она тянет `iana-time-zone`, читающий `/etc/localtime`. Крейт не использует ни `Local`, ни `::now()`, и заявление «никакого I/O» должно обеспечиваться деревом зависимостей, а не соглашением.
+- Время внутри крейта — всегда микросекунды с epoch UTC, тип `Micros(i64)`. `f64` не является представлением времени ни в одном типе и ни в одной сигнатуре расчётов; единственное исключение — конверсионные методы `Micros::from_secs_f64` / `Micros::as_secs_f64`, которые живут на самом newtype, чтобы округление было определено в одном месте, а не дублировалось на границе HTTP-слоя.
 - Таймаут по умолчанию — 900 секунд (совпадает с WakaTime).
 - Хвостовая добавка (`tail_padding`) — явный параметр конфигурации, а не константа. Её значение неизвестно и калибруется позже по живому аккаунту WakaTime; по умолчанию 0.
 - Инвариант конфигурации: `tail_padding <= timeout`. Без него интервалы разных сессий могут пересечься.
@@ -516,7 +517,9 @@ git commit -m "feat(core): конфигурация движка длитель�
 
 **Interfaces:**
 - Consumes: `Heartbeat`, `Attrs`, `Micros`, `DurationConfig`.
-- Produces: `Interval { start: Micros, end: Micros, attrs: Attrs }` с методом `duration(self) -> Micros`; функция `build_intervals(heartbeats: &[Heartbeat], cfg: DurationConfig) -> Vec<Interval>`.
+- Produces: `Interval { start: Micros, end: Micros, attrs: Attrs }` с методом `duration(self) -> Micros`; функция `build_intervals(heartbeats: &[Heartbeat], _cfg: DurationConfig) -> Vec<Interval>`.
+
+Параметр конфигурации в этой задаче ещё не используется — отсюда подчёркивание в имени. Разрыв сессии по таймауту появится в Task 5 вместе с тестами, которые его требуют.
 
 - [ ] **Step 1: Написать падающий тест**
 
@@ -630,9 +633,9 @@ impl Interval {
 
 /// Превращает поток отметок в непересекающиеся интервалы.
 ///
-/// Каждая пара соседних по времени отметок даёт интервал, если разрыв между
-/// ними не превышает таймаута. Интервал наследует атрибуты более ранней из пары.
-pub fn build_intervals(heartbeats: &[Heartbeat], cfg: DurationConfig) -> Vec<Interval> {
+/// Каждая пара соседних по времени отметок даёт интервал; интервал наследует
+/// атрибуты более ранней из пары.
+pub fn build_intervals(heartbeats: &[Heartbeat], _cfg: DurationConfig) -> Vec<Interval> {
     if heartbeats.is_empty() {
         return Vec::new();
     }
@@ -643,9 +646,6 @@ pub fn build_intervals(heartbeats: &[Heartbeat], cfg: DurationConfig) -> Vec<Int
     let mut out = Vec::with_capacity(sorted.len());
     for (i, hb) in sorted.iter().enumerate() {
         let Some(next) = sorted.get(i + 1) else { continue };
-        if next.time.saturating_sub(hb.time) > cfg.timeout() {
-            continue;
-        }
         if next.time > hb.time {
             out.push(Interval { start: hb.time, end: next.time, attrs: hb.attrs });
         }
@@ -716,16 +716,50 @@ git commit -m "feat(core): склейка соседних отметок в и�
     }
 ```
 
-- [ ] **Step 2: Запустить тесты**
+- [ ] **Step 2: Запустить тесты и убедиться, что они падают**
 
 Run: `cargo test -p wakode-core`
-Expected: PASS — поведение уже реализовано в Task 4 через `continue` при превышении таймаута. Если хоть один тест падает, значит граница сравнения перепутана: должно быть `> cfg.timeout()`, а не `>=`.
+Expected: FAIL на `gap_longer_than_timeout_breaks_the_session` — пауза в 901 секунду пока даёт интервал, потому что таймаут ещё не учитывается
 
-- [ ] **Step 3: Коммит**
+- [ ] **Step 3: Реализовать разрыв сессии**
+
+В `crates/wakode-core/src/intervals.rs` переименовать параметр `_cfg` в `cfg` и добавить проверку внутрь цикла:
+
+```rust
+pub fn build_intervals(heartbeats: &[Heartbeat], cfg: DurationConfig) -> Vec<Interval> {
+    if heartbeats.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sorted = heartbeats.to_vec();
+    sorted.sort_unstable();
+
+    let mut out = Vec::with_capacity(sorted.len());
+    for (i, hb) in sorted.iter().enumerate() {
+        let Some(next) = sorted.get(i + 1) else { continue };
+        // Пауза длиннее таймаута означает, что пользователь ушёл: это время не
+        // засчитывается никому. Граница включительная — ровно таймаут ещё считается.
+        if next.time.saturating_sub(hb.time) > cfg.timeout() {
+            continue;
+        }
+        if next.time > hb.time {
+            out.push(Interval { start: hb.time, end: next.time, attrs: hb.attrs });
+        }
+    }
+    out
+}
+```
+
+- [ ] **Step 4: Запустить тесты**
+
+Run: `cargo test -p wakode-core`
+Expected: PASS, восемнадцать тестов
+
+- [ ] **Step 5: Коммит**
 
 ```bash
 git add crates/wakode-core
-git commit -m "test(core): разрыв сессии по таймауту"
+git commit -m "feat(core): разрыв сессии по таймауту"
 ```
 
 ---
@@ -872,33 +906,20 @@ git commit -m "feat(core): хвостовая добавка последней 
     }
 ```
 
-- [ ] **Step 2: Запустить тесты и убедиться, что они падают**
+- [ ] **Step 2: Запустить тесты**
 
 Run: `cargo test -p wakode-core`
-Expected: FAIL на `duplicate_heartbeats_do_not_inflate_totals` — дубликаты дают лишние интервалы нулевой длины, а с ненулевой добавкой ещё и лишние хвосты
+Expected: PASS, двадцать семь тестов — без единого изменения в коде.
 
-- [ ] **Step 3: Добавить дедупликацию**
+Это не ошибка плана и не повод дописывать реализацию. Движок уже устойчив к дубликатам, и устойчивость эту несёт guard `end > hb.time` из задачи 6: два одинаковых timestamp дают интервал нулевой длины, а guard его отсекает. Задача 7 не добавляет поведения — она фиксирует тестами уже существующий контракт, который до сих пор держался на одном строгом сравнении и мог быть сломан незаметно.
 
-В `build_intervals` (`crates/wakode-core/src/intervals.rs`), сразу после сортировки:
+Явная дедупликация (`sorted.dedup()`) здесь **не нужна и не добавляется**: доказано, что она не меняет результат `build_intervals` ни при каком входе — ни в середине сессии, ни на разрыве, ни в позиции хвостовой добавки, ни при нулевой, ни при ненулевой `tail_padding`. Строка, которая ничего не делает, но выглядит несущей, дороже своего отсутствия.
 
-```rust
-    let mut sorted = heartbeats.to_vec();
-    sorted.sort_unstable();
-    // После сортировки полные дубликаты стоят рядом. Повторная доставка того же
-    // батча не должна менять результат.
-    sorted.dedup();
-```
-
-- [ ] **Step 4: Запустить тесты**
-
-Run: `cargo test -p wakode-core`
-Expected: PASS, двадцать пять тестов
-
-- [ ] **Step 5: Коммит**
+- [ ] **Step 3: Коммит**
 
 ```bash
 git add crates/wakode-core
-git commit -m "feat(core): устойчивость движка к порядку и дубликатам"
+git commit -m "test(core): зафиксировать устойчивость движка к порядку и дубликатам"
 ```
 
 ---

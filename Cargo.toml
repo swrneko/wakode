@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["crates/wakode-core"]
+
+[workspace.package]
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[workspace.dependencies]
+# Без `clock`: он тянет iana-time-zone, а тот читает /etc/localtime. Изоляция
+# wakode-core от файловой системы обязана держаться на списке зависимостей, а не
+# на честном слове. Крейту, которому понадобится `Local::now()`, включать фичу у
+# себя — здесь она не нужна никому.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = "0.10"
+serde = { version = "1", features = ["derive"] }
+proptest = "1"
+# Только в dev-зависимостях: формат нужен, чтобы зафиксировать тестами
+# проволочное представление доменных типов. В сборку крейта не попадает.
+serde_json = "1"
