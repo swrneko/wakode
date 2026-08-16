@@ -92,7 +92,18 @@ impl Interner {
         // номера, которым в `strings` ничего не соответствует. Следующая же
         // отметка с таким номером упёрлась бы во внешний ключ.
         let tx = conn.unchecked_transaction()?;
-        let mut fresh: Vec<(Arc<str>, Sid)> = Vec::new();
+        // Повторы внутри батча закрываются этой картой, а не повторным
+        // запросом за тем же значением: батч отметок приносит имя проекта по
+        // разу на каждую отметку, а `DO UPDATE` — настоящая перезапись
+        // строки, а не холостой ход, так что поход в базу за каждым
+        // повторением был бы расточителен. Заодно карта держит ровно одну
+        // `Arc` на новое значение — если бы каждый повтор заводил свою
+        // `Arc::from`, `by_value` (вставляется первым) и `by_id`
+        // (вставляется последним из `fresh`) хранили бы разные аллокации
+        // одной и той же строки, и обещание докстрока «обе карты делят одну
+        // копию текста» переставало бы быть правдой именно для повторяющихся
+        // новых значений.
+        let mut fresh: HashMap<&str, (Arc<str>, Sid)> = HashMap::new();
         let mut out = Vec::with_capacity(values.len());
 
         {
@@ -107,12 +118,15 @@ impl Interner {
                     out.push(sid);
                     continue;
                 }
-                // Повтор внутри батча отдельно не ловим: второй запрос
-                // упрётся в тот же конфликт и вернёт тот же номер.
+                if let Some((_, sid)) = fresh.get(*value) {
+                    out.push(*sid);
+                    continue;
+                }
+
                 let id: i64 = stmt.query_row([value], |row| row.get(0))?;
                 let sid = i64_to_sid(id)?;
                 out.push(sid);
-                fresh.push((Arc::from(*value), sid));
+                fresh.insert(value, (Arc::from(*value), sid));
             }
         }
 
@@ -123,7 +137,7 @@ impl Interner {
         // оставляет словарь ровно таким, каким он был.
         {
             let mut maps = self.inner.write().expect("словарь отравлен паникой");
-            for (text, sid) in fresh {
+            for (text, sid) in fresh.into_values() {
                 maps.by_value.insert(Arc::clone(&text), sid);
                 maps.by_id.insert(sid, text);
             }

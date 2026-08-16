@@ -111,32 +111,41 @@ fn dictionary_survives_reopening_the_database() {
     assert_eq!(interner.lookup("постоянная строка"), Some(sid));
 }
 
-/// `dictionary_survives_reopening_the_database` доказывает, что строка
-/// пережила закрытие базы, но не доказывает, что коммит сделал именно
-/// `intern_batch` — с автокоммитом SQLite это выглядело бы точно так же.
-/// Здесь после интернирования на том же соединении открывается и
-/// откатывается посторонняя транзакция: если бы `intern_batch` полагался на
-/// коммит вызывающего (или вовсе не коммитил), откат унёс бы интернированную
-/// строку вместе со своей.
 #[test]
-fn intern_batch_commits_on_its_own_even_if_a_later_transaction_on_the_same_connection_rolls_back()
-{
+fn intern_batch_commits_before_it_returns() {
+    // Доказательство того, что коммит произошёл **внутри** `intern_batch`, а
+    // не когда-нибудь потом: второе соединение — независимый наблюдатель, и
+    // незакоммиченную запись первого оно увидеть не может в принципе.
+    // Переоткрытие базы этого не показывает: там коммит мог случиться и на
+    // закрытии соединения.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wakode.db");
+
+    let mut writer = wakode_store::open(&path).unwrap();
+    migrate(&mut writer).unwrap();
+    let interner = Interner::load(&writer).unwrap();
+
+    let sid = interner.intern_batch(&writer, &["видно снаружи"]).unwrap()[0];
+
+    let observer = wakode_store::open(&path).unwrap();
+    let seen = Interner::load(&observer).unwrap();
+
+    assert_eq!(seen.lookup("видно снаружи"), Some(sid));
+    assert_eq!(&*seen.resolve(sid).unwrap(), "видно снаружи");
+}
+
+#[test]
+fn interning_inside_an_open_transaction_is_refused() {
+    // Контракт метода — «зовётся вне открытой транзакции». Нарушение обязано
+    // быть ошибкой, а не тихой вложенностью: словарь, записавший в память
+    // номера из чужой транзакции, переживёт её откат и начнёт врать.
     let mut conn = open_in_memory().unwrap();
     migrate(&mut conn).unwrap();
     let interner = Interner::load(&conn).unwrap();
 
-    let sid = interner.intern_batch(&conn, &["src/main.rs"]).unwrap()[0];
+    let tx = conn.transaction().unwrap();
+    assert!(interner.intern_batch(&tx, &["внутри транзакции"]).is_err());
+    drop(tx);
 
-    {
-        let tx = conn.unchecked_transaction().unwrap();
-        tx.execute("INSERT INTO strings(value) VALUES ('постороннее значение')", [])
-            .unwrap();
-        // Транзакция откатывается здесь, при выходе из области видимости,
-        // без вызова `commit`.
-    }
-
-    let reloaded = Interner::load(&conn).unwrap();
-    assert_eq!(&*reloaded.resolve(sid).unwrap(), "src/main.rs");
-    assert_eq!(reloaded.lookup("src/main.rs"), Some(sid));
-    assert_eq!(reloaded.lookup("постороннее значение"), None);
+    assert_eq!(interner.lookup("внутри транзакции"), None);
 }
