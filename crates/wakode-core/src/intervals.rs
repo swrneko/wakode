@@ -32,9 +32,10 @@ pub fn build_intervals(heartbeats: &[Heartbeat], cfg: DurationConfig) -> Vec<Int
 
     let mut sorted = heartbeats.to_vec();
     sorted.sort_unstable();
-    // После сортировки полные дубликаты стоят рядом. Повторная доставка того же
-    // батча не должна менять результат.
-    sorted.dedup();
+    // Дубликаты не удаляются отдельно: после сортировки полностью одинаковая
+    // отметка стоит рядом со своей копией, даёт с ней интервал нулевой длины,
+    // и его отсекает guard `end > hb.time` ниже — тот же механизм, что убирает
+    // любой другой нулевой интервал.
 
     let mut out = Vec::with_capacity(sorted.len());
     for (i, hb) in sorted.iter().enumerate() {
