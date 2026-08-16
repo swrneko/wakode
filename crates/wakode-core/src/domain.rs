@@ -39,6 +39,31 @@ pub enum EntityKind {
 ///
 /// Своей нумерации wakatime-cli доверять нельзя: там номера идут через `iota`,
 /// и вставка `ai coding` третьим элементом уже сдвинула всё, что стояло после.
+///
+/// Номер из хранилища возвращать в вариант следует **явным `match`**, а не
+/// serde: выведенный визитор принимает не только строку, но и числовой индекс
+/// варианта, а индекс — это позиция в объявлении, а не дискриминант отсюда. На
+/// JSON-пути расхождение не проявляется (там требуется строка или map), но на
+/// самоописывающем бинарном формате оно молча переименует чужие данные.
+///
+/// # Отсутствующая категория — это `Coding`, а не `Unknown`
+///
+/// Решение принято явно, потому что оно станет персистентными данными.
+/// Отсутствие поля и `null` на проводе означают «плагин не сказал»:
+/// wakatime-cli всегда проставляет категорию, и его собственное значение по
+/// умолчанию — `coding`. Поэтому пустое значение разбирается в
+/// [`Category::Coding`], совпадая с `Default`.
+///
+/// [`Category::Unknown`] зарезервирован **строго под нераспознанную строку** —
+/// категорию от версии плагина новее той, под которую мы собраны. Это
+/// принципиально другой факт: «данные есть, мы их не понимаем». Схлопывать его
+/// с «данных нет» нельзя, иначе в БД два разных факта получат один дискриминант
+/// и различить их потом будет нечем.
+///
+/// Внутри крейта решение исполняет [`category_or_default`], навешанная на поле
+/// [`Attrs::category`]. Слою HTTP из плана 3 её же следует навесить на своё
+/// проволочное представление heartbeat'а — иначе `null` вернёт ошибку разбора,
+/// а не `Coding`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 #[derive(Serialize, Deserialize)]
 #[repr(u8)]
@@ -86,18 +111,51 @@ pub enum Category {
     WritingDocs = 20,
     #[serde(rename = "writing tests")]
     WritingTests = 21,
-    /// Категория, которой мы ещё не знаем.
+    /// Категория, которую прислали, но которую мы не распознали.
     ///
     /// Плагин обновляется раньше сервера, и незнакомое значение не имеет права
     /// уронить разбор всего heartbeat'а: потерянное время дороже точности
     /// измерения. Номер `0` занят этим вариантом навсегда — под ним же
     /// осядут категории, выведенные из употребления.
     ///
-    /// Строка `"unknown"` — наша собственная, в протоколе WakaTime её нет: там
-    /// отсутствию категории соответствует `null`, а `null` вариантом-юнитом не
-    /// выражается. Перевод `null` ⇄ `Unknown` — забота слоя HTTP.
+    /// Значение строго одно: **«данные есть, мы их не поняли»**. Отсутствие
+    /// категории — другой факт, и он отображается в `Coding`; подробности и
+    /// обоснование — в описании самого перечисления.
+    ///
+    /// # Задача плана 3
+    ///
+    /// Строка `"unknown"` — наша собственная, в протоколе WakaTime такого
+    /// значения нет. Внутри крейта и в своём API это нормально, но **наружу
+    /// совместимому клиенту её отдавать нельзя**: для wakatime-cli это
+    /// невалидная категория. Слой совместимости обязан отобразить `Unknown` в
+    /// то, что протокол допускает (`null`), прежде чем вернуть категорию
+    /// клиенту.
     #[serde(other, rename = "unknown")]
     Unknown = 0,
+}
+
+/// Разбирает категорию, отображая пустое значение в [`Category::Coding`].
+///
+/// Обоснование — в описании [`Category`]: `null` и отсутствие поля означают
+/// «плагин не сказал», а не «плагин сказал незнакомое». Нераспознанная строка
+/// проходит обычным путём и даёт [`Category::Unknown`], оставаясь отдельным
+/// фактом.
+///
+/// Функция публична намеренно: слой HTTP плана 3 разбирает heartbeat'ы в свои
+/// проволочные структуры, и решение должно исполняться одним кодом, а не
+/// выводиться в каждом месте заново. Применять так:
+///
+/// ```text
+/// #[serde(default, deserialize_with = "wakode_core::domain::category_or_default")]
+/// category: Category,
+/// ```
+///
+/// `default` закрывает отсутствие поля, `deserialize_with` — явный `null`.
+pub fn category_or_default<'de, D>(deserializer: D) -> Result<Category, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Category>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// Атрибуты отметки — всё, кроме времени.
@@ -109,6 +167,8 @@ pub enum Category {
 pub struct Attrs {
     pub entity: Sid,
     pub kind: EntityKind,
+    /// Отсутствие поля и `null` дают [`Category::Coding`] — см. [`Category`].
+    #[serde(default, deserialize_with = "category_or_default")]
     pub category: Category,
     pub project: Option<Sid>,
     pub branch: Option<Sid>,
@@ -213,6 +273,55 @@ mod tests {
         // из-за этого весь heartbeat нельзя: время дороже точности измерения.
         let parsed: Category = serde_json::from_str("\"vibe coding\"").expect("не должно падать");
         assert_eq!(parsed, Category::Unknown);
+    }
+
+    /// Атрибуты в JSON без поля `category` — от него отталкиваются оба теста
+    /// про отсутствующее значение.
+    fn attrs_json_without_category() -> serde_json::Value {
+        serde_json::json!({
+            "entity": 1,
+            "kind": "file",
+            "project": 7,
+            "branch": null,
+            "language": null,
+            "editor": null,
+            "os": null,
+            "machine": null,
+        })
+    }
+
+    #[test]
+    fn absent_category_means_coding_because_the_plugin_simply_did_not_say() {
+        // Решение зафиксировано намеренно: wakatime-cli всегда проставляет
+        // категорию, и его собственное значение по умолчанию — `coding`.
+        // Поэтому `null` и отсутствие поля означают «плагин не сказал», а не
+        // «плагин сказал нечто незнакомое».
+        let mut with_null = attrs_json_without_category();
+        with_null["category"] = serde_json::Value::Null;
+
+        let parsed: Attrs = serde_json::from_value(with_null).unwrap();
+        assert_eq!(parsed.category, Category::Coding);
+
+        let missing: Attrs = serde_json::from_value(attrs_json_without_category()).unwrap();
+        assert_eq!(missing.category, Category::Coding);
+    }
+
+    #[test]
+    fn unrecognised_category_stays_a_separate_fact_from_the_absent_one() {
+        // Вторая ветка того же решения: незнакомая строка — это «данные есть,
+        // мы их не понимаем», и схлопывать её с «данных нет» нельзя. Иначе два
+        // разных факта уедут в БД под одним дискриминантом и различить их
+        // потом будет нечем.
+        let mut unfamiliar = attrs_json_without_category();
+        unfamiliar["category"] = serde_json::json!("vibe coding");
+
+        let parsed: Attrs = serde_json::from_value(unfamiliar).unwrap();
+        assert_eq!(parsed.category, Category::Unknown);
+
+        assert_ne!(
+            Category::Unknown as u8, Category::Coding as u8,
+            "у «не сказали» и «не поняли» обязаны быть разные номера"
+        );
     }
 
     #[test]
