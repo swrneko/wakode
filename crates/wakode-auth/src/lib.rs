@@ -7,9 +7,11 @@
 
 pub mod error;
 pub mod master_key;
+pub mod password;
 
 pub use error::{AuthError, AuthResult};
 pub use master_key::MasterKey;
+pub use password::{hash_password, verify_password};
 
 /// Заглушка вместо секрета в `Debug`.
 pub(crate) const REDACTED: &str = "<скрыт>";
