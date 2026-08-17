@@ -3393,6 +3393,8 @@ pub trait SessionRepo: Send + Sync {
 
 `impl Future` в позиции возврата у метода трейта (RPITIT) стабилен с Rust 1.75 — `async-trait` не нужен, и подключать его не надо: он даёт лишнюю зависимость и `Box`-аллокацию на каждый вызов. Реализации при этом пишутся обычным `async fn`: он подходит под `-> impl Future + Send`, пока захваченные значения `Send`.
 
+**Цена, которую платит план 3.** RPITIT делает трейт не-dyn-безопасным: `Arc<dyn HeartbeatRepo>` не скомпилируется. Значит HTTP-слой будет обобщённым по типу хранилища (`struct AppState<S: HeartbeatRepo + UserRepo>`), а не хранить объект трейта. Это осознанный выбор: обещание «Postgres добавляется реализацией трейта» он не нарушает — вторая реализация подставляется параметром типа, — но узнать об этом лучше сейчас, чем на середине плана 3. Если стирание типа всё же понадобится, `async-trait` вводится тогда и только для тех трейтов, которым он нужен.
+
 `Vec<u8>` в `key_by_lookup` и `session_by_token_hash` вместо `&[u8]` — не небрежность: значение переезжает в `spawn_blocking` и должно быть владеемым, а заимствование в асинхронной сигнатуре потребовало бы времени жизни, которое переживёт вызов.
 
 - [ ] **Step 4: Реализовать `SqliteStore`**
@@ -3427,9 +3429,9 @@ impl SqliteStore {
         })
     }
 
-    /// Соединение для чтения. Открывается на операцию: SQLite открывает файл
+    /// Собственное соединение под одну операцию: SQLite открывает файл
     /// дёшево, а пул понадобится только если это измерят как узкое место.
-    fn read_conn(&self) -> StoreResult<rusqlite::Connection> {
+    fn own_conn(&self) -> StoreResult<rusqlite::Connection> {
         crate::open(&self.path)
     }
 
@@ -3450,18 +3452,24 @@ impl SqliteStore {
     }
 }
 
-/// Выполнить блокирующую работу над свежим соединением для чтения.
+/// Выполнить блокирующую работу над собственным соединением.
+///
+/// Имя намеренно не `read_blocking`: через этот помощник идут и записи —
+/// пользователи, ключи и сессии, — а не только чтения. Они минуют пишущую
+/// задачу осознанно (см. шаг 5), и параллельные писатели здесь разводятся
+/// не очередью, а самим SQLite: WAL плюс `busy_timeout` из `conn.rs`.
+/// Своего retry поверх этого нет и быть не должно.
 ///
 /// `JoinError` тут значит ровно одно: замыкание паникнуло (отменять эти
 /// задачи некому). Поэтому `TaskPanicked`, а не `WriterGone` — пишущая
-/// задача к чтениям отношения не имеет, и путать эти два состояния значит
-/// врать в логах.
-async fn read_blocking<T, F>(store: &SqliteStore, work: F) -> StoreResult<T>
+/// задача к этим операциям отношения не имеет, и путать два состояния
+/// значит врать в логах.
+async fn on_own_connection<T, F>(store: &SqliteStore, work: F) -> StoreResult<T>
 where
     T: Send + 'static,
     F: FnOnce(rusqlite::Connection) -> StoreResult<T> + Send + 'static,
 {
-    let conn = store.read_conn()?;
+    let conn = store.own_conn()?;
     tokio::task::spawn_blocking(move || work(conn))
         .await
         .map_err(|_| crate::StoreError::TaskPanicked)?
@@ -3483,7 +3491,7 @@ impl HeartbeatRepo for SqliteStore {
         from: Micros,
         to: Micros,
     ) -> StoreResult<Vec<Heartbeat>> {
-        read_blocking(self, move |conn| {
+        on_own_connection(self, move |conn| {
             crate::load_heartbeats(&conn, user, from, to)
         })
         .await
@@ -3504,49 +3512,49 @@ impl HeartbeatRepo for SqliteStore {
 ```rust
 impl UserRepo for SqliteStore {
     async fn create_user(&self, new: NewUser) -> StoreResult<User> {
-        read_blocking(self, move |conn| crate::insert_user(&conn, &new)).await
+        on_own_connection(self, move |conn| crate::insert_user(&conn, &new)).await
     }
 
     async fn user_by_login(&self, login: &str) -> StoreResult<Option<User>> {
         // Строка копируется: замыкание переезжает в другой поток и пережить
         // заимствование не может.
         let login = login.to_owned();
-        read_blocking(self, move |conn| crate::find_user_by_login(&conn, &login)).await
+        on_own_connection(self, move |conn| crate::find_user_by_login(&conn, &login)).await
     }
 
     async fn user_by_id(&self, id: Uuid) -> StoreResult<Option<User>> {
-        read_blocking(self, move |conn| crate::find_user_by_id(&conn, id)).await
+        on_own_connection(self, move |conn| crate::find_user_by_id(&conn, id)).await
     }
 }
 
 impl KeyRepo for SqliteStore {
     async fn create_key(&self, new: NewApiKey) -> StoreResult<ApiKey> {
-        read_blocking(self, move |conn| crate::insert_api_key(&conn, &new)).await
+        on_own_connection(self, move |conn| crate::insert_api_key(&conn, &new)).await
     }
 
     async fn key_by_lookup(&self, lookup: Vec<u8>) -> StoreResult<Option<ApiKey>> {
-        read_blocking(self, move |conn| crate::find_key_by_lookup(&conn, &lookup)).await
+        on_own_connection(self, move |conn| crate::find_key_by_lookup(&conn, &lookup)).await
     }
 
     async fn revoke_key(&self, id: Uuid) -> StoreResult<()> {
-        read_blocking(self, move |conn| crate::revoke_key(&conn, id)).await
+        on_own_connection(self, move |conn| crate::revoke_key(&conn, id)).await
     }
 }
 
 impl SessionRepo for SqliteStore {
     async fn create_session(&self, new: NewSession) -> StoreResult<Session> {
-        read_blocking(self, move |conn| crate::insert_session(&conn, &new)).await
+        on_own_connection(self, move |conn| crate::insert_session(&conn, &new)).await
     }
 
     async fn session_by_token_hash(&self, hash: Vec<u8>) -> StoreResult<Option<Session>> {
-        read_blocking(self, move |conn| {
+        on_own_connection(self, move |conn| {
             crate::find_session_by_token_hash(&conn, &hash)
         })
         .await
     }
 
     async fn revoke_session(&self, id: Uuid) -> StoreResult<()> {
-        read_blocking(self, move |conn| crate::revoke_session(&conn, id)).await
+        on_own_connection(self, move |conn| crate::revoke_session(&conn, id)).await
     }
 }
 ```
