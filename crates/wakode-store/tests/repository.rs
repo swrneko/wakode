@@ -7,8 +7,8 @@ use wakode_store::{
     dirty_days_for, find_key_by_lookup, find_session_by_token_hash, find_user_by_id,
     find_user_by_login, insert_api_key, insert_heartbeats, insert_session, insert_user,
     load_heartbeats, migrate, open_in_memory, revoke_key, revoke_session, schema_version,
-    spawn_writer, touch_key_used, IncomingHeartbeat, Interner, NewApiKey, NewSession, NewUser,
-    Outcome, StoreError,
+    spawn_writer, touch_key_used, HeartbeatRepo, IncomingHeartbeat, Interner, NewApiKey,
+    NewSession, NewUser, Outcome, SqliteStore, StoreError, UserRepo,
 };
 
 fn a_user(login: &str) -> NewUser {
@@ -1181,4 +1181,59 @@ async fn writer_survives_a_failing_batch() {
         .await
         .unwrap();
     assert_eq!(ok.inserted(), 1);
+}
+
+#[tokio::test]
+async fn store_goes_through_the_trait_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(&dir.path().join("wakode.db"), 16).unwrap();
+
+    let user = store.create_user(a_user("swrneko")).await.unwrap();
+
+    let report = store
+        .record_heartbeats(user.id, vec![incoming(1_000, "src/main.rs", Some("wakode"))], user.timezone)
+        .await
+        .unwrap();
+    assert_eq!(report.inserted(), 1);
+
+    let loaded = store
+        .heartbeats_in_range(user.id, Micros::from_secs(0), Micros::from_secs(9_999))
+        .await
+        .unwrap();
+    assert_eq!(loaded.len(), 1);
+
+    let found = store.user_by_login("swrneko").await.unwrap().unwrap();
+    assert_eq!(found.id, user.id);
+}
+
+#[tokio::test]
+async fn backup_produces_a_readable_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(&dir.path().join("wakode.db"), 16).unwrap();
+    let user = store.create_user(a_user("swrneko")).await.unwrap();
+    store
+        .record_heartbeats(user.id, vec![incoming(1_000, "f.rs", None)], user.timezone)
+        .await
+        .unwrap();
+
+    let dest = dir.path().join("backup.db");
+    store.backup(&dest).await.unwrap();
+
+    // Копия обязана открываться и содержать те же данные — снимок делается
+    // на живой базе, поэтому проверяем именно консистентность, а не факт
+    // существования файла.
+    let copy = wakode_store::open(&dest).unwrap();
+    let loaded = load_heartbeats(&copy, user.id, Micros::from_secs(0), Micros::from_secs(9_999)).unwrap();
+    assert_eq!(loaded.len(), 1);
+}
+
+#[tokio::test]
+async fn opening_the_store_applies_migrations() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wakode.db");
+
+    let _store = SqliteStore::open(&path, 16).unwrap();
+
+    let conn = wakode_store::open(&path).unwrap();
+    assert_eq!(schema_version(&conn).unwrap(), 1);
 }
