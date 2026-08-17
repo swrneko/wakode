@@ -1922,7 +1922,17 @@ mod tests {
         }
 
         let started = start(a_config(&dir), Some(master.to_base64())).await.unwrap();
-        assert!(started.master_key.is_some());
+
+        // `master_key.is_some()` было бы тавтологией: ключ только что
+        // передали на вход. Проверяем прямо: ключ на месте и открывается
+        // тем же мастер-ключом, с которым старт прошёл.
+        let stored = started.store.first_key().await.unwrap().unwrap();
+        let opened = ApiKeyValue::decrypt(
+            &EncryptedKey::from_bytes(stored.key_encrypted),
+            started.master_key.as_ref().unwrap(),
+        )
+        .expect("ключ не открылся тем мастер-ключом, с которым старт прошёл");
+        assert_eq!(opened.to_string().len(), 36);
     }
 
     #[tokio::test]
@@ -1993,6 +2003,10 @@ pub enum StartupError {
 /// Поднятое состояние процесса.
 #[derive(Debug)]
 pub struct Startup {
+    /// `expect`, а не `allow`: как только задача 9 поднимет на хранилище
+    /// HTTP-слой, компилятор сообщит, что ожидание не оправдалось, и
+    /// атрибут придётся снять.
+    #[expect(dead_code, reason = "HTTP-слой поднимается в задаче 9")]
     pub store: SqliteStore,
     pub master_key: Option<MasterKey>,
     pub config: Config,

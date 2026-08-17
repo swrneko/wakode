@@ -131,7 +131,6 @@ impl Config {
     /// файла нет, это ошибка: пользователь сказал, где смотреть. Если не
     /// задан и умолчания на диске нет — берутся значения по умолчанию плюс
     /// окружение, что и нужно в контейнере.
-    ///
     pub fn load(explicit: Option<&Path>) -> Result<Self, ConfigError> {
         let default_path = PathBuf::from(DEFAULT_CONFIG_PATH);
         Self::load_from(explicit, &default_path, |name| std::env::var(name).ok())

@@ -5,7 +5,10 @@ use std::process::ExitCode;
 
 use config::Config;
 
-fn main() -> ExitCode {
+/// `#[tokio::main]`, а не свой `Runtime`: семантика та же, а форма — та,
+/// в которую задача 14 добавит разбор подкоманд, не переписывая всё.
+#[tokio::main]
+async fn main() -> ExitCode {
     let config = match Config::load(None) {
         Ok(config) => config,
         Err(err) => {
@@ -16,25 +19,27 @@ fn main() -> ExitCode {
 
     let master_key_raw = std::env::var("WAKODE_MASTER_KEY").ok();
 
-    let runtime = match tokio::runtime::Runtime::new() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            eprintln!("wakode: не удалось создать среду выполнения: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    match runtime.block_on(startup::start(config, master_key_raw)) {
+    match startup::start(config, master_key_raw).await {
         Ok(started) => {
-            // Подъём HTTP-слоя на `started.store` и `started.master_key` —
-            // задача 9: там ещё не существует `wakode-api`. Пока старт
-            // считается пройденным, если дошёл сюда без ошибки.
+            // Подъём HTTP-слоя — задача 9, `wakode-api` ещё не существует.
+            //
+            // Сказано ровно то, что произошло: старт пройден. Написать
+            // «слушаю <адрес>» было бы утверждением о состоянии, которого
+            // нет, — и владелец, выкативший такую сборку под systemd,
+            // пошёл бы искать причину в брандмауэре и в плагине редактора,
+            // но не в том, что сервер не поднимался. Задача 7 существует
+            // ради устранения ровно такой тихой лжи о состоянии; отдавать
+            // её из собственного `main` было бы смешно.
             println!(
-                "wakode: старт пройден, слушаю {} (мастер-ключ {})",
+                "wakode: старт пройден, HTTP-слой ещё не поднят \
+                 (адрес из конфигурации {}, мастер-ключ {})",
                 started.config.server.listen,
-                if started.master_key.is_some() { "задан" } else { "не задан" }
+                if started.master_key.is_some() {
+                    "задан"
+                } else {
+                    "не задан"
+                }
             );
-            let _ = started.store;
             ExitCode::SUCCESS
         }
         Err(err) => {

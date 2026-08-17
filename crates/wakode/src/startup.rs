@@ -32,6 +32,11 @@ pub enum StartupError {
 /// Поднятое состояние процесса.
 #[derive(Debug)]
 pub struct Startup {
+    /// `expect`, а не `allow`: как только задача 9 поднимет на хранилище
+    /// HTTP-слой, компилятор сообщит, что ожидание не оправдалось, и
+    /// атрибут придётся снять. `allow` остался бы навсегда и глушил бы
+    /// `dead_code` для всего, до чего дотянется.
+    #[expect(dead_code, reason = "HTTP-слой поднимается в задаче 9")]
     pub store: SqliteStore,
     pub master_key: Option<MasterKey>,
     pub config: Config,
@@ -209,7 +214,19 @@ mod tests {
         }
 
         let started = start(a_config(&dir), Some(master.to_base64())).await.unwrap();
-        assert!(started.master_key.is_some());
+
+        // `master_key.is_some()` здесь было бы тавтологией: ключ только что
+        // передали на вход. Доказательная сила теста в том, что `start`
+        // выше не вернул ошибку, — то есть ключ из базы прочитан и открыт.
+        // Проверяем это прямо: ключ на месте и открывается тем же
+        // мастер-ключом, которым его записали.
+        let stored = started.store.first_key().await.unwrap().unwrap();
+        let opened = ApiKeyValue::decrypt(
+            &EncryptedKey::from_bytes(stored.key_encrypted),
+            started.master_key.as_ref().unwrap(),
+        )
+        .expect("ключ не открылся тем мастер-ключом, с которым старт прошёл");
+        assert_eq!(opened.to_string().len(), 36);
     }
 
     #[tokio::test]
