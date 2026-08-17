@@ -1380,6 +1380,70 @@ async fn opening_the_store_applies_migrations() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_writer_that_was_shut_down_reports_it_is_gone() {
+    // Долг плана 2: до появления shutdown у `WriterGone` не было ни одного
+    // достижимого пути, и вариант ошибки существовал на веру.
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(&dir.path().join("wakode.db"), 8).unwrap();
+    let user = store.create_user(a_user("swrneko")).await.unwrap();
+
+    store
+        .record_heartbeats(user.id, vec![incoming(1_000, "f.rs", None)], user.timezone)
+        .await
+        .unwrap();
+
+    store.shutdown().await.unwrap();
+
+    let err = store
+        .record_heartbeats(user.id, vec![incoming(2_000, "f.rs", None)], user.timezone)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::WriterGone), "получили {err:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_lets_the_writer_finish_what_it_accepted() {
+    // Остановка не должна терять уже принятое: cli, получивший успех,
+    // стёр отметки у себя, и «приняли, но не записали» — потеря.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wakode.db");
+    let store = SqliteStore::open(&path, 64).unwrap();
+    let user = store.create_user(a_user("swrneko")).await.unwrap();
+
+    let batch: Vec<IncomingHeartbeat> = (0..5_000)
+        .map(|i| incoming(1_000 + i, "f.rs", Some("wakode")))
+        .collect();
+    let report = store
+        .record_heartbeats(user.id, batch, user.timezone)
+        .await
+        .unwrap();
+    assert_eq!(report.inserted(), 5_000);
+
+    store.shutdown().await.unwrap();
+
+    let conn = wakode_store::open(&path).unwrap();
+    let loaded = load_heartbeats(
+        &conn,
+        user.id,
+        Micros::from_secs(0),
+        Micros::from_secs(999_999),
+    )
+    .unwrap();
+    assert_eq!(loaded.len(), 5_000);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_twice_is_not_an_error() {
+    // Останов зовут и при штатном завершении, и из обработчика сигнала;
+    // второй вызов не должен превращаться в отказ.
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(&dir.path().join("wakode.db"), 8).unwrap();
+
+    store.shutdown().await.unwrap();
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_write_beside_the_writer_waits_instead_of_failing_busy() {
     // Центральное обещание архитектуры, которое до сих пор держалось только
     // на докстринге `on_own_connection`: редкие одиночные записи идут своими

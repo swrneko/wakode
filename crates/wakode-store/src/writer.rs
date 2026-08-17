@@ -9,12 +9,19 @@ use crate::error::{StoreError, StoreResult};
 use crate::heartbeats::{insert_heartbeats, IncomingHeartbeat, InsertReport};
 use crate::interner::Interner;
 
-/// Заявка на запись и канал для ответа.
-struct WriteJob {
-    user: Uuid,
-    batch: Vec<IncomingHeartbeat>,
-    tz: Tz,
-    reply: oneshot::Sender<StoreResult<InsertReport>>,
+/// Заявка писателю.
+enum WriteJob {
+    Insert {
+        user: Uuid,
+        batch: Vec<IncomingHeartbeat>,
+        tz: Tz,
+        reply: oneshot::Sender<StoreResult<InsertReport>>,
+    },
+    /// Сигнал остановиться. Писатель отвечает и выходит из цикла, уничтожая
+    /// приёмник, — после этого все отправители получают `WriterGone`.
+    Stop {
+        ack: oneshot::Sender<()>,
+    },
 }
 
 /// Ручка к пишущей задаче. Клонируется свободно, все копии шлют в один канал.
@@ -54,11 +61,28 @@ pub fn spawn_writer(mut conn: Connection, interner: Arc<Interner>, capacity: usi
     // её на исполнителе асинхронных задач нельзя.
     std::thread::spawn(move || {
         while let Some(job) = rx.blocking_recv() {
-            let result = insert_heartbeats(&mut conn, &interner, job.user, &job.batch, job.tz);
-            // Ответ уходит только после того, как транзакция закоммичена
-            // внутри insert_heartbeats. Отправитель мог уйти — это не наша
-            // беда, запись уже состоялась.
-            let _ = job.reply.send(result);
+            match job {
+                WriteJob::Stop { ack } => {
+                    let _ = ack.send(());
+                    break;
+                }
+                WriteJob::Insert { user, batch, tz, reply } => {
+                    // Ответ уходит только после того, как транзакция
+                    // закоммичена внутри insert_heartbeats. Отправитель мог
+                    // уйти — это не наша беда, запись уже состоялась.
+                    //
+                    // Паника внутри вставки не должна убивать писателя
+                    // навсегда: до этого она уносила поток молча, и
+                    // единственным сигналом наружу был `WriterGone`,
+                    // неотличимый от штатной остановки.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        insert_heartbeats(&mut conn, &interner, user, &batch, tz)
+                    }))
+                    .unwrap_or(Err(StoreError::TaskPanicked));
+
+                    let _ = reply.send(result);
+                }
+            }
         }
     });
 
@@ -74,7 +98,7 @@ impl WriteHandle {
         tz: Tz,
     ) -> StoreResult<InsertReport> {
         let (reply, wait) = oneshot::channel();
-        let job = WriteJob { user, batch, tz, reply };
+        let job = WriteJob::Insert { user, batch, tz, reply };
 
         // try_send, а не send: ждать места в очереди значило бы копить
         // запросы в памяти. Отказ здесь превращается в 503 с Retry-After,
@@ -85,5 +109,21 @@ impl WriteHandle {
         })?;
 
         wait.await.map_err(|_| StoreError::WriterGone)?
+    }
+
+    /// Остановить писателя, дождавшись, пока он разберёт принятое.
+    ///
+    /// Повторный вызов не ошибка: останов зовут и при штатном завершении,
+    /// и из обработчика сигнала, и эти пути пересекаются.
+    pub async fn shutdown(&self) -> StoreResult<()> {
+        let (ack, wait) = oneshot::channel();
+        match self.tx.send(WriteJob::Stop { ack }).await {
+            Ok(()) => {
+                let _ = wait.await;
+                Ok(())
+            }
+            // Приёмник уже уничтожен — писатель остановлен, цель достигнута.
+            Err(_) => Ok(()),
+        }
     }
 }

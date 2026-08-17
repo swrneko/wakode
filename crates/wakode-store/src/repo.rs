@@ -106,6 +106,11 @@ impl SqliteStore {
         })
     }
 
+    /// Остановить пишущую задачу и дождаться, пока она разберёт принятое.
+    pub async fn shutdown(&self) -> StoreResult<()> {
+        self.writer.shutdown().await
+    }
+
     /// Консистентный снимок живой базы.
     ///
     /// Отказывает, если по пути `dest` уже есть файл (`VACUUM INTO` не
