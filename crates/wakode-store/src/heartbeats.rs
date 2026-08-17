@@ -1,7 +1,7 @@
 use chrono_tz::Tz;
 use rusqlite::Connection;
 use uuid::Uuid;
-use wakode_core::{Category, EntityKind, Micros, Sid};
+use wakode_core::{Attrs, Category, EntityKind, Heartbeat, Micros, Sid};
 
 use crate::codec::{
     category_to_i64, i64_to_category, i64_to_kind, i64_to_sid, kind_to_i64, sid_to_i64,
@@ -11,7 +11,6 @@ use crate::dedup::dedup_hash;
 use crate::dirty::{affected_days, mark_dirty};
 use crate::error::StoreResult;
 use crate::interner::Interner;
-use wakode_core::{Attrs, Heartbeat};
 
 /// Отметка как она пришла с провода: строки ещё не интернированы.
 #[derive(Debug, Clone)]

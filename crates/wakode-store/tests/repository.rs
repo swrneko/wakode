@@ -19,8 +19,9 @@ fn a_user(login: &str) -> NewUser {
     }
 }
 
-/// Единственный тест в этом файле, которому позволено знать про SQL:
-/// он проверяет саму схему, а не поведение поверх неё.
+/// Сырой SQL в этом файле позволен только проверкам самой схемы, а не
+/// поведения поверх неё — таких проверок здесь две: эта и
+/// `heartbeat_dedup_index_is_unique` ниже.
 #[test]
 fn wave_zero_schema_creates_every_table() {
     let mut conn = open_in_memory().unwrap();
@@ -516,13 +517,18 @@ fn loaded_heartbeats_come_back_as_core_types() {
 }
 
 #[test]
-fn range_is_half_open_and_sorted() {
+fn range_is_half_open() {
     let mut conn = open_in_memory().unwrap();
     migrate(&mut conn).unwrap();
     let user = insert_user(&conn, &a_user("swrneko")).unwrap();
     let interner = Interner::load(&conn).unwrap();
 
-    // Вставляем не по порядку — чтение обязано отдать по возрастанию времени.
+    // Вставляем не по порядку. Порядок в результате здесь берётся из
+    // индекса `hb_time`, а не из `ORDER BY` — обход по индексу для этого
+    // запроса и так отдаёт строки по возрастанию времени. Значит тест
+    // ловит неверную явную сортировку (`ORDER BY time DESC` его роняет),
+    // но не её отсутствие: убери `ORDER BY time` из запроса вовсе — план
+    // выполнения не изменится, и тест не заметит подмены.
     let batch = [
         incoming(300, "c.rs", None),
         incoming(100, "a.rs", None),
@@ -579,6 +585,12 @@ fn every_attribute_survives_the_round_trip() {
     // значениями: только так ловится перестановка соседних полей при
     // разборе. Пустое поле не двигает курсор, поэтому на `None` подмена
     // проекта веткой выглядит точно так же, как её отсутствие.
+    //
+    // Тест закрывает время и девять полей `Attrs`. `plugin_id`, `is_write`
+    // и одиннадцать числовых и текстовых колонок ниже заполняются ради
+    // проверки позиций параметров вокруг них в `INSERT`, но `load_heartbeats`
+    // их не читает — значит их собственные позиции не проверяет ничто,
+    // пока у них не появится читатель.
     let mut conn = open_in_memory().unwrap();
     migrate(&mut conn).unwrap();
     let user = insert_user(&conn, &a_user("swrneko")).unwrap();
