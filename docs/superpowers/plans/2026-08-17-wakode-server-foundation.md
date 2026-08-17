@@ -386,9 +386,9 @@ mod tests {
             )),
             "параметры стоимости разошлись с константами: {hash}"
         );
-        assert!(ARGON2_MEMORY_KIB >= 19_456, "память ослаблена");
-        assert!(ARGON2_ITERATIONS >= 2, "число проходов ослаблено");
-        assert!(ARGON2_PARALLELISM >= 1);
+        // Порог проверяется на этапе компиляции — `const _: () = assert!(…)`
+        // рядом с константами. `assert!` на константах внутри теста clippy
+        // справедливо считает бессмыслицей: условие известно до запуска.
 
         // Длина соли — та же категория тихого ослабления.
         let salt = argon2::password_hash::PasswordHash::new(&hash)
@@ -913,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn the_hash_is_not_the_token_itself() {
+    fn the_hash_does_not_contain_the_token() {
         // Односторонность нужна затем, что утечка базы не должна давать
         // возможность войти под чужой сессией.
         //
@@ -1024,7 +1024,7 @@ impl std::fmt::Debug for SessionToken {
 - [ ] **Step 4: Прогнать**
 
 Run: `cargo test -p wakode-auth`
-Expected: PASS, тридцать три теста в wakode-auth.
+Expected: PASS, тридцать шесть тестов в wakode-auth.
 
 - [ ] **Step 5: Мутационная проверка**
 

@@ -337,22 +337,14 @@ mod tests {
         let value = ApiKeyValue::generate();
         let encrypted = value.encrypt(&master).unwrap();
 
-        // Проверка ловит реалистичную регрессию — замену ручного `Debug`
-        // на производный, — но исчерпывающей не является: реализация,
-        // печатающая UUID без дефисов или шифротекст в hex, прошла бы её
-        // при полной утечке обоих секретов. Способа проверить «секрет не
-        // выводится никак» через сравнение строк не существует; защищает
-        // здесь форма кода, а тест лишь сторожит её от невнимательности.
-        let value_dump = format!("{value:?}");
-        assert!(
-            !value_dump.contains(&value.to_string()),
-            "значение ключа выведено дословно: {value_dump}"
-        );
-
-        let encrypted_dump = format!("{encrypted:?}");
-        assert!(
-            !encrypted_dump.contains(&format!("{:?}", encrypted.as_bytes())),
-            "шифротекст выведен дословно: {encrypted_dump}"
+        // Сверка с точной ожидаемой строкой, как в `master_key` и
+        // `session`: поиск подстроки в этом крейте трижды оказывался
+        // зелёным на утёкшем секрете, и правило «как проверяется
+        // отсутствие утечки» должно быть одно на все четыре модуля.
+        assert_eq!(format!("{value:?}"), format!("ApiKeyValue({REDACTED:?})"));
+        assert_eq!(
+            format!("{encrypted:?}"),
+            format!("EncryptedKey {{ bytes: {} }}", encrypted.as_bytes().len())
         );
     }
 }

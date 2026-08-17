@@ -23,7 +23,12 @@ impl SessionToken {
     }
 
     pub fn parse(raw: &str) -> Option<Self> {
-        let bytes = URL_SAFE_NO_PAD.decode(raw.trim()).ok()?;
+        // Без `trim`: токен приезжает из cookie, где HTTP-слой уже отрезал
+        // разделители. У `ApiKeyValue` обрезка есть и обоснована — там
+        // значение приходит из конфига редактора с переводом строки; здесь
+        // такой причины нет, а расширять множество принимаемых входов без
+        // причины не надо.
+        let bytes = URL_SAFE_NO_PAD.decode(raw).ok()?;
         bytes.as_slice().try_into().ok().map(Self)
     }
 
@@ -111,6 +116,24 @@ mod tests {
         let token = SessionToken::generate();
         let dump = format!("{token:?}");
         assert_eq!(dump, format!("SessionToken({REDACTED:?})"));
+    }
+
+    #[test]
+    fn the_base64_alphabet_is_pinned() {
+        // Токен уезжает в cookie и приезжает обратно. Алфавит здесь
+        // URL-safe и без паддинга — иначе `+`, `/` и `=` пришлось бы
+        // экранировать. Байты подобраны так, что в стандартном алфавите
+        // они дали бы `+` и `/`: без этого смена алфавита разлогинила бы
+        // всех разом, а круговой обход остался бы зелёным.
+        const RAW: [u8; 32] = [
+            251, 255, 191, 251, 255, 191, 251, 255, 191, 251, 255, 191, 251, 255, 191, 251, 255,
+            191, 251, 255, 191, 251, 255, 191, 251, 255, 191, 251, 255, 191, 251, 255,
+        ];
+        const ENCODED: &str = "-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_8";
+
+        let token = SessionToken::parse(ENCODED).expect("URL-safe алфавит без паддинга");
+        assert_eq!(token.to_string(), ENCODED);
+        assert_eq!(token.hash(), <sha2::Sha256 as sha2::Digest>::digest(RAW).to_vec());
     }
 
     #[test]
