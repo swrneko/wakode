@@ -2734,6 +2734,15 @@ fn deleting_a_user_takes_their_keys_and_sessions_with_them() {
 
 Последний тест проверяет, что `ON DELETE CASCADE` действительно работает — а он работает только при включённой прагме `foreign_keys`, которую мы ставим в `conn.rs`. Тест сторожит связку этих двух вещей.
 
+**Про сырой SQL в нём.** Удаления пользователя в волне 0 нет, поэтому проверить каскад через публичный интерфейс нечем. Это третье и последнее из трёх мест, где сырой SQL позволен: каскад — свойство самой схемы, как и две уже занятые проверки (список таблиц и уникальность `hb_dedup`). Четвёртого места не будет. Комментарий в тесте обязан это проговорить, иначе следующий читатель решит, что запрет мягкий.
+
+**Ещё два теста сверх шести.** `touch_key_used` и `revoke_session` реализуются здесь же, и без тестов остались бы двумя публичными функциями, о которых не доказано ничего:
+
+- `touching_a_key_records_when_it_was_last_used` — у свежего ключа `last_used_at` пуст; после `touch_key_used` он заполнен. Проверять конкретное значение времени не надо, `is_some()` достаточно: часы здесь настоящие, и тест не должен зависеть от их разрешения.
+- `revoked_session_is_still_found_but_marked` — зеркало `revoked_key_is_still_found_but_marked` и по той же причине: слой аутентификации обязан отличать «сессии не было» от «сессия отозвана».
+
+Оба идут по стилю соседних тестов файла.
+
 - [ ] **Step 2: Запустить и убедиться, что падает**
 
 Run: `cargo test -p wakode-store --test repository`
@@ -2971,7 +2980,7 @@ pub fn revoke_session(conn: &Connection, id: Uuid) -> StoreResult<()> {
 В `lib.rs`: `pub mod keys;`, `pub mod sessions;`, `pub use keys::{find_key_by_lookup, insert_api_key, revoke_key, touch_key_used, ApiKey, NewApiKey};`, `pub use sessions::{find_session_by_token_hash, insert_session, revoke_session, NewSession, Session};`.
 
 Run: `cargo test -p wakode-store`
-Expected: PASS, шесть новых тестов.
+Expected: PASS, восемь новых тестов.
 
 - [ ] **Step 6: Коммит**
 
