@@ -503,9 +503,105 @@ mod tests {
         // Плагины валидируют ключ регуляркой UUID с проверкой версии [1-5].
         // UUIDv7, который проект использует для первичных ключей, её не
         // пройдёт, и редакторы молча перестанут отправлять отметки.
+        // Регулярка плагинов смотрит два поля: версию и вариант. Проверять
+        // только версию значит не защищать от ручной сборки UUID из
+        // случайных байт с забытым вариантом — а это ровно та ошибка,
+        // из-за которой редакторы молча перестают слать отметки.
         let value = ApiKeyValue::generate();
         let parsed = uuid::Uuid::parse_str(&value.to_string()).unwrap();
         assert_eq!(parsed.get_version_num(), 4);
+        assert_eq!(parsed.get_variant(), uuid::Variant::RFC4122);
+    }
+
+    #[test]
+    fn a_short_or_empty_ciphertext_is_refused_not_panicked() {
+        // `EncryptedKey::from_bytes` зовут на байтах из базы. Усечённая
+        // строка не должна превращать отказ авторизации в панику потока:
+        // без проверки длины `split_at` паникует на первом же байте.
+        let master = MasterKey::generate();
+        let full = ApiKeyValue::generate().encrypt(&master).unwrap();
+
+        for bytes in [
+            Vec::new(),
+            vec![0u8; 1],
+            full.as_bytes()[..full.as_bytes().len() / 2].to_vec(),
+        ] {
+            assert!(matches!(
+                ApiKeyValue::decrypt(&EncryptedKey::from_bytes(bytes), &master),
+                Err(AuthError::Decrypt)
+            ));
+        }
+    }
+
+    #[test]
+    fn the_ciphertext_does_not_contain_the_value_in_the_clear() {
+        // Круговой обход доказывает обратимость, но не шифрование:
+        // реализация, склеивающая nonce с открытым текстом, прошла бы его.
+        let master = MasterKey::generate();
+        let value = ApiKeyValue::generate();
+        let encrypted = value.encrypt(&master).unwrap();
+
+        let text = value.to_string();
+        assert!(
+            !encrypted
+                .as_bytes()
+                .windows(text.len())
+                .any(|window| window == text.as_bytes()),
+            "значение лежит в шифротексте открытым"
+        );
+    }
+
+    #[test]
+    fn a_key_encrypted_by_an_earlier_build_still_opens() {
+        // Формат хранения — обязательство перед всеми существующими
+        // базами. Смена шифра, порядка склейки или длины nonce сделала бы
+        // нечитаемыми все выданные ключи, и заметить это можно только
+        // фиксированным вектором: круговой обход внутри одного запуска
+        // согласован сам с собой и такую поломку не видит.
+        //
+        // Вектор снят с рабочей реализации один раз. Если он покраснел —
+        // это не повод его перегенерировать: сначала пойми, что изменилось
+        // в формате, и что делать с ключами, уже лежащими в базах.
+        let master = MasterKey::from_base64("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=").unwrap();
+        let stored: [u8; 76] = [
+            160, 247, 27, 57, 200, 201, 215, 88, 101, 223, 187, 244, 224, 117, 41, 226, 19, 174,
+            66, 76, 150, 126, 246, 7, 3, 119, 133, 80, 108, 50, 30, 127, 6, 223, 202, 194, 66, 133,
+            50, 182, 81, 30, 88, 206, 20, 60, 130, 211, 51, 31, 49, 83, 49, 246, 47, 76, 153, 131,
+            217, 40, 40, 155, 127, 52, 51, 70, 51, 32, 208, 240, 237, 58, 230, 180, 234, 180,
+        ];
+
+        let restored = ApiKeyValue::decrypt(&EncryptedKey::from_bytes(stored.to_vec()), &master)
+            .expect("ключ, зашифрованный прежней сборкой, перестал открываться");
+        assert_eq!(restored.to_string(), "6f1e8d3a-2c4b-4a9e-8f7d-1b2c3d4e5f60");
+    }
+
+    #[test]
+    fn the_lookup_algorithm_is_pinned_to_a_fixed_vector() {
+        // Отпечаток ложится в уникальный индекс. Смена алгоритма или его
+        // усечение — тихая поломка: старые ключи перестанут находиться, а
+        // короткий отпечаток ослабит стойкость к коллизиям, и ни то, ни
+        // другое не видно из тестов, сравнивающих отпечаток сам с собой.
+        let master = MasterKey::from_base64("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=").unwrap();
+        let value = ApiKeyValue::parse("6f1e8d3a-2c4b-4a9e-8f7d-1b2c3d4e5f60").unwrap();
+
+        assert_eq!(
+            value.lookup(&master),
+            vec![
+                76, 184, 159, 202, 153, 23, 75, 9, 206, 0, 192, 148, 139, 127, 11, 63, 219, 57,
+                129, 192, 151, 142, 132, 128, 171, 224, 228, 185, 231, 65, 57, 117
+            ]
+        );
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_tolerated_on_parse() {
+        // Значение приезжает из конфига редактора и часто с переводом
+        // строки на конце.
+        let value = ApiKeyValue::generate();
+        let text = value.to_string();
+
+        assert_eq!(ApiKeyValue::parse(&format!("  {text}\n")).unwrap(), value);
+        assert_eq!(ApiKeyValue::parse(&format!("\twaka_{text}  ")).unwrap(), value);
     }
 
     #[test]
@@ -754,7 +850,7 @@ impl std::fmt::Debug for EncryptedKey {
 - [ ] **Step 4: Прогнать**
 
 Run: `cargo test -p wakode-auth`
-Expected: PASS, двадцать тестов.
+Expected: PASS, двадцать шесть тестов в wakode-auth.
 
 - [ ] **Step 5: Мутационная проверка**
 
