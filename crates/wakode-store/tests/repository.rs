@@ -1263,3 +1263,51 @@ async fn opening_the_store_applies_migrations() {
     let conn = wakode_store::open(&path).unwrap();
     assert_eq!(schema_version(&conn).unwrap(), 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_beside_the_writer_waits_instead_of_failing_busy() {
+    // Центральное обещание архитектуры, которое до сих пор держалось только
+    // на докстринге `on_own_connection`: редкие одиночные записи идут своими
+    // соединениями МИМО пишущей задачи, и параллельного писателя разводит не
+    // очередь, а сам SQLite по `busy_timeout` из `conn.rs`. Если бы прагмы
+    // там не было, `create_user` во время чужой транзакции получил бы
+    // `SQLITE_BUSY` немедленно — то есть логин падал бы под нагрузкой ровно
+    // тогда, когда отметки идут потоком.
+    //
+    // Многопоточный исполнитель тут обязателен: на однопоточном `create_user`
+    // и батч не наложились бы по времени, и тест прошёл бы, ничего не
+    // проверив.
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(&dir.path().join("wakode.db"), 16).unwrap();
+    let owner = store.create_user(a_user("owner")).await.unwrap();
+
+    // Батч, который держит транзакцию писателя заметное время.
+    let batch: Vec<IncomingHeartbeat> = (0..20_000)
+        .map(|i| incoming(1_000 + i, "f.rs", Some("wakode")))
+        .collect();
+
+    let writing = {
+        let store = store.clone();
+        let tz = owner.timezone;
+        tokio::spawn(async move { store.record_heartbeats(owner.id, batch, tz).await })
+    };
+
+    // Пока батч в работе, пишем мимо очереди — и обязаны дождаться, а не
+    // упасть. Записей много и подряд: одна могла бы целиком уложиться в
+    // промежуток до того, как писатель откроет свою транзакцию, и тогда
+    // тест не проверил бы ничего.
+    let mut beside = Vec::new();
+    for i in 0..200 {
+        beside.push(store.create_user(a_user(&format!("beside-{i}"))).await);
+    }
+
+    let report = writing.await.unwrap().unwrap();
+    assert_eq!(report.inserted(), 20_000);
+
+    for (i, one) in beside.into_iter().enumerate() {
+        one.unwrap_or_else(|err| {
+            panic!("запись {i} мимо очереди упала вместо ожидания busy_timeout: {err:?}")
+        });
+    }
+    assert!(store.user_by_login("beside-199").await.unwrap().is_some());
+}
