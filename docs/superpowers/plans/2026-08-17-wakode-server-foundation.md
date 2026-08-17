@@ -374,15 +374,43 @@ mod tests {
         let hash = hash_password("любой").unwrap();
         assert!(hash.starts_with("$argon2id$"), "получили {hash}");
 
-        // Стоимость пришпилена, а не только вариант алгоритма. Умолчания
-        // крейта сегодня совпадают с рекомендованным OWASP минимумом для
-        // argon2id, но умолчания меняются молча — а ослабление памяти с
-        // 19 МиБ до, скажем, 8 КиБ не изменит ни одной строки нашего кода
-        // и не уронит ни одной проверки формата.
+        // Стоимость проверяется на двух уровнях, и оба нужны. Первый —
+        // что уехавшее в хеш совпадает с нашими константами: сторожит
+        // проводку. Второй — что сами константы не ниже порога: числа
+        // здесь литеральные намеренно, потому что проверка, читающая те же
+        // константы, что и код, двигается вместе с ними и ослабление
+        // пропускает. Порог, а не равенство: усиление ронять незачем.
         assert!(
-            hash.contains("$v=19$m=19456,t=2,p=1$"),
-            "параметры стоимости изменились: {hash}"
+            hash.contains(&format!(
+                "$v=19$m={ARGON2_MEMORY_KIB},t={ARGON2_ITERATIONS},p={ARGON2_PARALLELISM}$"
+            )),
+            "параметры стоимости разошлись с константами: {hash}"
         );
+        assert!(ARGON2_MEMORY_KIB >= 19_456, "память ослаблена");
+        assert!(ARGON2_ITERATIONS >= 2, "число проходов ослаблено");
+        assert!(ARGON2_PARALLELISM >= 1);
+
+        // Длина соли — та же категория тихого ослабления.
+        let salt = argon2::password_hash::PasswordHash::new(&hash)
+            .unwrap()
+            .salt
+            .unwrap();
+        assert_eq!(salt.decode_b64(&mut [0u8; 64]).unwrap().len(), 16);
+    }
+
+    #[test]
+    fn a_hash_without_a_digest_is_malformed_not_a_wrong_password() {
+        // PHC-строка, обрезанная ровно перед дайджестом, разбирается без
+        // ошибки. Сверять с ней нечего: такой хеш не откроется ничем и
+        // никогда, и отвечать на него «пароль не подошёл» значит прятать
+        // поломку данных под обычное событие.
+        let full = hash_password("любой").unwrap();
+        let without_digest = &full[..full.rfind('$').unwrap()];
+
+        assert!(matches!(
+            verify_password("любой", without_digest),
+            Err(AuthError::PasswordHashMalformed)
+        ));
     }
 }
 ```
@@ -409,7 +437,7 @@ use crate::error::{AuthError, AuthResult};
 /// параметров не требует миграции.
 pub fn hash_password(password: &str) -> AuthResult<String> {
     let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
+    hasher()
         .hash_password(password.as_bytes(), &salt)
         .map(|hash| hash.to_string())
         .map_err(|_| AuthError::PasswordHashFailed)
