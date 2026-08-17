@@ -134,11 +134,20 @@ mod tests {
 
     #[test]
     fn a_key_of_the_wrong_length_is_refused() {
-        // 31 байт: длина проверяется явно, а не «как получится».
+        // Длина пришпилена с обеих сторон. Только снизу — недостаточно:
+        // реализация, молча откусывающая хвост у слишком длинного ключа,
+        // прошла бы такую проверку. А это худший из отказов — оператор
+        // поставил ключ из 64 байт, сервер поднялся и шифрует не тем.
         let short = base64::engine::general_purpose::STANDARD.encode([0u8; 31]);
         assert!(matches!(
             MasterKey::from_base64(&short),
             Err(AuthError::MasterKeyLength { got: 31 })
+        ));
+
+        let long = base64::engine::general_purpose::STANDARD.encode([0u8; 33]);
+        assert!(matches!(
+            MasterKey::from_base64(&long),
+            Err(AuthError::MasterKeyLength { got: 33 })
         ));
     }
 
@@ -152,12 +161,13 @@ mod tests {
 
     #[test]
     fn debug_does_not_print_the_key() {
+        // Сравнение с точной ожидаемой строкой, а не поиск подстроки.
+        // Поиск здесь не работает: производный `Debug` для `[u8; 32]`
+        // печатает байты десятичными (`[153, 188, …]`), поэтому ни
+        // base64-представление, ни шестнадцатеричное в дампе не появятся —
+        // и обе такие проверки прошли бы на утёкшем ключе.
         let key = MasterKey::generate();
-        let dump = format!("{key:?}");
-        assert!(!dump.contains(&key.to_base64()), "ключ утёк в Debug: {dump}");
-        // Первые байты в шестнадцатеричном виде тоже не должны появиться.
-        assert!(!dump.contains(&format!("{:02x}", key.as_bytes()[0])) || dump.len() < 32);
-        assert!(dump.contains("MasterKey"));
+        assert_eq!(format!("{key:?}"), format!("MasterKey({REDACTED:?})"));
     }
 }
 ```
@@ -212,17 +222,13 @@ pub type AuthResult<T> = Result<T, AuthError>;
 //! или `axum`, значит криптография перестала быть отдельной и проверять
 //! её изоляцию станет нечем.
 
-pub mod api_key;
+// Модули добавляются по одному, задачами 2–4: объявить их все сразу
+// значило бы не собрать крейт до конца задачи 4.
 pub mod error;
 pub mod master_key;
-pub mod password;
-pub mod session;
 
-pub use api_key::{ApiKeyValue, EncryptedKey};
 pub use error::{AuthError, AuthResult};
 pub use master_key::MasterKey;
-pub use password::{hash_password, verify_password};
-pub use session::SessionToken;
 
 /// Заглушка вместо секрета в `Debug`.
 pub(crate) const REDACTED: &str = "<скрыт>";

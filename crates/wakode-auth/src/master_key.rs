@@ -69,11 +69,20 @@ mod tests {
 
     #[test]
     fn a_key_of_the_wrong_length_is_refused() {
-        // 31 байт: длина проверяется явно, а не «как получится».
+        // Длина пришпилена с обеих сторон. Только снизу — недостаточно:
+        // реализация, молча откусывающая хвост у слишком длинного ключа,
+        // прошла бы такую проверку. А это худший из отказов — оператор
+        // поставил ключ из 64 байт, сервер поднялся и шифрует не тем.
         let short = STANDARD.encode([0u8; 31]);
         assert!(matches!(
             MasterKey::from_base64(&short),
             Err(AuthError::MasterKeyLength { got: 31 })
+        ));
+
+        let long = STANDARD.encode([0u8; 33]);
+        assert!(matches!(
+            MasterKey::from_base64(&long),
+            Err(AuthError::MasterKeyLength { got: 33 })
         ));
     }
 
