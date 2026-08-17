@@ -1533,7 +1533,7 @@ pub enum ConfigError {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub server: ServerConfig,
     pub database: DatabaseConfig,
@@ -1542,21 +1542,21 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     pub listen: String,
     pub public_url: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DatabaseConfig {
     pub path: PathBuf,
     pub write_queue: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AuthConfig {
     pub registration: bool,
     pub session_ttl_days: i64,
@@ -1564,7 +1564,7 @@ pub struct AuthConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DurationsConfig {
     pub timeout_secs: i64,
     /// Добавка последней отметке сессии.
@@ -1658,8 +1658,11 @@ impl Config {
                 source,
             })?
         } else if explicit.is_some() {
+            // Путь приводится к абсолютному: под systemd рабочий каталог
+            // не тот, что думает админ, и «файл не найден: wakode.toml» не
+            // говорит, где его искали.
             return Err(ConfigError::Missing {
-                path: path.to_path_buf(),
+                path: std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()),
             });
         } else {
             Config::default()
@@ -1680,7 +1683,9 @@ impl Config {
             self.database.path = PathBuf::from(value);
         }
         if let Some(value) = env("WAKODE_DATABASE_WRITE_QUEUE") {
-            self.database.write_queue = parse_number("WAKODE_DATABASE_WRITE_QUEUE", &value)? as usize;
+            // Разбор сразу в `usize`, а не `i64 as usize`: беззнаковый
+            // каст превратил бы `-1` в `usize::MAX` молча.
+            self.database.write_queue = parse_size("WAKODE_DATABASE_WRITE_QUEUE", &value)?;
         }
         if let Some(value) = env("WAKODE_AUTH_REGISTRATION") {
             self.auth.registration = parse_bool("WAKODE_AUTH_REGISTRATION", &value)?;
@@ -1704,6 +1709,13 @@ impl Config {
 }
 
 fn parse_number(name: &'static str, value: &str) -> Result<i64, ConfigError> {
+    value.trim().parse().map_err(|_| ConfigError::NotANumber {
+        name,
+        value: value.to_owned(),
+    })
+}
+
+fn parse_size(name: &'static str, value: &str) -> Result<usize, ConfigError> {
     value.trim().parse().map_err(|_| ConfigError::NotANumber {
         name,
         value: value.to_owned(),
@@ -1735,7 +1747,14 @@ fn main() {
 - [ ] **Step 5: Прогнать**
 
 Run: `cargo test -p wakode`
-Expected: PASS, восемь тестов.
+Expected: PASS, двенадцать тестов.
+
+**Четыре теста сверх блока кода**, каждый закрывает то, что иначе проявится не в CI, а на живом инстансе:
+
+- `every_field_can_be_overridden_from_the_environment` — все девять полей разом. Обещание «`WAKODE_*` перекрывают сверху» дано на девять, а доказывалось на два: опечатка в имени переменной или выпавшая ветка не роняли ничего.
+- `an_unknown_key_in_the_file_is_an_error` — опечатка в имени поля и в имени секции. Без `deny_unknown_fields` обе дают запуск с умолчаниями и ни слова в лог; это хуже отсутствующего файла, там хотя бы есть отказ.
+- `a_negative_queue_size_is_an_error_not_a_huge_number` — `-1` в ёмкости очереди.
+- `a_relative_missing_path_is_reported_absolutely` — путь в отказе абсолютный.
 
 - [ ] **Step 6: Мутационная проверка**
 

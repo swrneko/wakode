@@ -30,7 +30,7 @@ pub enum ConfigError {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub server: ServerConfig,
     pub database: DatabaseConfig,
@@ -39,21 +39,21 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     pub listen: String,
     pub public_url: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DatabaseConfig {
     pub path: PathBuf,
     pub write_queue: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AuthConfig {
     pub registration: bool,
     pub session_ttl_days: i64,
@@ -61,7 +61,7 @@ pub struct AuthConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DurationsConfig {
     pub timeout_secs: i64,
     /// Добавка последней отметке сессии.
@@ -133,7 +133,12 @@ impl Config {
     /// окружение, что и нужно в контейнере.
     ///
     /// Пока не вызывается из `main`: последовательность старта — задача 7.
-    #[allow(dead_code)]
+    ///
+    /// `expect`, а не `allow`: как только `main` начнёт звать `load`,
+    /// компилятор сообщит, что ожидание не оправдалось, и атрибут придётся
+    /// снять. `allow` такого сигнала не даёт и остался бы навсегда, гася
+    /// заодно `dead_code` для всего, до чего дотянется.
+    #[expect(dead_code, reason = "последовательность старта — задача 7")]
     pub fn load(explicit: Option<&Path>) -> Result<Self, ConfigError> {
         let default_path = PathBuf::from(DEFAULT_CONFIG_PATH);
         Self::load_from(explicit, &default_path, |name| std::env::var(name).ok())
@@ -158,8 +163,13 @@ impl Config {
                 source,
             })?
         } else if explicit.is_some() {
+            // Путь приводится к абсолютному: пользователь запускает сервер
+            // из-под systemd, где рабочий каталог не тот, что он думает, и
+            // сообщение «файл не найден: wakode.toml» не говорит, где его
+            // искали. Это и есть та неоднозначность, ради устранения
+            // которой у явного пути вообще заведён отдельный отказ.
             return Err(ConfigError::Missing {
-                path: path.to_path_buf(),
+                path: std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()),
             });
         } else {
             Config::default()
@@ -180,7 +190,11 @@ impl Config {
             self.database.path = PathBuf::from(value);
         }
         if let Some(value) = env("WAKODE_DATABASE_WRITE_QUEUE") {
-            self.database.write_queue = parse_number("WAKODE_DATABASE_WRITE_QUEUE", &value)? as usize;
+            // Разбор сразу в `usize`, а не `i64 as usize`: беззнаковый каст
+            // превратил бы `-1` в `usize::MAX` молча, и очередь записи
+            // завелась бы с абсурдной ёмкостью вместо внятного отказа.
+            self.database.write_queue =
+                parse_size("WAKODE_DATABASE_WRITE_QUEUE", &value)?;
         }
         if let Some(value) = env("WAKODE_AUTH_REGISTRATION") {
             self.auth.registration = parse_bool("WAKODE_AUTH_REGISTRATION", &value)?;
@@ -204,6 +218,13 @@ impl Config {
 }
 
 fn parse_number(name: &'static str, value: &str) -> Result<i64, ConfigError> {
+    value.trim().parse().map_err(|_| ConfigError::NotANumber {
+        name,
+        value: value.to_owned(),
+    })
+}
+
+fn parse_size(name: &'static str, value: &str) -> Result<usize, ConfigError> {
     value.trim().parse().map_err(|_| ConfigError::NotANumber {
         name,
         value: value.to_owned(),
@@ -347,19 +368,131 @@ timeout_secs = 1800
         // строка старта отправила бы такое поле в лог. Сверка состава
         // краснеет на **любом** новом поле и заставляет автора решить,
         // секрет это или нет. Если поле не секрет — просто допиши его сюда.
+        // Значения заданы файлом, а не взяты из умолчаний: иначе правка
+        // любого умолчания краснила бы сторожа секретов, автор получал бы
+        // объяснение не про то, что он сделал, и рано или поздно перестал
+        // бы его читать. Здесь у каждой красноты один адрес — состав.
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(&dir, "");
+        let path = write_config(
+            &dir,
+            r#"
+[server]
+listen = "l"
+public_url = "u"
+
+[database]
+path = "d"
+write_queue = 1
+
+[auth]
+registration = true
+session_ttl_days = 2
+setup_from_any_address = true
+
+[durations]
+timeout_secs = 3
+tail_padding_secs = 4
+"#,
+        );
         let config = Config::load_from(Some(&path), &path, |_| None).unwrap();
 
         assert_eq!(
             format!("{config:?}"),
             "Config { \
-             server: ServerConfig { listen: \"127.0.0.1:9000\", \
-             public_url: \"http://localhost:9000\" }, \
-             database: DatabaseConfig { path: \"./wakode.db\", write_queue: 256 }, \
-             auth: AuthConfig { registration: false, session_ttl_days: 30, \
-             setup_from_any_address: false }, \
-             durations: DurationsConfig { timeout_secs: 900, tail_padding_secs: 0 } }"
+             server: ServerConfig { listen: \"l\", public_url: \"u\" }, \
+             database: DatabaseConfig { path: \"d\", write_queue: 1 }, \
+             auth: AuthConfig { registration: true, session_ttl_days: 2, \
+             setup_from_any_address: true }, \
+             durations: DurationsConfig { timeout_secs: 3, tail_padding_secs: 4 } }"
+        );
+    }
+
+    #[test]
+    fn every_field_can_be_overridden_from_the_environment() {
+        // Обещание «WAKODE_* перекрывают сверху» дано на все девять полей,
+        // а доказывалось на два. Опечатка в имени переменной или молча
+        // выпавшая ветка проявились бы не в тестах, а на живом инстансе:
+        // WAKODE_AUTH_REGISTRATION=true не включил бы регистрацию, а
+        // WAKODE_DATABASE_PATH не переехал бы на том.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "");
+
+        let config = Config::load_from(Some(&path), &path, |name| {
+            Some(match name {
+                "WAKODE_SERVER_LISTEN" => "0.0.0.0:1",
+                "WAKODE_SERVER_PUBLIC_URL" => "https://пример.рф",
+                "WAKODE_DATABASE_PATH" => "/данные/wakode.db",
+                "WAKODE_DATABASE_WRITE_QUEUE" => "7",
+                "WAKODE_AUTH_REGISTRATION" => "true",
+                "WAKODE_AUTH_SESSION_TTL_DAYS" => "11",
+                "WAKODE_AUTH_SETUP_FROM_ANY_ADDRESS" => "true",
+                "WAKODE_DURATIONS_TIMEOUT_SECS" => "1200",
+                "WAKODE_DURATIONS_TAIL_PADDING_SECS" => "13",
+                other => panic!("незнакомое имя переменной: {other}"),
+            }
+            .to_owned())
+        })
+        .unwrap();
+
+        assert_eq!(config.server.listen, "0.0.0.0:1");
+        assert_eq!(config.server.public_url, "https://пример.рф");
+        assert_eq!(config.database.path, PathBuf::from("/данные/wakode.db"));
+        assert_eq!(config.database.write_queue, 7);
+        assert!(config.auth.registration);
+        assert_eq!(config.auth.session_ttl_days, 11);
+        assert!(config.auth.setup_from_any_address);
+        assert_eq!(config.durations.timeout_secs, 1200);
+        assert_eq!(config.durations.tail_padding_secs, 13);
+    }
+
+    #[test]
+    fn an_unknown_key_in_the_file_is_an_error() {
+        // Опечатка в имени поля или секции иначе даёт запуск с умолчаниями
+        // и ни слова в лог. Это хуже отсутствующего файла: там хотя бы есть
+        // отказ. Ровно та же болезнь, ради которой у явного `--config`
+        // заведён свой отказ.
+        let dir = tempfile::tempdir().unwrap();
+
+        let typo_in_field = write_config(&dir, "[server]\nlisen = \"0.0.0.0:80\"\n");
+        assert!(matches!(
+            Config::load_from(Some(&typo_in_field), &typo_in_field, |_| None),
+            Err(ConfigError::Parse { .. })
+        ));
+
+        let typo_in_section = write_config(&dir, "[servr]\nlisten = \"0.0.0.0:80\"\n");
+        assert!(matches!(
+            Config::load_from(Some(&typo_in_section), &typo_in_section, |_| None),
+            Err(ConfigError::Parse { .. })
+        ));
+    }
+
+    #[test]
+    fn a_negative_queue_size_is_an_error_not_a_huge_number() {
+        // `i64 as usize` превратил бы `-1` в `usize::MAX` молча, и очередь
+        // записи завелась бы с абсурдной ёмкостью вместо отказа.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "");
+
+        let err = Config::load_from(Some(&path), &path, |name| {
+            (name == "WAKODE_DATABASE_WRITE_QUEUE").then(|| "-1".to_owned())
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, ConfigError::NotANumber { .. }));
+        assert!(format!("{err}").contains("WAKODE_DATABASE_WRITE_QUEUE"));
+    }
+
+    #[test]
+    fn a_relative_missing_path_is_reported_absolutely() {
+        // Под systemd рабочий каталог не тот, что думает админ, и сообщение
+        // «файл не найден: wakode.toml» не говорит, где его искали.
+        let relative = Path::new("нет-такого-конфига.toml");
+        let err = Config::load_from(Some(relative), relative, |_| None).unwrap_err();
+
+        let text = format!("{err}");
+        assert!(
+            text.contains(std::path::MAIN_SEPARATOR),
+            "путь в сообщении не абсолютный: {text}"
         );
     }
 }
