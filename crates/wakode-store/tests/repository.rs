@@ -261,6 +261,12 @@ fn first_api_key_returns_the_oldest_one() {
     // Порядок обязан быть воспроизводимым: шаг 5 старта расшифровывает
     // именно этот ключ, и «какой-нибудь» здесь означал бы, что проверка
     // мастер-ключа то проходит, то нет.
+    //
+    // Сам `ORDER BY` этот тест НЕ доказывает: ключи вставляются подряд, и
+    // порядок совпадает с сортировкой случайно. Настоящая проверка —
+    // `first_api_key_orders_by_created_at_not_by_insertion` в
+    // `src/keys.rs`, где `created_at` идёт против порядка вставки.
+    // Не удаляй её как дубль.
     let mut conn = open_in_memory().unwrap();
     migrate(&mut conn).unwrap();
     let user = insert_user(&conn, &a_user("swrneko")).unwrap();
@@ -295,8 +301,14 @@ fn first_api_key_returns_the_oldest_one() {
 fn first_api_key_sees_keys_of_every_user() {
     // Шаг 5 старта проверяет мастер-ключ инстанса целиком, а не одного
     // пользователя: ключ любого владельца зашифрован тем же мастер-ключом.
+    //
+    // Первый пользователь заводится намеренно и остаётся без ключей. Без
+    // него тест не проверял бы ничего: при единственном пользователе его
+    // прошла бы и реализация, ищущая ключи только у самого раннего или
+    // только у администратора.
     let mut conn = open_in_memory().unwrap();
     migrate(&mut conn).unwrap();
+    insert_user(&conn, &a_user("без ключей")).unwrap();
     let other = insert_user(&conn, &a_user("другой")).unwrap();
 
     insert_api_key(
