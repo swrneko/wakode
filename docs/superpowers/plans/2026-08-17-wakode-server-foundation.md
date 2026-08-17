@@ -2194,10 +2194,16 @@ enum WriteJob {
 
 ```rust
     std::thread::spawn(move || {
+        let mut stop_ack: Option<oneshot::Sender<()>> = None;
+
         while let Some(job) = rx.blocking_recv() {
             match job {
                 WriteJob::Stop { ack } => {
-                    let _ = ack.send(());
+                    // Подтверждение уходит не здесь, а после выхода из
+                    // цикла — когда соединение уже отпущено. Ответить
+                    // раньше значило бы сказать «остановился», продолжая
+                    // держать базу.
+                    stop_ack = Some(ack);
                     break;
                 }
                 WriteJob::Insert { user, batch, tz, reply } => {
@@ -2213,6 +2219,13 @@ enum WriteJob {
                     let _ = reply.send(result);
                 }
             }
+        }
+
+        // Соединение закрывается до подтверждения: получивший `ack` вправе
+        // считать, что база отпущена и файл можно переоткрывать.
+        drop(conn);
+        if let Some(ack) = stop_ack {
+            let _ = ack.send(());
         }
     });
 ```
@@ -2255,7 +2268,7 @@ impl SqliteStore {
 - [ ] **Step 4: Прогнать**
 
 Run: `cargo test -p wakode-store`
-Expected: PASS, три новых теста.
+Expected: PASS, пять новых тестов.
 
 - [ ] **Step 5: Мутационная проверка**
 
