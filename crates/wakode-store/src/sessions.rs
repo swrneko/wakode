@@ -3,6 +3,8 @@
 //! Свободные функции по той же форме, что и `keys`; репозиторный трейт
 //! появится в задаче 12.
 
+use std::fmt;
+
 use rusqlite::{Connection, OptionalExtension};
 use uuid::Uuid;
 use wakode_core::Micros;
@@ -11,12 +13,28 @@ use crate::clock;
 use crate::codec::{blob_to_uuid, uuid_to_blob};
 use crate::error::StoreResult;
 
-#[derive(Debug, Clone)]
+/// Заявка на сессию.
+///
+/// `token_hash` — хеш токена, который лежит в куке у браузера. `Debug` тут
+/// написан руками, как у [`crate::User`] и [`crate::NewApiKey`]: хеш —
+/// производная от секрета, и лог не то место, где ей стоит оседать.
+#[derive(Clone)]
 pub struct NewSession {
     pub user_id: Uuid,
     pub token_hash: Vec<u8>,
     pub user_agent: Option<String>,
     pub expires_at: Micros,
+}
+
+impl fmt::Debug for NewSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NewSession")
+            .field("user_id", &self.user_id)
+            .field("token_hash", &crate::REDACTED)
+            .field("user_agent", &self.user_agent)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -105,4 +123,33 @@ pub fn revoke_session(conn: &Connection, id: Uuid) -> StoreResult<()> {
         rusqlite::params![uuid_to_blob(id), clock::now().get()],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOKEN_HASH: &[u8] = &[222, 173, 190, 239];
+
+    #[test]
+    fn debug_hides_the_token_hash_but_keeps_the_user_agent() {
+        let new = NewSession {
+            user_id: Uuid::now_v7(),
+            token_hash: TOKEN_HASH.to_vec(),
+            user_agent: Some("wakode-cli/0.1".to_owned()),
+            expires_at: Micros::from_secs(1_755_000_000),
+        };
+
+        let dump = format!("{new:?}");
+
+        assert!(
+            !dump.contains(&format!("{TOKEN_HASH:?}")),
+            "хеш токена утёк в Debug: {dump}"
+        );
+        assert!(dump.contains(crate::REDACTED), "заглушки не видно: {dump}");
+        assert!(
+            dump.contains("wakode-cli/0.1"),
+            "user-agent прятать не надо: {dump}"
+        );
+    }
 }

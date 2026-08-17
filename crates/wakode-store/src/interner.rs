@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::{Arc, RwLock};
 
 use rusqlite::Connection;
@@ -15,12 +16,33 @@ use crate::error::StoreResult;
 ///
 /// Писатель ровно один — пишущая задача, — поэтому запись под замком редка,
 /// а чтение почти никогда не встречает конкуренции.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Interner {
     inner: RwLock<Maps>,
 }
 
-#[derive(Debug, Default)]
+/// Печатает **размер** словаря, а не его содержимое.
+///
+/// Производный `Debug` вывалил бы обе карты целиком, а в них лежат пути к
+/// файлам и названия проектов всех пользователей сразу — самое чувствительное,
+/// что есть в базе трекера. Достаточно одного `tracing::debug!(?state)` или
+/// `#[instrument]` в HTTP-слое, который держит `SqliteStore` (а тот держит
+/// `Arc<Interner>`), чтобы весь словарь уехал в лог.
+impl fmt::Debug for Interner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Отравленный замок здесь не повод паниковать, в отличие от `resolve`:
+        // `Debug` зовут как раз из путей сообщения об ошибке, и паника внутри
+        // форматирования подменила бы исходную причину собой.
+        let maps = self.inner.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        f.debug_struct("Interner")
+            .field("strings", &maps.by_id.len())
+            .finish()
+    }
+}
+
+/// `Debug` намеренно не выводится: карты видны только через [`Interner`], а
+/// его собственная реализация печатает размер вместо содержимого.
+#[derive(Default)]
 struct Maps {
     by_value: HashMap<Arc<str>, Sid>,
     by_id: HashMap<Sid, Arc<str>>,
@@ -144,5 +166,33 @@ impl Interner {
         }
 
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{migrate, open_in_memory};
+
+    #[test]
+    fn debug_shows_the_size_of_the_dictionary_but_not_its_contents() {
+        let mut conn = open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+
+        let interner = Interner::load(&conn).unwrap();
+        interner
+            .intern_batch(&conn, &["/home/swrneko/секрет.rs", "секретный-проект"])
+            .unwrap();
+
+        let dump = format!("{interner:?}");
+
+        assert!(
+            !dump.contains("секрет.rs") && !dump.contains("секретный-проект"),
+            "словарь не должен попадать в лог целиком: {dump}"
+        );
+        assert!(
+            dump.contains('2'),
+            "размер словаря печатать надо — по нему и отлаживают: {dump}"
+        );
     }
 }
