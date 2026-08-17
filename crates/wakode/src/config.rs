@@ -336,15 +336,30 @@ timeout_secs = 1800
     }
 
     #[test]
-    fn debug_does_not_print_a_master_key_because_config_has_none() {
-        // Мастер-ключ в конфиге отсутствует по построению. Тест сторожит
-        // это: если поле появится, `Debug` его напечатает, и утечка в лог
-        // случится в первой же строке старта.
+    fn the_config_carries_no_secrets() {
+        // Мастер-ключ в конфиге отсутствует по построению: он живёт только
+        // в `WAKODE_MASTER_KEY`. Файл с ключом рядом с базой означал бы,
+        // что украденный бэкап содержит и шифротекст, и ключ к нему.
+        //
+        // Сторожит это сверка полного состава полей, а не поиск подстроки
+        // «master». Поиск подстроки не поймал бы поле с любым другим
+        // именем — а `Config` печатается производным `Debug`, и первая же
+        // строка старта отправила бы такое поле в лог. Сверка состава
+        // краснеет на **любом** новом поле и заставляет автора решить,
+        // секрет это или нет. Если поле не секрет — просто допиши его сюда.
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(&dir, "");
         let config = Config::load_from(Some(&path), &path, |_| None).unwrap();
 
-        let dump = format!("{config:?}");
-        assert!(!dump.to_lowercase().contains("master"), "в конфиге появился мастер-ключ: {dump}");
+        assert_eq!(
+            format!("{config:?}"),
+            "Config { \
+             server: ServerConfig { listen: \"127.0.0.1:9000\", \
+             public_url: \"http://localhost:9000\" }, \
+             database: DatabaseConfig { path: \"./wakode.db\", write_queue: 256 }, \
+             auth: AuthConfig { registration: false, session_ttl_days: 30, \
+             setup_from_any_address: false }, \
+             durations: DurationsConfig { timeout_secs: 900, tail_padding_secs: 0 } }"
+        );
     }
 }
