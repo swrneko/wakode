@@ -57,9 +57,12 @@ pub trait SessionRepo: Send + Sync {
 
 /// Хранилище на SQLite.
 ///
-/// Пишущая задача владеет своим соединением. Читатели открывают собственные:
-/// в WAL-режиме они не мешают ни писателю, ни друг другу, поэтому гонять
-/// чтения через ту же очередь было бы искусственным узким местом.
+/// Пишущая задача владеет своим соединением и держит поток отметок —
+/// `record_heartbeats`. Всё остальное (пользователи, ключи, сессии, чтение
+/// отметок) открывает собственное соединение через `on_own_connection` и
+/// идёт мимо этой очереди: в WAL-режиме такие соединения не мешают ни
+/// писателю, ни друг другу, а гонять их через ту же очередь было бы
+/// искусственным узким местом.
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
     path: PathBuf,
@@ -68,6 +71,13 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
+    /// Открыть (или создать) базу по пути и поднять пишущую задачу.
+    ///
+    /// `write_queue` — ёмкость канала пишущей задачи, обычно из конфига
+    /// HTTP-слоя. `0` тут не запрещён проверкой, но и не безобиден:
+    /// `spawn_writer` называет его правдоподобной опечаткой конфига, и канал
+    /// нулевой ёмкости роняет процесс паникой изнутри `tokio::sync::mpsc`
+    /// при первом же вызове.
     pub fn open(path: &Path, write_queue: usize) -> StoreResult<Self> {
         let mut conn = crate::open(path)?;
         crate::migrate(&mut conn)?;
@@ -89,15 +99,27 @@ impl SqliteStore {
     }
 
     /// Консистентный снимок живой базы.
+    ///
+    /// Отказывает, если по пути `dest` уже есть файл (`VACUUM INTO` не
+    /// перезаписывает существующий файл): вызывающий получит
+    /// `StoreError::Sqlite` с «output file already exists», а не тихую
+    /// перезапись — ротацию имени бэкапа решает вызывающий, не эта функция.
     pub async fn backup(&self, dest: &Path) -> StoreResult<()> {
         let path = self.path.clone();
         let dest = dest.to_path_buf();
         tokio::task::spawn_blocking(move || {
             let conn = crate::open(&path)?;
+            // `to_str`, а не `to_string_lossy`: путь с не-UTF-8 байтами (на
+            // Linux имена файлов — произвольные байты) молча подменился бы
+            // символом замены, и VACUUM INTO создал бы файл с ДРУГИМ именем,
+            // отрапортовав Ok(()) — бэкап потерялся бы, не сказав об этом.
+            let dest_str = dest
+                .to_str()
+                .ok_or_else(|| rusqlite::Error::InvalidPath(dest.clone()))?;
             // VACUUM INTO делает снимок без остановки записи и попутно
             // дефрагментирует файл — в отличие от копирования файла руками,
             // которое на живой базе даёт битую копию.
-            conn.execute("VACUUM INTO ?1", [dest.to_string_lossy().as_ref()])?;
+            conn.execute("VACUUM INTO ?1", [dest_str])?;
             Ok(())
         })
         .await

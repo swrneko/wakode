@@ -1219,12 +1219,36 @@ async fn backup_produces_a_readable_copy() {
     let dest = dir.path().join("backup.db");
     store.backup(&dest).await.unwrap();
 
-    // Копия обязана открываться и содержать те же данные — снимок делается
-    // на живой базе, поэтому проверяем именно консистентность, а не факт
-    // существования файла.
+    // Доказывает ровно то, что копия открывается и содержит закоммиченные
+    // данные — не факт существования файла. Не доказывает: настоящую
+    // консистентность снимка под параллельной записью этот тест не ловит —
+    // здесь никто не пишет во время `backup`, а замена `VACUUM INTO` на
+    // `wal_checkpoint` + `fs::copy` (то есть реализацию, некорректную именно
+    // под конкурентной записью) этот тест не различает от настоящей.
     let copy = wakode_store::open(&dest).unwrap();
     let loaded = load_heartbeats(&copy, user.id, Micros::from_secs(0), Micros::from_secs(9_999)).unwrap();
     assert_eq!(loaded.len(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn backup_to_a_non_utf8_path_fails_instead_of_writing_a_differently_named_file() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(&dir.path().join("wakode.db"), 16).unwrap();
+
+    // 0xFF не встречается ни в одной валидной UTF-8 последовательности, а на
+    // Linux имена файлов — произвольные байты, так что такой путь легален.
+    // `to_string_lossy` подменила бы этот байт на U+FFFD, и VACUUM INTO
+    // создал бы файл с другим именем, отрапортовав Ok(()) — бэкап потерялся
+    // бы молча.
+    let dest = dir.path().join(OsStr::from_bytes(b"back\xffup.db"));
+
+    let err = store.backup(&dest).await.unwrap_err();
+    assert!(matches!(err, StoreError::Sqlite(_)), "получили {err:?}");
+    assert!(!dest.exists(), "файла по запрошенному пути быть не должно");
 }
 
 #[tokio::test]
