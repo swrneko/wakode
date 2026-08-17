@@ -11,15 +11,22 @@ use crate::Micros;
 #[derive(Serialize, Deserialize)]
 pub struct Sid(pub u32);
 
+/// Что за сущность правил в редакторе.
+///
+/// Числа уходят в колонку `kind` таблицы `heartbeats`, поэтому дискриминанты
+/// заданы явно: перестановка вариантов без этого молча переименовала бы уже
+/// записанные данные. Новые варианты дописываются в конец, существующие
+/// не перенумеровываются.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[repr(u8)]
 pub enum EntityKind {
     #[default]
-    File,
-    App,
-    Url,
-    Domain,
+    File = 0,
+    App = 1,
+    Url = 2,
+    Domain = 3,
 }
 
 /// Чем занят пользователь — категория из протокола WakaTime.
@@ -354,6 +361,20 @@ mod tests {
                 kind
             );
         }
+    }
+
+    #[test]
+    fn entity_kind_discriminants_are_pinned() {
+        const CONTRACT: &[(EntityKind, u8)] = &[
+            (EntityKind::File, 0),
+            (EntityKind::App, 1),
+            (EntityKind::Url, 2),
+            (EntityKind::Domain, 3),
+        ];
+        for (kind, number) in CONTRACT {
+            assert_eq!(*kind as u8, *number, "{kind:?}");
+        }
+        assert_eq!(CONTRACT.len(), 4, "новый вариант — новая строка контракта");
     }
 
     #[test]
