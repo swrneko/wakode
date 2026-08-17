@@ -3,11 +3,15 @@ use rusqlite::Connection;
 use uuid::Uuid;
 use wakode_core::{Category, EntityKind, Micros, Sid};
 
-use crate::codec::{category_to_i64, kind_to_i64, sid_to_i64, uuid_to_blob};
+use crate::codec::{
+    category_to_i64, i64_to_category, i64_to_kind, i64_to_sid, kind_to_i64, sid_to_i64,
+    uuid_to_blob,
+};
 use crate::dedup::dedup_hash;
 use crate::dirty::{affected_days, mark_dirty};
 use crate::error::StoreResult;
 use crate::interner::Interner;
+use wakode_core::{Attrs, Heartbeat};
 
 /// Отметка как она пришла с провода: строки ещё не интернированы.
 #[derive(Debug, Clone)]
@@ -219,4 +223,65 @@ fn take_next(ids: &[Sid], cursor: &mut usize, present: bool) -> Option<Sid> {
     let sid = ids[*cursor];
     *cursor += 1;
     Some(sid)
+}
+
+/// Поднять отметки пользователя за полуинтервал `[from, to)`.
+///
+/// Границы совпадают с тем, что отдаёт `wakode_core::heartbeat_window`, —
+/// то есть уже расширены на таймаут в обе стороны. Сортировка по времени
+/// делается индексом `hb_time`, а не в Rust: движок длительностей всё равно
+/// отсортирует вход, но упорядоченная выборка дешевле и делает результат
+/// воспроизводимым.
+pub fn load_heartbeats(
+    conn: &Connection,
+    user: Uuid,
+    from: Micros,
+    to: Micros,
+) -> StoreResult<Vec<Heartbeat>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT time, entity_id, kind, category,
+                project_id, branch_id, language_id, editor_id, os_id, machine_id
+         FROM heartbeats
+         WHERE user_id = ?1 AND time >= ?2 AND time < ?3
+         ORDER BY time",
+    )?;
+
+    let rows = stmt.query_map(
+        rusqlite::params![uuid_to_blob(user), from.get(), to.get()],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+            ))
+        },
+    )?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (time, entity, kind, category, project, branch, language, editor, os, machine) = row?;
+        out.push(Heartbeat {
+            time: Micros::new(time),
+            attrs: Attrs {
+                entity: i64_to_sid(entity)?,
+                kind: i64_to_kind(kind)?,
+                category: i64_to_category(category)?,
+                project: project.map(i64_to_sid).transpose()?,
+                branch: branch.map(i64_to_sid).transpose()?,
+                language: language.map(i64_to_sid).transpose()?,
+                editor: editor.map(i64_to_sid).transpose()?,
+                os: os.map(i64_to_sid).transpose()?,
+                machine: machine.map(i64_to_sid).transpose()?,
+            },
+        });
+    }
+
+    Ok(out)
 }

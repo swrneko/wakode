@@ -2,8 +2,9 @@ use chrono::NaiveDate;
 use chrono_tz::Tz;
 use wakode_core::{Category, EntityKind, Micros};
 use wakode_store::{
-    dirty_days_for, find_user_by_id, find_user_by_login, insert_heartbeats, insert_user, migrate,
-    open_in_memory, schema_version, IncomingHeartbeat, Interner, NewUser, Outcome,
+    dirty_days_for, find_user_by_id, find_user_by_login, insert_heartbeats, insert_user,
+    load_heartbeats, migrate, open_in_memory, schema_version, IncomingHeartbeat, Interner,
+    NewUser, Outcome,
 };
 
 fn a_user(login: &str) -> NewUser {
@@ -483,4 +484,167 @@ fn an_empty_batch_touches_nothing() {
 
     assert_eq!(report.outcomes, Vec::new());
     assert!(dirty_days_for(&conn, user.id).unwrap().is_empty());
+}
+
+#[test]
+fn loaded_heartbeats_come_back_as_core_types() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
+    let batch = [incoming(1_000, "src/main.rs", Some("wakode"))];
+    insert_heartbeats(&mut conn, &interner, user.id, &batch, user.timezone).unwrap();
+
+    let loaded = load_heartbeats(
+        &conn,
+        user.id,
+        Micros::from_secs(0),
+        Micros::from_secs(2_000),
+    )
+    .unwrap();
+
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].time, Micros::from_secs(1_000));
+    assert_eq!(loaded[0].attrs.category, Category::Coding);
+    assert_eq!(loaded[0].attrs.kind, EntityKind::File);
+    assert!(loaded[0].attrs.project.is_some());
+    assert_eq!(
+        interner.resolve(loaded[0].attrs.entity).unwrap().as_ref(),
+        "src/main.rs"
+    );
+}
+
+#[test]
+fn range_is_half_open_and_sorted() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
+    // Вставляем не по порядку — чтение обязано отдать по возрастанию времени.
+    let batch = [
+        incoming(300, "c.rs", None),
+        incoming(100, "a.rs", None),
+        incoming(200, "b.rs", None),
+    ];
+    insert_heartbeats(&mut conn, &interner, user.id, &batch, user.timezone).unwrap();
+
+    let loaded = load_heartbeats(
+        &conn,
+        user.id,
+        Micros::from_secs(100),
+        Micros::from_secs(300),
+    )
+    .unwrap();
+
+    let times: Vec<i64> = loaded.iter().map(|hb| hb.time.get()).collect();
+    assert_eq!(
+        times,
+        vec![Micros::from_secs(100).get(), Micros::from_secs(200).get()],
+        "нижняя граница включена, верхняя — нет"
+    );
+}
+
+#[test]
+fn one_user_never_sees_another_users_heartbeats() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let one = insert_user(&conn, &a_user("one")).unwrap();
+    let two = insert_user(&conn, &a_user("two")).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
+    insert_heartbeats(&mut conn, &interner, one.id, &[incoming(100, "a.rs", None)], one.timezone).unwrap();
+    insert_heartbeats(&mut conn, &interner, two.id, &[incoming(100, "b.rs", None)], two.timezone).unwrap();
+
+    let loaded = load_heartbeats(&conn, one.id, Micros::from_secs(0), Micros::from_secs(1_000)).unwrap();
+
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(interner.resolve(loaded[0].attrs.entity).unwrap().as_ref(), "a.rs");
+}
+
+#[test]
+fn empty_range_gives_an_empty_vector_not_an_error() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+
+    let loaded = load_heartbeats(&conn, user.id, Micros::from_secs(0), Micros::from_secs(1)).unwrap();
+    assert!(loaded.is_empty());
+}
+
+#[test]
+fn every_attribute_survives_the_round_trip() {
+    // Долг задачи 8. Все необязательные поля заполнены **различимыми**
+    // значениями: только так ловится перестановка соседних полей при
+    // разборе. Пустое поле не двигает курсор, поэтому на `None` подмена
+    // проекта веткой выглядит точно так же, как её отсутствие.
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
+    let full = IncomingHeartbeat {
+        time: Micros::from_secs(1_755_000_000),
+        entity: "сущность".to_owned(),
+        kind: EntityKind::App,
+        category: Category::Debugging,
+        project: Some("проект".to_owned()),
+        branch: Some("ветка".to_owned()),
+        language: Some("язык".to_owned()),
+        editor: Some("редактор".to_owned()),
+        os: Some("ос".to_owned()),
+        machine: Some("машина".to_owned()),
+        plugin: Some("плагин".to_owned()),
+        is_write: true,
+        lines: Some(1),
+        lineno: Some(2),
+        cursorpos: Some(3),
+        line_additions: Some(4),
+        line_deletions: Some(5),
+        project_root_count: Some(6),
+        dependencies: Some("зависимости".to_owned()),
+        ai_line_changes: Some(7),
+        human_line_changes: Some(8),
+        ai_meta: Some("мета".to_owned()),
+    };
+
+    insert_heartbeats(&mut conn, &interner, user.id, &[full], user.timezone).unwrap();
+    let loaded = load_heartbeats(
+        &conn,
+        user.id,
+        Micros::from_secs(1_755_000_000),
+        Micros::from_secs(1_755_000_001),
+    )
+    .unwrap();
+
+    let attrs = loaded[0].attrs;
+    let text = |sid| interner.resolve(sid).unwrap().to_string();
+
+    assert_eq!(loaded[0].time, Micros::from_secs(1_755_000_000));
+    assert_eq!(attrs.kind, EntityKind::App);
+    assert_eq!(attrs.category, Category::Debugging);
+    assert_eq!(text(attrs.entity), "сущность");
+    assert_eq!(text(attrs.project.unwrap()), "проект");
+    assert_eq!(text(attrs.branch.unwrap()), "ветка");
+    assert_eq!(text(attrs.language.unwrap()), "язык");
+    assert_eq!(text(attrs.editor.unwrap()), "редактор");
+    assert_eq!(text(attrs.os.unwrap()), "ос");
+    assert_eq!(text(attrs.machine.unwrap()), "машина");
+}
+
+#[test]
+fn a_refused_batch_stores_no_heartbeats_at_all() {
+    // Долг задачи 8, закрытый ровно настолько, насколько он закрываем.
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let interner = Interner::load(&conn).unwrap();
+
+    let ghost = uuid::Uuid::now_v7();
+    let doomed = [incoming(200, "b.rs", None), incoming(300, "c.rs", None)];
+    assert!(insert_heartbeats(&mut conn, &interner, ghost, &doomed, chrono_tz::UTC).is_err());
+
+    let loaded =
+        load_heartbeats(&conn, ghost, Micros::from_secs(0), Micros::from_secs(1_000)).unwrap();
+    assert!(loaded.is_empty());
 }
