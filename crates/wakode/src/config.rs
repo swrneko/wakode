@@ -132,13 +132,6 @@ impl Config {
     /// задан и умолчания на диске нет — берутся значения по умолчанию плюс
     /// окружение, что и нужно в контейнере.
     ///
-    /// Пока не вызывается из `main`: последовательность старта — задача 7.
-    ///
-    /// `expect`, а не `allow`: как только `main` начнёт звать `load`,
-    /// компилятор сообщит, что ожидание не оправдалось, и атрибут придётся
-    /// снять. `allow` такого сигнала не даёт и остался бы навсегда, гася
-    /// заодно `dead_code` для всего, до чего дотянется.
-    #[expect(dead_code, reason = "последовательность старта — задача 7")]
     pub fn load(explicit: Option<&Path>) -> Result<Self, ConfigError> {
         let default_path = PathBuf::from(DEFAULT_CONFIG_PATH);
         Self::load_from(explicit, &default_path, |name| std::env::var(name).ok())
