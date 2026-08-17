@@ -1254,15 +1254,20 @@ pub fn first_api_key(conn: &Connection) -> StoreResult<Option<ApiKey>> {
 - [ ] **Step 4: Прогнать**
 
 Run: `cargo test -p wakode-store`
-Expected: PASS, пять новых тестов.
+Expected: PASS, пять новых тестов в `tests/repository.rs` и два в `src/keys.rs`.
 
 - [ ] **Step 5: Мутационная проверка**
 
 | Мутация | Обязан упасть |
 |---|---|
-| `ORDER BY created_at, id` убрать, оставив `LIMIT 1` | `first_api_key_returns_the_oldest_one` — если не упадёт, значит порядок пришёл от плана запроса, и это находка: скажи прямо, а не подгоняй тест |
+| `ORDER BY created_at, id` убрать, оставив `LIMIT 1` | `first_api_key_orders_by_created_at_not_by_insertion` (модульный тест в `src/keys.rs`) |
+| `ORDER BY created_at DESC` | он же |
 | `user_count` возвращает `Ok(0)` всегда | `user_count_follows_the_users_actually_inserted` |
-| добавить в `first_api_key` условие `WHERE revoked_at IS NULL` | ни один тест не упадёт — это находка о покрытии, доложи её |
+| добавить в `first_api_key` условие `WHERE revoked_at IS NULL` | `first_api_key_sees_revoked_keys_too` |
+
+**Почему два теста порядка живут в `src/keys.rs`, а не в `tests/repository.rs`.** Интеграционный тест порядок не доказывает: два ключа, вставленные подряд, получают и `created_at`, и rowid по возрастанию, поэтому обход таблицы совпадает с `ORDER BY` случайно — ровно на этом в `load_heartbeats` уже обжигались. Различающий тест требует `created_at`, идущего против порядка вставки, а задать его можно только напрямую. Сырой SQL в модульном тесте внутри `src/` для того и позволен: три места в `tests/repository.rs` — про схему, а это про то, чего через публичный интерфейс не выразить.
+
+**Про отозванные ключи.** `first_api_key` их **видит**, и это не недосмотр: шаг 5 старта расшифровывает найденным ключом пробное значение, а отозванный зашифрован тем же мастер-ключом и годится ровно так же. Инстанс, где единственный ключ отозвали, обязан продолжать отказываться стартовать с чужим мастер-ключом.
 
 - [ ] **Step 6: Коммит**
 

@@ -219,6 +219,108 @@ mod tests {
     const ENCRYPTED: &[u8] = &[222, 173, 190, 239];
     const LOOKUP: &[u8] = &[13, 240, 13, 240];
 
+    /// Завести пользователя и вернуть его идентификатор.
+    fn a_user_id(conn: &Connection) -> Uuid {
+        insert_user(
+            conn,
+            &NewUser {
+                login: "swrneko".to_owned(),
+                email: None,
+                password_hash: "непрозрачно".to_owned(),
+                display_name: None,
+                timezone: "UTC".parse().unwrap(),
+                timeout_secs: 900,
+                is_admin: false,
+            },
+        )
+        .unwrap()
+        .id
+    }
+
+    #[test]
+    fn first_api_key_orders_by_created_at_not_by_insertion() {
+        // Интеграционный тест на порядок не доказывает ничего: два ключа,
+        // вставленные подряд, получают и `created_at`, и rowid по
+        // возрастанию, поэтому обход таблицы совпадает с `ORDER BY`
+        // случайно. Ровно на этом в `load_heartbeats` уже обжигались.
+        //
+        // Здесь `created_at` задаётся напрямую и идёт против порядка
+        // вставки — тогда `ORDER BY` становится единственным, что даёт
+        // верный ответ. Сырой SQL в модульном тесте внутри `src/` для того
+        // и позволен: три места в `tests/repository.rs` — про схему, а это
+        // про то, чего через публичный интерфейс не выразить.
+        let mut conn = open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        let user = a_user_id(&conn);
+
+        let later = insert_api_key(
+            &conn,
+            &NewApiKey {
+                user_id: user,
+                name: "вставлен первым".to_owned(),
+                key_encrypted: ENCRYPTED.to_vec(),
+                key_lookup: LOOKUP.to_vec(),
+            },
+        )
+        .unwrap();
+        let earlier = insert_api_key(
+            &conn,
+            &NewApiKey {
+                user_id: user,
+                name: "вставлен вторым".to_owned(),
+                key_encrypted: vec![1, 2, 3],
+                key_lookup: vec![4, 5, 6],
+            },
+        )
+        .unwrap();
+
+        // Второму по вставке приписываем более раннее время.
+        conn.execute(
+            "UPDATE api_keys SET created_at = ?2 WHERE id = ?1",
+            rusqlite::params![uuid_to_blob(earlier.id), 1_000_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE api_keys SET created_at = ?2 WHERE id = ?1",
+            rusqlite::params![uuid_to_blob(later.id), 2_000_i64],
+        )
+        .unwrap();
+
+        let found = first_api_key(&conn).unwrap().unwrap();
+        assert_eq!(
+            found.id, earlier.id,
+            "порядок пришёл от обхода таблицы, а не от ORDER BY"
+        );
+    }
+
+    #[test]
+    fn first_api_key_sees_revoked_keys_too() {
+        // Шаг 5 старта расшифровывает этим ключом пробное значение, чтобы
+        // убедиться, что мастер-ключ тот самый. Отозванный ключ зашифрован
+        // тем же мастер-ключом и для проверки годится ровно так же, а
+        // инстанс, где единственный ключ отозвали, обязан продолжать
+        // отказываться стартовать с чужим мастер-ключом.
+        let mut conn = open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        let user = a_user_id(&conn);
+
+        let key = insert_api_key(
+            &conn,
+            &NewApiKey {
+                user_id: user,
+                name: "отозванный".to_owned(),
+                key_encrypted: ENCRYPTED.to_vec(),
+                key_lookup: LOOKUP.to_vec(),
+            },
+        )
+        .unwrap();
+        revoke_key(&conn, key.id).unwrap();
+
+        let found = first_api_key(&conn).unwrap().unwrap();
+        assert_eq!(found.id, key.id);
+        assert!(found.revoked_at.is_some());
+    }
+
     #[test]
     fn debug_hides_the_key_material_but_keeps_the_name() {
         let mut conn = open_in_memory().unwrap();
