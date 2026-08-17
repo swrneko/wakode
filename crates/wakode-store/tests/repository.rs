@@ -2,9 +2,10 @@ use chrono::NaiveDate;
 use chrono_tz::Tz;
 use wakode_core::{Category, EntityKind, Micros};
 use wakode_store::{
-    dirty_days_for, find_user_by_id, find_user_by_login, insert_heartbeats, insert_user,
-    load_heartbeats, migrate, open_in_memory, schema_version, IncomingHeartbeat, Interner,
-    NewUser, Outcome,
+    dirty_days_for, find_key_by_lookup, find_session_by_token_hash, find_user_by_id,
+    find_user_by_login, insert_api_key, insert_heartbeats, insert_session, insert_user,
+    load_heartbeats, migrate, open_in_memory, revoke_key, revoke_session, schema_version,
+    touch_key_used, IncomingHeartbeat, Interner, NewApiKey, NewSession, NewUser, Outcome,
 };
 
 fn a_user(login: &str) -> NewUser {
@@ -249,6 +250,194 @@ fn timezone_survives_the_round_trip() {
 
     let found = find_user_by_id(&conn, created.id).unwrap().unwrap();
     assert_eq!(found.timezone, Tz::America__Havana);
+}
+
+#[test]
+fn api_key_is_found_by_its_lookup_fingerprint() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+
+    let created = insert_api_key(
+        &conn,
+        &NewApiKey {
+            user_id: user.id,
+            name: "рабочий ноутбук".to_owned(),
+            key_encrypted: vec![1, 2, 3],
+            key_lookup: vec![9, 9, 9],
+        },
+    )
+    .unwrap();
+
+    let found = find_key_by_lookup(&conn, &[9, 9, 9]).unwrap().unwrap();
+    assert_eq!(found.id, created.id);
+    assert_eq!(found.user_id, user.id);
+    assert_eq!(found.key_encrypted, vec![1, 2, 3]);
+    assert!(found.revoked_at.is_none());
+}
+
+#[test]
+fn revoked_key_is_still_found_but_marked() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+
+    let created = insert_api_key(
+        &conn,
+        &NewApiKey {
+            user_id: user.id,
+            name: "старый".to_owned(),
+            key_encrypted: vec![1],
+            key_lookup: vec![2],
+        },
+    )
+    .unwrap();
+
+    revoke_key(&conn, created.id).unwrap();
+
+    // Отозванный ключ обязан находиться: иначе слой аутентификации не сможет
+    // отличить «ключа никогда не было» от «ключ отозван», а это разные ответы.
+    let found = find_key_by_lookup(&conn, &[2]).unwrap().unwrap();
+    assert!(found.revoked_at.is_some());
+}
+
+#[test]
+fn unknown_lookup_is_none() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+
+    assert!(find_key_by_lookup(&conn, &[0, 0, 0]).unwrap().is_none());
+}
+
+#[test]
+fn duplicate_lookup_is_refused() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+
+    let key = |name: &str| NewApiKey {
+        user_id: user.id,
+        name: name.to_owned(),
+        key_encrypted: vec![1],
+        key_lookup: vec![7],
+    };
+
+    insert_api_key(&conn, &key("первый")).unwrap();
+    assert!(insert_api_key(&conn, &key("второй")).is_err());
+}
+
+#[test]
+fn touching_a_key_records_when_it_was_last_used() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+
+    let created = insert_api_key(
+        &conn,
+        &NewApiKey {
+            user_id: user.id,
+            name: "ключ".to_owned(),
+            key_encrypted: vec![1],
+            key_lookup: vec![5],
+        },
+    )
+    .unwrap();
+    assert!(created.last_used_at.is_none());
+
+    touch_key_used(&conn, created.id).unwrap();
+
+    let found = find_key_by_lookup(&conn, &[5]).unwrap().unwrap();
+    assert!(found.last_used_at.is_some());
+}
+
+#[test]
+fn session_round_trips_by_token_hash() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+
+    let created = insert_session(
+        &conn,
+        &NewSession {
+            user_id: user.id,
+            token_hash: vec![4, 2],
+            user_agent: Some("Firefox".to_owned()),
+            expires_at: Micros::from_secs(2_000_000_000),
+        },
+    )
+    .unwrap();
+
+    let found = find_session_by_token_hash(&conn, &[4, 2]).unwrap().unwrap();
+    assert_eq!(found.id, created.id);
+    assert_eq!(found.user_id, user.id);
+    assert_eq!(found.expires_at, Micros::from_secs(2_000_000_000));
+}
+
+#[test]
+fn revoked_session_is_still_found_but_marked() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+
+    let created = insert_session(
+        &conn,
+        &NewSession {
+            user_id: user.id,
+            token_hash: vec![8, 8],
+            user_agent: None,
+            expires_at: Micros::from_secs(2_000_000_000),
+        },
+    )
+    .unwrap();
+
+    revoke_session(&conn, created.id).unwrap();
+
+    // Отозванная сессия обязана находиться: слой аутентификации должен
+    // отличать «сессии не было» от «сессия отозвана» — это разные ответы.
+    let found = find_session_by_token_hash(&conn, &[8, 8]).unwrap().unwrap();
+    assert!(found.revoked_at.is_some());
+}
+
+#[test]
+fn deleting_a_user_takes_their_keys_and_sessions_with_them() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+
+    insert_api_key(
+        &conn,
+        &NewApiKey {
+            user_id: user.id,
+            name: "ключ".to_owned(),
+            key_encrypted: vec![1],
+            key_lookup: vec![1],
+        },
+    )
+    .unwrap();
+    insert_session(
+        &conn,
+        &NewSession {
+            user_id: user.id,
+            token_hash: vec![1],
+            user_agent: None,
+            expires_at: Micros::from_secs(1),
+        },
+    )
+    .unwrap();
+
+    // Третье и последнее из трёх мест, где в этом файле позволен сырой SQL:
+    // удаления пользователя в волне 0 нет, каскад через публичный интерфейс
+    // не проверить, а он — свойство самой схемы, как список таблиц в
+    // `wave_zero_schema_creates_every_table` и уникальность индекса в
+    // `heartbeat_dedup_index_is_unique`. Четвёртого места не будет.
+    conn.execute(
+        "DELETE FROM users WHERE id = ?1",
+        [wakode_store::codec::uuid_to_blob(user.id)],
+    )
+    .unwrap();
+
+    assert!(find_key_by_lookup(&conn, &[1]).unwrap().is_none());
+    assert!(find_session_by_token_hash(&conn, &[1]).unwrap().is_none());
 }
 
 fn incoming(time_secs: i64, entity: &str, project: Option<&str>) -> IncomingHeartbeat {
