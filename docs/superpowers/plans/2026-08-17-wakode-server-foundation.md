@@ -913,12 +913,34 @@ mod tests {
     }
 
     #[test]
-    fn the_hash_does_not_contain_the_token() {
+    fn the_hash_is_not_the_token_itself() {
         // Односторонность нужна затем, что утечка базы не должна давать
         // возможность войти под чужой сессией.
+        //
+        // Сравнение идёт по байтам, а не по тексту. Текстовая проверка
+        // вида `String::from_utf8_lossy(&hash()).contains(&to_string())`
+        // не ловит ничего: хеш — 32 сырых байта, токен печатается 43
+        // символами base64url, и короткая строка не может содержать
+        // длинную ни при какой реализации.
         let token = SessionToken::generate();
-        let text = token.to_string();
-        assert!(!String::from_utf8_lossy(&token.hash()).contains(&text));
+        let raw = URL_SAFE_NO_PAD.decode(token.to_string()).unwrap();
+        assert_ne!(token.hash(), raw, "хеш совпал с самим токеном");
+    }
+
+    #[test]
+    fn the_hash_algorithm_is_pinned_to_a_fixed_vector() {
+        // Хеш ложится в уникальный индекс `sessions.token_hash`. Тихая
+        // смена алгоритма разлогинила бы всех разом, и круговой обход
+        // внутри одного запуска этого не увидит: он согласован сам с собой.
+        let token = SessionToken::parse("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8").unwrap();
+        assert_eq!(
+            token.hash(),
+            // SHA-256 от байтов 0x00..0x1f, посчитан независимо.
+            vec![
+                99, 13, 205, 41, 102, 196, 51, 102, 145, 18, 84, 72, 187, 178, 91, 79, 244, 18,
+                164, 156, 115, 45, 178, 200, 171, 193, 184, 88, 27, 215, 16, 221
+            ]
+        );
     }
 
     #[test]
@@ -929,9 +951,12 @@ mod tests {
 
     #[test]
     fn debug_does_not_print_the_token() {
+        // Сравнение с точной строкой, а не поиск подстроки. Та же ловушка,
+        // что в задаче 1: производный `Debug` печатает `[u8; 32]`
+        // десятичными, а `to_string()` даёт base64url — эти представления
+        // не пересекаются, и поиск подстроки зелёный на утёкшем токене.
         let token = SessionToken::generate();
-        let dump = format!("{token:?}");
-        assert!(!dump.contains(&token.to_string()), "токен утёк: {dump}");
+        assert_eq!(format!("{token:?}"), format!("SessionToken({REDACTED:?})"));
     }
 }
 ```
@@ -999,7 +1024,7 @@ impl std::fmt::Debug for SessionToken {
 - [ ] **Step 4: Прогнать**
 
 Run: `cargo test -p wakode-auth`
-Expected: PASS, двадцать шесть тестов.
+Expected: PASS, тридцать три теста в wakode-auth.
 
 - [ ] **Step 5: Мутационная проверка**
 
