@@ -397,10 +397,16 @@ fn every_api_key_field_survives_the_round_trip() {
     // Проверяются **все** поля, не только отпечаток. `name` и `created_at`
     // раньше не проверял ни один assert в этом файле, а в `api_keys` подряд
     // лежат три `INTEGER` (`created_at`, `last_used_at`, `revoked_at`) и два
-    // `BLOB` (`id`, `user_id`) — ровно расстановка, где `row.get(N)` может
-    // съехать на соседнюю колонку того же типа и это не заметит ничто, кроме
-    // прямого assert'а по каждому полю. `created_at` сравнивается с тем, что
+    // `BLOB` (`id`, `user_id`) — ровно расстановка, где `row.get(N)` съезжает
+    // на соседнюю колонку того же типа. `created_at` сравнивается с тем, что
     // вернул `insert_api_key`, а не с конкретным числом: часы здесь настоящие.
+    //
+    // Пару `last_used_at`/`revoked_at` этот тест не различает: у свежего
+    // ключа обе пусты, заполнить их тут нечем, и взаимная перестановка
+    // проходит через оба `is_none()` беспрепятственно. Её ловят три других
+    // теста — `revoked_key_is_still_found_but_marked`,
+    // `touching_a_key_records_when_it_was_last_used` и
+    // `revoking_an_already_revoked_key_or_session_keeps_the_original_timestamp`.
     let mut conn = open_in_memory().unwrap();
     migrate(&mut conn).unwrap();
     let user = insert_user(&conn, &a_user("swrneko")).unwrap();

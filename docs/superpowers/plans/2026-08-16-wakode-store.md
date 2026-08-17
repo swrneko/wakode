@@ -2655,11 +2655,41 @@ fn revoked_key_is_still_found_but_marked() {
 }
 
 #[test]
-fn unknown_lookup_is_none() {
+fn a_keys_lookup_finds_its_own_row_and_leaves_others_alone() {
     let mut conn = open_in_memory().unwrap();
     migrate(&mut conn).unwrap();
+    let alice = insert_user(&conn, &a_user("alice")).unwrap();
+    let bob = insert_user(&conn, &a_user("bob")).unwrap();
 
-    assert!(find_key_by_lookup(&conn, &[0, 0, 0]).unwrap().is_none());
+    let alice_key = insert_api_key(&conn, &NewApiKey {
+        user_id: alice.id, name: "алисин".to_owned(),
+        key_encrypted: vec![1], key_lookup: vec![11],
+    }).unwrap();
+    let bob_key = insert_api_key(&conn, &NewApiKey {
+        user_id: bob.id, name: "бобов".to_owned(),
+        key_encrypted: vec![2], key_lookup: vec![22],
+    }).unwrap();
+
+    // Строки в таблице есть, но искомого отпечатка среди них нет: `None`
+    // обязан получиться из-за отсутствия совпадения, а не из-за пустой
+    // таблицы — реализация вроде `SELECT ... LIMIT 1` без фильтра по
+    // `key_lookup` эту разницу не ловит.
+    assert!(find_key_by_lookup(&conn, &[99]).unwrap().is_none());
+
+    let found = find_key_by_lookup(&conn, &[11]).unwrap().unwrap();
+    assert_eq!(found.id, alice_key.id);
+    assert_eq!(found.user_id, alice.id);
+
+    // Отзыв и touch адресуются по `id`. Реализация, где в запросе нет
+    // `id = ?1`, отозвала бы или пометила бы использованными ключи всех
+    // пользователей разом — массовый разлогин вместо отзыва одного ключа.
+    revoke_key(&conn, alice_key.id).unwrap();
+    touch_key_used(&conn, alice_key.id).unwrap();
+
+    let bob_after = find_key_by_lookup(&conn, &[22]).unwrap().unwrap();
+    assert_eq!(bob_after.id, bob_key.id);
+    assert!(bob_after.revoked_at.is_none(), "отзыв чужого ключа задел соседний");
+    assert!(bob_after.last_used_at.is_none(), "touch чужого ключа задел соседний");
 }
 
 #[test]
@@ -2736,12 +2766,15 @@ fn deleting_a_user_takes_their_keys_and_sessions_with_them() {
 
 **Про сырой SQL в нём.** Удаления пользователя в волне 0 нет, поэтому проверить каскад через публичный интерфейс нечем. Это третье и последнее из трёх мест, где сырой SQL позволен: каскад — свойство самой схемы, как и две уже занятые проверки (список таблиц и уникальность `hb_dedup`). Четвёртого места не будет. Комментарий в тесте обязан это проговорить, иначе следующий читатель решит, что запрет мягкий.
 
-**Ещё два теста сверх шести.** `touch_key_used` и `revoke_session` реализуются здесь же, и без тестов остались бы двумя публичными функциями, о которых не доказано ничего:
+**Ещё пять тестов сверх блока кода.** Без них семь публичных функций остались бы недоказанными; все идут по стилю соседних тестов файла.
 
 - `touching_a_key_records_when_it_was_last_used` — у свежего ключа `last_used_at` пуст; после `touch_key_used` он заполнен. Проверять конкретное значение времени не надо, `is_some()` достаточно: часы здесь настоящие, и тест не должен зависеть от их разрешения.
 - `revoked_session_is_still_found_but_marked` — зеркало `revoked_key_is_still_found_but_marked` и по той же причине: слой аутентификации обязан отличать «сессии не было» от «сессия отозвана».
+- `a_sessions_lookup_finds_its_own_row_and_leaves_others_alone` — зеркало теста изоляции для ключей, приведённого выше, для `find_session_by_token_hash` и `revoke_session`.
+- `revoking_an_already_revoked_key_or_session_keeps_the_original_timestamp` — отозвать, запомнить `revoked_at`, отозвать ещё раз, убедиться, что значение не изменилось. Сторож для `AND revoked_at IS NULL`: без клаузы «когда ключ отозвали» превращается в «когда его последний раз пытались отозвать», а повтор — обычное дело (ретрай HTTP, двойной клик в настройках).
+- `every_api_key_field_survives_the_round_trip` и `every_session_field_survives_the_round_trip` — все поля `ApiKey` и `Session` заполнены различимыми значениями и проверены после чтения, по образцу `every_field_survives_the_round_trip` из задачи 7. В `api_keys` подряд лежат три `INTEGER` (`created_at`, `last_used_at`, `revoked_at`) и два `BLOB` — расстановка, где `row.get(N)` съезжает на соседнюю колонку того же типа и это не замечает ничто, кроме прямого assert'а по каждому полю. `created_at` сравнивать с конкретным числом нельзя, но можно с тем, что вернул `insert_*`.
 
-Оба идут по стилю соседних тестов файла.
+**Почему тестов изоляции не может не быть.** Без второго пользователя в таблице лежит ровно одна строка, и тогда `WHERE key_lookup = ?1` спокойно заменяется на `WHERE ?1 IS NOT NULL`, а `id = ?1` из `revoke_key`/`revoke_session`/`touch_key_used` вынимается — суита остаётся зелёной. Пропущенная реализация первого рода даёт аутентификацию под чужим пользователем, второго — отзыв ключей и сессий всех пользователей разом. Тест на пустой таблице (`unknown_lookup_is_none`, каким он был в первой редакции этого плана) от этого не спасает: он доказывает «пустая таблица → `None`», а не «неизвестный отпечаток → `None`».
 
 - [ ] **Step 2: Запустить и убедиться, что падает**
 
@@ -2980,7 +3013,7 @@ pub fn revoke_session(conn: &Connection, id: Uuid) -> StoreResult<()> {
 В `lib.rs`: `pub mod keys;`, `pub mod sessions;`, `pub use keys::{find_key_by_lookup, insert_api_key, revoke_key, touch_key_used, ApiKey, NewApiKey};`, `pub use sessions::{find_session_by_token_hash, insert_session, revoke_session, NewSession, Session};`.
 
 Run: `cargo test -p wakode-store`
-Expected: PASS, восемь новых тестов.
+Expected: PASS, двенадцать новых тестов.
 
 - [ ] **Step 6: Коммит**
 
