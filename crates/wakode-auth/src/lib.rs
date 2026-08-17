@@ -9,11 +9,13 @@ pub mod api_key;
 pub mod error;
 pub mod master_key;
 pub mod password;
+pub mod session;
 
 pub use api_key::{ApiKeyValue, EncryptedKey};
 pub use error::{AuthError, AuthResult};
 pub use master_key::MasterKey;
 pub use password::{hash_password, verify_password};
+pub use session::SessionToken;
 
 /// Заглушка вместо секрета в `Debug`.
 pub(crate) const REDACTED: &str = "<скрыт>";
