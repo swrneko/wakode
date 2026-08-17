@@ -144,6 +144,48 @@ pub fn find_key_by_lookup(conn: &Connection, lookup: &[u8]) -> StoreResult<Optio
     }))
 }
 
+/// Самый ранний API-ключ в базе, если он есть.
+///
+/// Последовательность старта берёт им две вещи разом: сам факт наличия
+/// ключей (без мастер-ключа стартовать нельзя) и шифротекст для проверки,
+/// что мастер-ключ тот самый. Порядок по `created_at` делает проверку
+/// воспроизводимой — «какой-нибудь» ключ означал бы, что она то проходит,
+/// то нет.
+pub fn first_api_key(conn: &Connection) -> StoreResult<Option<ApiKey>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, user_id, name, key_encrypted, created_at, last_used_at, revoked_at
+         FROM api_keys ORDER BY created_at, id LIMIT 1",
+    )?;
+
+    let row = stmt
+        .query_row([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+            ))
+        })
+        .optional()?;
+
+    let Some((id, user_id, name, key_encrypted, created, used, revoked)) = row else {
+        return Ok(None);
+    };
+
+    Ok(Some(ApiKey {
+        id: blob_to_uuid(&id)?,
+        user_id: blob_to_uuid(&user_id)?,
+        name,
+        key_encrypted,
+        created_at: Micros::new(created),
+        last_used_at: used.map(Micros::new),
+        revoked_at: revoked.map(Micros::new),
+    }))
+}
+
 /// Отозвать ключ.
 ///
 /// `AND revoked_at IS NULL` в запросе — не лишнее условие: повторный отзыв

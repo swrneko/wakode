@@ -5,10 +5,10 @@ use chrono_tz::Tz;
 use wakode_core::{Category, EntityKind, Micros};
 use wakode_store::{
     dirty_days_for, find_key_by_lookup, find_session_by_token_hash, find_user_by_id,
-    find_user_by_login, insert_api_key, insert_heartbeats, insert_session, insert_user,
-    load_heartbeats, migrate, open_in_memory, revoke_key, revoke_session, schema_version,
-    spawn_writer, touch_key_used, HeartbeatRepo, IncomingHeartbeat, Interner, NewApiKey,
-    NewSession, NewUser, Outcome, SqliteStore, StoreError, UserRepo,
+    find_user_by_login, first_api_key, insert_api_key, insert_heartbeats, insert_session,
+    insert_user, load_heartbeats, migrate, open_in_memory, revoke_key, revoke_session,
+    schema_version, spawn_writer, touch_key_used, user_count, HeartbeatRepo, IncomingHeartbeat,
+    Interner, KeyRepo, NewApiKey, NewSession, NewUser, Outcome, SqliteStore, StoreError, UserRepo,
 };
 
 fn a_user(login: &str) -> NewUser {
@@ -233,6 +233,84 @@ fn missing_user_is_none_not_an_error() {
 
     assert!(find_user_by_login(&conn, "нет такого").unwrap().is_none());
     assert!(find_user_by_id(&conn, uuid::Uuid::now_v7()).unwrap().is_none());
+}
+
+#[test]
+fn an_empty_database_has_no_users_and_no_keys() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+
+    assert_eq!(user_count(&conn).unwrap(), 0);
+    assert!(first_api_key(&conn).unwrap().is_none());
+}
+
+#[test]
+fn user_count_follows_the_users_actually_inserted() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+
+    insert_user(&conn, &a_user("первый")).unwrap();
+    assert_eq!(user_count(&conn).unwrap(), 1);
+
+    insert_user(&conn, &a_user("второй")).unwrap();
+    assert_eq!(user_count(&conn).unwrap(), 2);
+}
+
+#[test]
+fn first_api_key_returns_the_oldest_one() {
+    // Порядок обязан быть воспроизводимым: шаг 5 старта расшифровывает
+    // именно этот ключ, и «какой-нибудь» здесь означал бы, что проверка
+    // мастер-ключа то проходит, то нет.
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+
+    let older = insert_api_key(
+        &conn,
+        &NewApiKey {
+            user_id: user.id,
+            name: "старый".to_owned(),
+            key_encrypted: vec![1],
+            key_lookup: vec![1],
+        },
+    )
+    .unwrap();
+    insert_api_key(
+        &conn,
+        &NewApiKey {
+            user_id: user.id,
+            name: "новый".to_owned(),
+            key_encrypted: vec![2],
+            key_lookup: vec![2],
+        },
+    )
+    .unwrap();
+
+    let found = first_api_key(&conn).unwrap().unwrap();
+    assert_eq!(found.id, older.id);
+    assert_eq!(found.key_encrypted, vec![1]);
+}
+
+#[test]
+fn first_api_key_sees_keys_of_every_user() {
+    // Шаг 5 старта проверяет мастер-ключ инстанса целиком, а не одного
+    // пользователя: ключ любого владельца зашифрован тем же мастер-ключом.
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let other = insert_user(&conn, &a_user("другой")).unwrap();
+
+    insert_api_key(
+        &conn,
+        &NewApiKey {
+            user_id: other.id,
+            name: "чужой".to_owned(),
+            key_encrypted: vec![9],
+            key_lookup: vec![9],
+        },
+    )
+    .unwrap();
+
+    assert!(first_api_key(&conn).unwrap().is_some());
 }
 
 #[test]
@@ -1208,6 +1286,29 @@ async fn store_goes_through_the_trait_end_to_end() {
 
     let found = store.user_by_login("swrneko").await.unwrap().unwrap();
     assert_eq!(found.id, user.id);
+}
+
+#[tokio::test]
+async fn the_store_answers_both_questions_through_the_traits() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(&dir.path().join("wakode.db"), 16).unwrap();
+
+    assert_eq!(store.user_count().await.unwrap(), 0);
+    assert!(store.first_key().await.unwrap().is_none());
+
+    let user = store.create_user(a_user("swrneko")).await.unwrap();
+    store
+        .create_key(NewApiKey {
+            user_id: user.id,
+            name: "ключ".to_owned(),
+            key_encrypted: vec![3],
+            key_lookup: vec![3],
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(store.user_count().await.unwrap(), 1);
+    assert_eq!(store.first_key().await.unwrap().unwrap().key_encrypted, vec![3]);
 }
 
 #[tokio::test]

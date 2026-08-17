@@ -120,6 +120,15 @@ pub fn insert_user(conn: &Connection, new: &NewUser) -> StoreResult<User> {
     })
 }
 
+/// Сколько всего пользователей в базе.
+///
+/// Нужно экрану первичной настройки: он открыт ровно до появления первого
+/// пользователя и закрывается навсегда после.
+pub fn user_count(conn: &Connection) -> StoreResult<i64> {
+    let mut stmt = conn.prepare_cached("SELECT count(*) FROM users")?;
+    Ok(stmt.query_row([], |row| row.get(0))?)
+}
+
 pub fn find_user_by_login(conn: &Connection, login: &str) -> StoreResult<Option<User>> {
     query_one(conn, "login = ?1", rusqlite::params![login])
 }
