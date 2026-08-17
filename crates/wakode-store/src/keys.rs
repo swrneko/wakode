@@ -104,6 +104,13 @@ pub fn find_key_by_lookup(conn: &Connection, lookup: &[u8]) -> StoreResult<Optio
     }))
 }
 
+/// Отозвать ключ.
+///
+/// `AND revoked_at IS NULL` в запросе — не лишнее условие: повторный отзыв
+/// уже отозванного ключа не должен переписывать `revoked_at` текущим
+/// временем, иначе «когда ключ отозвали» превратится в «когда его в
+/// последний раз пытались отозвать». Повтор — обычное дело: ретрай HTTP,
+/// двойной клик в настройках.
 pub fn revoke_key(conn: &Connection, id: Uuid) -> StoreResult<()> {
     conn.execute(
         "UPDATE api_keys SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",

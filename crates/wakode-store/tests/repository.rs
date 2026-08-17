@@ -302,11 +302,53 @@ fn revoked_key_is_still_found_but_marked() {
 }
 
 #[test]
-fn unknown_lookup_is_none() {
+fn a_keys_lookup_finds_its_own_row_and_leaves_others_alone() {
     let mut conn = open_in_memory().unwrap();
     migrate(&mut conn).unwrap();
+    let alice = insert_user(&conn, &a_user("alice")).unwrap();
+    let bob = insert_user(&conn, &a_user("bob")).unwrap();
 
-    assert!(find_key_by_lookup(&conn, &[0, 0, 0]).unwrap().is_none());
+    let alice_key = insert_api_key(
+        &conn,
+        &NewApiKey {
+            user_id: alice.id,
+            name: "алисин".to_owned(),
+            key_encrypted: vec![1],
+            key_lookup: vec![11],
+        },
+    )
+    .unwrap();
+    let bob_key = insert_api_key(
+        &conn,
+        &NewApiKey {
+            user_id: bob.id,
+            name: "бобов".to_owned(),
+            key_encrypted: vec![2],
+            key_lookup: vec![22],
+        },
+    )
+    .unwrap();
+
+    // Строки в таблице есть, но искомого отпечатка среди них нет: `None`
+    // обязан получиться из-за отсутствия совпадения, а не из-за пустой
+    // таблицы — реализация вроде `SELECT ... LIMIT 1` без фильтра по
+    // `key_lookup` эту разницу не ловит.
+    assert!(find_key_by_lookup(&conn, &[99]).unwrap().is_none());
+
+    let found = find_key_by_lookup(&conn, &[11]).unwrap().unwrap();
+    assert_eq!(found.id, alice_key.id);
+    assert_eq!(found.user_id, alice.id);
+
+    // Отзыв и touch адресуются по `id`. Реализация, где в запросе нет
+    // `id = ?1`, отозвала бы или пометила бы использованными ключи всех
+    // пользователей разом — массовый разлогин вместо отзыва одного ключа.
+    revoke_key(&conn, alice_key.id).unwrap();
+    touch_key_used(&conn, alice_key.id).unwrap();
+
+    let bob_after = find_key_by_lookup(&conn, &[22]).unwrap().unwrap();
+    assert_eq!(bob_after.id, bob_key.id);
+    assert!(bob_after.revoked_at.is_none(), "отзыв чужого ключа задел соседний");
+    assert!(bob_after.last_used_at.is_none(), "touch чужого ключа задел соседний");
 }
 
 #[test]
@@ -348,6 +390,41 @@ fn touching_a_key_records_when_it_was_last_used() {
 
     let found = find_key_by_lookup(&conn, &[5]).unwrap().unwrap();
     assert!(found.last_used_at.is_some());
+}
+
+#[test]
+fn every_api_key_field_survives_the_round_trip() {
+    // Проверяются **все** поля, не только отпечаток. `name` и `created_at`
+    // раньше не проверял ни один assert в этом файле, а в `api_keys` подряд
+    // лежат три `INTEGER` (`created_at`, `last_used_at`, `revoked_at`) и два
+    // `BLOB` (`id`, `user_id`) — ровно расстановка, где `row.get(N)` может
+    // съехать на соседнюю колонку того же типа и это не заметит ничто, кроме
+    // прямого assert'а по каждому полю. `created_at` сравнивается с тем, что
+    // вернул `insert_api_key`, а не с конкретным числом: часы здесь настоящие.
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+
+    let created = insert_api_key(
+        &conn,
+        &NewApiKey {
+            user_id: user.id,
+            name: "полный ключ".to_owned(),
+            key_encrypted: vec![5, 6, 7],
+            key_lookup: vec![55],
+        },
+    )
+    .unwrap();
+
+    let found = find_key_by_lookup(&conn, &[55]).unwrap().unwrap();
+
+    assert_eq!(found.id, created.id);
+    assert_eq!(found.user_id, created.user_id);
+    assert_eq!(found.name, "полный ключ");
+    assert_eq!(found.key_encrypted, vec![5, 6, 7]);
+    assert_eq!(found.created_at, created.created_at);
+    assert!(found.last_used_at.is_none());
+    assert!(found.revoked_at.is_none());
 }
 
 #[test]
@@ -396,6 +473,135 @@ fn revoked_session_is_still_found_but_marked() {
     // отличать «сессии не было» от «сессия отозвана» — это разные ответы.
     let found = find_session_by_token_hash(&conn, &[8, 8]).unwrap().unwrap();
     assert!(found.revoked_at.is_some());
+}
+
+#[test]
+fn every_session_field_survives_the_round_trip() {
+    // Тот же долг, что закрывает `every_api_key_field_survives_the_round_trip`
+    // для ключей: `session_round_trips_by_token_hash` проверяет три поля из
+    // шести, `user_agent`, `created_at` и `revoked_at` не читает ни один
+    // assert.
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+
+    let created = insert_session(
+        &conn,
+        &NewSession {
+            user_id: user.id,
+            token_hash: vec![66],
+            user_agent: Some("Chrome на Linux".to_owned()),
+            expires_at: Micros::from_secs(2_000_000_000),
+        },
+    )
+    .unwrap();
+
+    let found = find_session_by_token_hash(&conn, &[66]).unwrap().unwrap();
+
+    assert_eq!(found.id, created.id);
+    assert_eq!(found.user_id, created.user_id);
+    assert_eq!(found.user_agent.as_deref(), Some("Chrome на Linux"));
+    assert_eq!(found.created_at, created.created_at);
+    assert_eq!(found.expires_at, Micros::from_secs(2_000_000_000));
+    assert!(found.revoked_at.is_none());
+}
+
+#[test]
+fn a_sessions_lookup_finds_its_own_row_and_leaves_others_alone() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let alice = insert_user(&conn, &a_user("alice")).unwrap();
+    let bob = insert_user(&conn, &a_user("bob")).unwrap();
+
+    let alice_session = insert_session(
+        &conn,
+        &NewSession {
+            user_id: alice.id,
+            token_hash: vec![11],
+            user_agent: None,
+            expires_at: Micros::from_secs(2_000_000_000),
+        },
+    )
+    .unwrap();
+    let bob_session = insert_session(
+        &conn,
+        &NewSession {
+            user_id: bob.id,
+            token_hash: vec![22],
+            user_agent: None,
+            expires_at: Micros::from_secs(2_000_000_000),
+        },
+    )
+    .unwrap();
+
+    assert!(find_session_by_token_hash(&conn, &[99]).unwrap().is_none());
+
+    let found = find_session_by_token_hash(&conn, &[11]).unwrap().unwrap();
+    assert_eq!(found.id, alice_session.id);
+    assert_eq!(found.user_id, alice.id);
+
+    // Отзыв адресуется по `id`. Реализация без `id = ?1` в запросе отозвала
+    // бы сессии всех пользователей разом — массовый разлогин вместо отзыва
+    // одной сессии.
+    revoke_session(&conn, alice_session.id).unwrap();
+
+    let bob_after = find_session_by_token_hash(&conn, &[22]).unwrap().unwrap();
+    assert_eq!(bob_after.id, bob_session.id);
+    assert!(bob_after.revoked_at.is_none(), "отзыв чужой сессии задел соседнюю");
+}
+
+#[test]
+fn revoking_an_already_revoked_key_or_session_keeps_the_original_timestamp() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+
+    let key = insert_api_key(
+        &conn,
+        &NewApiKey {
+            user_id: user.id,
+            name: "ключ".to_owned(),
+            key_encrypted: vec![1],
+            key_lookup: vec![41],
+        },
+    )
+    .unwrap();
+    let session = insert_session(
+        &conn,
+        &NewSession {
+            user_id: user.id,
+            token_hash: vec![41],
+            user_agent: None,
+            expires_at: Micros::from_secs(2_000_000_000),
+        },
+    )
+    .unwrap();
+
+    revoke_key(&conn, key.id).unwrap();
+    revoke_session(&conn, session.id).unwrap();
+
+    let key_revoked_at = find_key_by_lookup(&conn, &[41]).unwrap().unwrap().revoked_at.unwrap();
+    let session_revoked_at = find_session_by_token_hash(&conn, &[41])
+        .unwrap()
+        .unwrap()
+        .revoked_at
+        .unwrap();
+
+    // Повтор — обычное дело: ретрай HTTP, двойной клик в настройках. Без
+    // `AND revoked_at IS NULL` в запросе второй вызов переписал бы отметку
+    // текущим временем, и «когда отозвали» превратилось бы в «когда в
+    // последний раз попытались отозвать».
+    revoke_key(&conn, key.id).unwrap();
+    revoke_session(&conn, session.id).unwrap();
+
+    assert_eq!(
+        find_key_by_lookup(&conn, &[41]).unwrap().unwrap().revoked_at,
+        Some(key_revoked_at)
+    );
+    assert_eq!(
+        find_session_by_token_hash(&conn, &[41]).unwrap().unwrap().revoked_at,
+        Some(session_revoked_at)
+    );
 }
 
 #[test]

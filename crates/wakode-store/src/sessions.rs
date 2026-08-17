@@ -93,6 +93,12 @@ pub fn find_session_by_token_hash(
     }))
 }
 
+/// Отозвать сессию.
+///
+/// `AND revoked_at IS NULL` — та же гарантия, что и в `revoke_key`: повторный
+/// отзыв не должен переписывать момент отзыва текущим временем. Ретрай HTTP
+/// или двойной клик в настройках — штатный сценарий, не повод терять
+/// исходную метку.
 pub fn revoke_session(conn: &Connection, id: Uuid) -> StoreResult<()> {
     conn.execute(
         "UPDATE sessions SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
