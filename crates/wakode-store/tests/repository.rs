@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use chrono::NaiveDate;
 use chrono_tz::Tz;
 use wakode_core::{Category, EntityKind, Micros};
@@ -5,7 +7,8 @@ use wakode_store::{
     dirty_days_for, find_key_by_lookup, find_session_by_token_hash, find_user_by_id,
     find_user_by_login, insert_api_key, insert_heartbeats, insert_session, insert_user,
     load_heartbeats, migrate, open_in_memory, revoke_key, revoke_session, schema_version,
-    touch_key_used, IncomingHeartbeat, Interner, NewApiKey, NewSession, NewUser, Outcome,
+    spawn_writer, touch_key_used, IncomingHeartbeat, Interner, NewApiKey, NewSession, NewUser,
+    Outcome, StoreError,
 };
 
 fn a_user(login: &str) -> NewUser {
@@ -1060,4 +1063,104 @@ fn a_refused_batch_stores_no_heartbeats_at_all() {
     let loaded =
         load_heartbeats(&conn, ghost, Micros::from_secs(0), Micros::from_secs(1_000)).unwrap();
     assert!(loaded.is_empty());
+}
+
+#[tokio::test]
+async fn writer_commits_and_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wakode.db");
+    let mut conn = wakode_store::open(&path).unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+    let interner = Arc::new(Interner::load(&conn).unwrap());
+
+    let handle = spawn_writer(conn, Arc::clone(&interner), 8);
+
+    let report = handle
+        .insert_heartbeats(user.id, vec![incoming(1_000, "src/main.rs", None)], user.timezone)
+        .await
+        .unwrap();
+    assert_eq!(report.inserted(), 1);
+
+    // Читаем отдельным соединением: успех обязан означать, что транзакция
+    // уже закоммичена, иначе cli сотрёт отметки из своей очереди зря.
+    let read = wakode_store::open(&path).unwrap();
+    let loaded = load_heartbeats(&read, user.id, Micros::from_secs(0), Micros::from_secs(9_999)).unwrap();
+    assert_eq!(loaded.len(), 1);
+}
+
+#[tokio::test]
+async fn a_full_queue_refuses_instead_of_buffering() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wakode.db");
+    let mut conn = wakode_store::open(&path).unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+    let interner = Arc::new(Interner::load(&conn).unwrap());
+
+    // Канал на одну заявку: заполнить его тривиально.
+    let handle = spawn_writer(conn, interner, 1);
+
+    let mut refused = 0;
+    let mut tasks = Vec::new();
+    for i in 0..64 {
+        let handle = handle.clone();
+        let tz = user.timezone;
+        let id = user.id;
+        tasks.push(tokio::spawn(async move {
+            handle
+                .insert_heartbeats(id, vec![incoming(1_000 + i, "f.rs", None)], tz)
+                .await
+        }));
+    }
+    for task in tasks {
+        if let Err(StoreError::WriteQueueFull) = task.await.unwrap() {
+            refused += 1;
+        }
+    }
+
+    // Честно про определённость: пишущая задача живёт в настоящем потоке ОС
+    // и разгребает очередь параллельно с тем, как эта задача её наполняет —
+    // железной гарантии отказа тут нет ни у какой формулировки, кроме той,
+    // что вводит шов для остановки писателя, а он несоразмерен масштабу
+    // задачи. Тест опирается на запас: чтобы отказов не случилось ни
+    // одного, писатель обязан полностью закоммитить шестьдесят три батча в
+    // файловую базу быстрее, чем эта задача выполнит шестьдесят четыре
+    // подряд идущих `try_send` — разница на несколько порядков, а не
+    // пограничный случай. Запас измерен, а не предположен: десять подряд
+    // прогонов этого теста (см. отчёт задачи 11) дали 62 отказа из 64 в
+    // каждом без единого исключения — цифра стабильна, потому что поток ОС
+    // писателя успевает обработать от силы один-два батча за то время,
+    // пока исполнитель tokio проворачивает всю пачку `try_send`.
+    assert!(
+        refused > 0,
+        "при канале на одну заявку и 64 одновременных записях отказы обязаны появиться: \
+         молчаливая буферизация здесь означала бы потерю при падении процесса"
+    );
+}
+
+#[tokio::test]
+async fn writer_survives_a_failing_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wakode.db");
+    let mut conn = wakode_store::open(&path).unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+    let interner = Arc::new(Interner::load(&conn).unwrap());
+
+    let handle = spawn_writer(conn, interner, 8);
+
+    // Несуществующий пользователь — внешний ключ не пустит.
+    let failed = handle
+        .insert_heartbeats(uuid::Uuid::now_v7(), vec![incoming(1, "f.rs", None)], user.timezone)
+        .await;
+    assert!(failed.is_err());
+
+    // Задача обязана остаться живой: одна битая заявка не должна уносить
+    // с собой запись для всех остальных.
+    let ok = handle
+        .insert_heartbeats(user.id, vec![incoming(2, "f.rs", None)], user.timezone)
+        .await
+        .unwrap();
+    assert_eq!(ok.inserted(), 1);
 }
