@@ -24,8 +24,10 @@ fn a_user(login: &str) -> NewUser {
 }
 
 /// Сырой SQL в этом файле позволен только проверкам самой схемы, а не
-/// поведения поверх неё — таких проверок здесь две: эта и
-/// `heartbeat_dedup_index_is_unique` ниже.
+/// поведения поверх неё — таких проверок здесь три: эта,
+/// `heartbeat_dedup_index_is_unique` и
+/// `deleting_a_user_takes_their_keys_and_sessions_with_them`. Четвёртой
+/// не заводим.
 #[test]
 fn wave_zero_schema_creates_every_table() {
     let mut conn = open_in_memory().unwrap();
