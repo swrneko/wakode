@@ -1433,6 +1433,99 @@ async fn shutdown_lets_the_writer_finish_what_it_accepted() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn shutdown_works_after_the_queue_has_overflowed() {
+    // Останов проходит после того, как очередь переполнялась и писатель
+    // был занят долгим батчем.
+    //
+    // Честно про пределы: замену `send().await` на `try_send` в `shutdown`
+    // этот тест **не** ловит. К моменту вызова все заявки-наполнители уже
+    // дождались ответа, слот освободился, и `try_send` прошёл бы тоже.
+    // Поймать разницу можно только вызвав `shutdown` ровно в тот момент,
+    // когда буфер занят, а это гонка, а не тест. Почему `send().await`
+    // всё-таки правильный выбор: отметки при полной очереди отклонять
+    // нужно — cli дошлёт их из своей, — а сигнал остановки отклонять
+    // некуда, и вызывающему нечем обработать такой отказ.
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(&dir.path().join("wakode.db"), 1).unwrap();
+    let user = store.create_user(a_user("swrneko")).await.unwrap();
+
+    // Забить писателя надолго и не дожидаться ответа.
+    let batch: Vec<IncomingHeartbeat> = (0..20_000)
+        .map(|i| incoming(1_000 + i, "f.rs", Some("wakode")))
+        .collect();
+    let busy = {
+        let store = store.clone();
+        let tz = user.timezone;
+        tokio::spawn(async move { store.record_heartbeats(user.id, batch, tz).await })
+    };
+
+    // Пока писатель занят, наполнить очередь ёмкости 1 до отказа. Заявки
+    // уходят параллельно и не дожидаются ответа: последовательное
+    // ожидание освобождало бы слот перед каждой следующей, и очередь не
+    // копилась бы никогда.
+    let mut pending = Vec::new();
+    for i in 0..64 {
+        let store = store.clone();
+        let tz = user.timezone;
+        let id = user.id;
+        pending.push(tokio::spawn(async move {
+            store
+                .record_heartbeats(id, vec![incoming(900_000 + i, "g.rs", None)], tz)
+                .await
+        }));
+    }
+
+    let mut refused = 0;
+    for task in pending {
+        if let Ok(Err(StoreError::WriteQueueFull)) = task.await {
+            refused += 1;
+        }
+    }
+    assert!(refused > 0, "очередь не переполнилась, тест ничего не проверяет");
+
+    store
+        .shutdown()
+        .await
+        .expect("останов не прошёл при полной очереди");
+
+    let _ = busy.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn data_written_before_shutdown_is_readable_after_it() {
+    // Останов не теряет принятого: cli, получивший успех, стёр отметки у
+    // себя, и «приняли, но при остановке потеряли» — потеря.
+    //
+    // Честно про пределы: порядок «отпустить соединение до подтверждения»
+    // этот тест не проверяет. В WAL-режиме второе соединение открывается и
+    // читает закоммиченное независимо от того, живо ли первое, — то есть
+    // перестановка `drop(conn)` и отправки подтверждения снаружи
+    // неразличима. Порядок оставлен правильным по построению: получивший
+    // подтверждение вправе считать базу отпущенной, и следующая задача,
+    // которой это понадобится по-настоящему, не будет гадать.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wakode.db");
+    let store = SqliteStore::open(&path, 8).unwrap();
+    let user = store.create_user(a_user("swrneko")).await.unwrap();
+
+    store
+        .record_heartbeats(user.id, vec![incoming(1_000, "f.rs", None)], user.timezone)
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+
+    let conn = wakode_store::open(&path).unwrap();
+    let loaded = load_heartbeats(
+        &conn,
+        user.id,
+        Micros::from_secs(0),
+        Micros::from_secs(9_999),
+    )
+    .unwrap();
+    assert_eq!(loaded.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn shutdown_twice_is_not_an_error() {
     // Останов зовут и при штатном завершении, и из обработчика сигнала;
     // второй вызов не должен превращаться в отказ.
