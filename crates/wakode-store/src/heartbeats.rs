@@ -284,3 +284,180 @@ pub fn load_heartbeats(
 
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::users::{insert_user, NewUser};
+    use crate::{migrate, open_in_memory};
+
+    fn a_user() -> NewUser {
+        NewUser {
+            login: "swrneko".to_owned(),
+            email: None,
+            password_hash: "непрозрачные байты из плана 3".to_owned(),
+            display_name: None,
+            timezone: "Europe/Moscow".parse().unwrap(),
+            timeout_secs: 900,
+            is_admin: false,
+        }
+    }
+
+    /// Отметка со всеми заполненными полями.
+    ///
+    /// Значения — те же, что в `every_attribute_survives_the_round_trip`
+    /// (`tests/repository.rs`), чтобы два теста не разошлись описанием одной
+    /// и той же отметки. Расхождение ровно одно: `is_write` здесь `false`.
+    /// Числа обязаны быть **попарно различны**, иначе перестановка двух
+    /// соседних `INTEGER`-параметров запишет то же самое и не поймается, а
+    /// `true` дало бы в колонке `is_write` единицу — ровно то же, что в
+    /// соседней `lines`.
+    fn full_heartbeat() -> IncomingHeartbeat {
+        IncomingHeartbeat {
+            time: Micros::from_secs(1_755_000_000),
+            entity: "сущность".to_owned(),
+            kind: EntityKind::App,
+            category: Category::Debugging,
+            project: Some("проект".to_owned()),
+            branch: Some("ветка".to_owned()),
+            language: Some("язык".to_owned()),
+            editor: Some("редактор".to_owned()),
+            os: Some("ос".to_owned()),
+            machine: Some("машина".to_owned()),
+            plugin: Some("плагин".to_owned()),
+            is_write: false,
+            lines: Some(1),
+            lineno: Some(2),
+            cursorpos: Some(3),
+            line_additions: Some(4),
+            line_deletions: Some(5),
+            project_root_count: Some(6),
+            dependencies: Some("зависимости".to_owned()),
+            ai_line_changes: Some(7),
+            human_line_changes: Some(8),
+            ai_meta: Some("мета".to_owned()),
+        }
+    }
+
+    /// Двенадцать колонок `INSERT`, которых не читает никто.
+    ///
+    /// `load_heartbeats` берёт десять колонок, `Attrs` несёт девять полей —
+    /// а `plugin_id`, `is_write` и десять числовых и текстовых колонок за
+    /// ними не читает ни один путь кода. Отсутствие читателя не делает
+    /// ошибку неважной: оно делает её бесшумной и необратимой. Переставленные
+    /// местами `lines` и `lineno` ничего не уронят и никуда не попадут — они
+    /// будут неправильно писаться с первого дня, а всплывёт это в волне 1,
+    /// когда в базе уже лежат месяцы отметок, которые задним числом не
+    /// расшить. Сырой `SELECT` здесь — единственный доступный читатель.
+    #[test]
+    fn every_unread_column_lands_in_the_place_the_insert_promised() {
+        let mut conn = open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        let user = insert_user(&conn, &a_user()).unwrap();
+        let interner = Interner::load(&conn).unwrap();
+
+        insert_heartbeats(
+            &mut conn,
+            &interner,
+            user.id,
+            &[full_heartbeat()],
+            user.timezone,
+        )
+        .unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT plugin_id, is_write, lines, lineno, cursorpos,
+                        line_additions, line_deletions, project_root_count,
+                        dependencies, ai_line_changes, human_line_changes, ai_meta
+                 FROM heartbeats",
+            )
+            .unwrap();
+        let row = stmt
+            .query_row([], |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                ))
+            })
+            .unwrap();
+
+        let (
+            plugin,
+            is_write,
+            lines,
+            lineno,
+            cursorpos,
+            line_additions,
+            line_deletions,
+            project_root_count,
+            dependencies,
+            ai_line_changes,
+            human_line_changes,
+            ai_meta,
+        ) = row;
+
+        let plugin_sid = interner.lookup("плагин").expect("плагин интернирован");
+        assert_eq!(plugin, Some(sid_to_i64(plugin_sid)), "plugin_id");
+        assert_eq!(is_write, 0, "is_write");
+        assert_eq!(lines, Some(1), "lines");
+        assert_eq!(lineno, Some(2), "lineno");
+        assert_eq!(cursorpos, Some(3), "cursorpos");
+        assert_eq!(line_additions, Some(4), "line_additions");
+        assert_eq!(line_deletions, Some(5), "line_deletions");
+        assert_eq!(project_root_count, Some(6), "project_root_count");
+        assert_eq!(dependencies.as_deref(), Some("зависимости"), "dependencies");
+        assert_eq!(ai_line_changes, Some(7), "ai_line_changes");
+        assert_eq!(human_line_changes, Some(8), "human_line_changes");
+        assert_eq!(ai_meta.as_deref(), Some("мета"), "ai_meta");
+    }
+
+    /// Повторная доставка не переписывает метку уже помеченного дня.
+    ///
+    /// Это и есть наблюдаемый эффект фильтра по `Outcome::Inserted`:
+    /// `mark_dirty` делает `DO UPDATE SET marked_at = excluded.marked_at`, и
+    /// без фильтра батч, целиком отбитый дедупликацией, всё равно обновил бы
+    /// `marked_at` — то есть день, уже пересчитанный волной 1, пачкался бы
+    /// заново. Через `dirty_days_for` этого не видно: он отдаёт даты без
+    /// `marked_at`, поэтому колонка читается сырым `SELECT`.
+    #[test]
+    fn redelivered_batch_leaves_the_mark_of_an_already_dirty_day_alone() {
+        let mut conn = open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        let user = insert_user(&conn, &a_user()).unwrap();
+        let interner = Interner::load(&conn).unwrap();
+
+        let batch = [full_heartbeat()];
+        let first =
+            insert_heartbeats(&mut conn, &interner, user.id, &batch, user.timezone).unwrap();
+        assert_eq!(first.inserted(), 1);
+
+        // Метка отодвигается в заведомо невозможное прошлое, а не сравнивается
+        // с прежней: оба вызова берут системные часы, и два показания подряд
+        // могут совпасть до микросекунды — тест зазеленел бы там, где фильтра
+        // нет. Ноль же с `clock::now()` не совпадёт никогда.
+        conn.execute("UPDATE dirty_days SET marked_at = 0", []).unwrap();
+
+        let again =
+            insert_heartbeats(&mut conn, &interner, user.id, &batch, user.timezone).unwrap();
+        assert_eq!(again.duplicates(), 1, "тот же батч обязан отбиться целиком");
+
+        let marked_at: i64 = conn
+            .query_row("SELECT marked_at FROM dirty_days", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            marked_at, 0,
+            "день, которому повтор ничего не добавил, не должен помечаться заново"
+        );
+    }
+}
