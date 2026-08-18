@@ -8,6 +8,7 @@ pub mod compat;
 pub mod error;
 pub mod health;
 pub mod internal;
+pub mod setup;
 pub mod state;
 
 pub use error::ApiError;
@@ -26,6 +27,8 @@ use axum::Router;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health::healthz))
+        .route("/api/setup/status", get(setup::status))
+        .route("/api/setup", axum::routing::post(setup::setup))
         .fallback(|| async { ApiError::NotFound })
         .method_not_allowed_fallback(|| async { ApiError::MethodNotAllowed })
         .with_state(state)

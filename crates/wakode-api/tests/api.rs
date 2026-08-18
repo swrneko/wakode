@@ -1053,3 +1053,464 @@ async fn session_auth_carries_the_id_of_the_session_that_opened_it() {
         session.id.to_string()
     );
 }
+
+/// Запрос с подставленным адресом клиента: `ConnectInfo` в тестах не
+/// появляется сам — его кладёт слой, которого при `oneshot` нет.
+fn with_peer(mut request: Request<Body>, peer: &str) -> Request<Body> {
+    let addr: std::net::SocketAddr = peer.parse().unwrap();
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(addr));
+    request
+}
+
+/// Тело запроса первичной настройки с заданным логином.
+fn setup_body(login: &str) -> Body {
+    Body::from(format!(
+        r#"{{"login":"{login}","password":"достаточно длинный","timezone":"Europe/Moscow"}}"#
+    ))
+}
+
+/// Запрос настройки с заданным телом, пришедший с заданного адреса.
+async fn setup_from(state: AppState, peer: &str, body: Body) -> Response {
+    router(state)
+        .oneshot(with_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/api/setup")
+                .header("content-type", "application/json")
+                .body(body)
+                .unwrap(),
+            peer,
+        ))
+        .await
+        .unwrap()
+}
+
+/// Ответ `/api/setup/status` как JSON.
+async fn setup_status(state: AppState) -> serde_json::Value {
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/setup/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    json_body(response).await
+}
+
+#[tokio::test]
+async fn setup_is_needed_while_the_database_has_no_users() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let json = setup_status(a_state(&dir)).await;
+
+    assert_eq!(json["needed"], serde_json::json!(true));
+}
+
+#[tokio::test]
+async fn setup_from_loopback_creates_the_first_admin() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = a_state(&dir);
+    let store = state.store.clone();
+
+    let response = setup_from(state, "127.0.0.1:54321", setup_body("swrneko")).await;
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let json = json_body(response).await;
+
+    let created = store.user_by_login("swrneko").await.unwrap().unwrap();
+    assert_eq!(
+        json["id"],
+        serde_json::json!(created.id.to_string()),
+        "ответ вернул не идентификатор заведённого пользователя: {json}"
+    );
+    assert!(
+        created.is_admin,
+        "первый пользователь обязан быть администратором"
+    );
+    assert_ne!(
+        created.password_hash, "достаточно длинный",
+        "пароль сохранён как есть вместо хеша"
+    );
+}
+
+#[tokio::test]
+async fn setup_from_a_foreign_address_is_refused_by_default() {
+    // Окно между стартом и первым входом — это окно, в которое чужой
+    // занимает инстанс. Дефолт закрыт.
+    let dir = tempfile::tempdir().unwrap();
+    let state = a_state(&dir);
+    let store = state.store.clone();
+
+    let response = setup_from(state, "203.0.113.7:40000", setup_body("чужой")).await;
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    // Отказ обязан быть отказом и в базе: 403 с уже заведённым
+    // администратором был бы худшим из исходов — инстанс занят, а лог
+    // говорит, что не занят.
+    assert_eq!(
+        store.user_count().await.unwrap(),
+        0,
+        "чужой запрос отклонён по коду, но пользователя завёл"
+    );
+}
+
+#[tokio::test]
+async fn a_foreign_address_is_allowed_when_the_owner_says_so() {
+    // Зеркало предыдущего: без него «запрещать всегда» прошло бы проверку
+    // на запрет и выглядело бы правильным.
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(a_store(&dir), None, false, 30, true);
+
+    let response = setup_from(state, "203.0.113.7:40000", setup_body("за-прокси")).await;
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn an_ipv6_loopback_is_loopback_too() {
+    // Стек по умолчанию слушает и `::`, и петлевой клиент приезжает как
+    // `::1`. Проверка через сравнение с `127.0.0.1` прошла бы весь
+    // остальной набор зелёной и отказывала бы владельцу на его же машине.
+    let dir = tempfile::tempdir().unwrap();
+    let state = a_state(&dir);
+
+    let response = setup_from(state, "[::1]:54321", setup_body("шестая-версия")).await;
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn setup_closes_forever_after_the_first_user() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = a_state(&dir);
+
+    let first = setup_from(state.clone(), "127.0.0.1:54321", setup_body("первый")).await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    let second = setup_from(state.clone(), "127.0.0.1:54322", setup_body("второй")).await;
+    assert_eq!(second.status(), StatusCode::FORBIDDEN);
+    assert!(
+        state.store.user_by_login("второй").await.unwrap().is_none(),
+        "второй администратор всё-таки завёлся"
+    );
+
+    let json = setup_status(state).await;
+    assert_eq!(json["needed"], serde_json::json!(false));
+}
+
+#[tokio::test]
+async fn the_address_is_checked_before_the_database() {
+    // Держит порядок проверок, записанный комментарием в `setup.rs`.
+    // Без этого теста комментарий утверждал бы порядок, который свободно
+    // переставляется, — а вместе с ним уезжает и обещание «чужой запрос
+    // не ходит в базу».
+    let dir = tempfile::tempdir().unwrap();
+    let state = a_state(&dir);
+    setup_from(state.clone(), "127.0.0.1:54321", setup_body("первый")).await;
+
+    let response = setup_from(state, "203.0.113.7:40000", setup_body("чужой")).await;
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let json = json_body(response).await;
+    let message = json["error"].as_str().unwrap();
+    assert!(
+        message.contains("локального адреса"),
+        "проверка адреса ушла ниже обращения к базе: {message}"
+    );
+}
+
+/// Тело настройки с произвольным логином и паролем.
+fn setup_body_with(login: &str, password: &str) -> Body {
+    Body::from(format!(
+        r#"{{"login":"{login}","password":"{password}","timezone":"Europe/Moscow"}}"#
+    ))
+}
+
+#[tokio::test]
+async fn an_empty_password_is_refused() {
+    // Инстанс в момент настройки ещё открыт: администратор с пустым
+    // паролем — это занятый чужим инстанс с эндпоинтом, закрытым навсегда.
+    // Отказ обязан быть 400 с внятным текстом, а не 500 и не «непонятно».
+    let dir = tempfile::tempdir().unwrap();
+    let state = a_state(&dir);
+    let store = state.store.clone();
+
+    let response = setup_from(state, "127.0.0.1:54321", setup_body_with("swrneko", "")).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = json_body(response).await;
+    assert!(
+        json["error"].as_str().unwrap().contains("пароль"),
+        "причина не названа: {json}"
+    );
+    assert_eq!(
+        store.user_count().await.unwrap(),
+        0,
+        "администратор с пустым паролем всё-таки завёлся"
+    );
+}
+
+#[tokio::test]
+async fn a_short_password_is_refused_too() {
+    // Отдельно от пустого: проверка `is_empty()` прошла бы предыдущий тест
+    // и пропустила бы пароль в один символ.
+    let dir = tempfile::tempdir().unwrap();
+    let state = a_state(&dir);
+
+    let response = setup_from(state, "127.0.0.1:54321", setup_body_with("swrneko", "1234567")).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn a_password_of_exactly_the_minimum_length_is_accepted() {
+    // Граница проверяется с обеих сторон: `>` вместо `>=` отрезал бы
+    // ровно допустимый пароль, и владелец не понял бы, почему.
+    let dir = tempfile::tempdir().unwrap();
+    let state = a_state(&dir);
+
+    let response = setup_from(state, "127.0.0.1:54321", setup_body_with("swrneko", "12345678")).await;
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn an_empty_login_is_refused() {
+    // Логин из ничего или из одних пробелов — это учётная запись, в
+    // которую нельзя войти с формы, заведённая на эндпоинте, который
+    // после неё закрывается навсегда.
+    let dir = tempfile::tempdir().unwrap();
+
+    for login in ["", "   "] {
+        let dir_for_case = tempfile::tempdir_in(dir.path()).unwrap();
+        let state = a_state(&dir_for_case);
+        let store = state.store.clone();
+
+        let response = setup_from(
+            state,
+            "127.0.0.1:54321",
+            setup_body_with(login, "достаточно длинный"),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "логин {login:?} принят"
+        );
+        let json = json_body(response).await;
+        assert!(
+            json["error"].as_str().unwrap().contains("логин"),
+            "причина не названа: {json}"
+        );
+        assert_eq!(
+            store.user_count().await.unwrap(),
+            0,
+            "администратор с логином {login:?} всё-таки завёлся"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_login_is_stored_without_its_stray_spaces() {
+    // Логин, набранный со случайным пробелом по краю, иначе навсегда
+    // останется недостижимым с формы входа: экран настройки к тому моменту
+    // уже закрыт.
+    let dir = tempfile::tempdir().unwrap();
+    let state = a_state(&dir);
+    let store = state.store.clone();
+
+    let response = setup_from(
+        state,
+        "127.0.0.1:54321",
+        setup_body_with("  swrneko  ", "достаточно длинный"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert!(
+        store.user_by_login("swrneko").await.unwrap().is_some(),
+        "логин сохранён вместе с пробелами"
+    );
+}
+
+#[tokio::test]
+async fn the_created_password_verifies() {
+    // «Хеш не равен открытому паролю» — слишком слабое утверждение: ему
+    // удовлетворяет и произвольный мусор, и хеш от другой строки. Такой
+    // администратор не смог бы войти никогда, а узнал бы об этом на живом
+    // инстансе, где эндпоинт уже закрыт навсегда.
+    let dir = tempfile::tempdir().unwrap();
+    let state = a_state(&dir);
+    let store = state.store.clone();
+
+    let response = setup_from(state, "127.0.0.1:54321", setup_body("swrneko")).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let created = store.user_by_login("swrneko").await.unwrap().unwrap();
+    assert!(
+        wakode_auth::verify_password("достаточно длинный", &created.password_hash).unwrap(),
+        "сохранённый хеш не открывается присланным паролем"
+    );
+    assert!(
+        !wakode_auth::verify_password("другой пароль", &created.password_hash).unwrap(),
+        "хеш открывается чем угодно"
+    );
+}
+
+#[tokio::test]
+async fn a_bad_timezone_is_a_bad_request_not_a_500() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = a_state(&dir);
+
+    let response = setup_from(
+        state,
+        "127.0.0.1:54321",
+        Body::from(
+            r#"{"login":"кто","password":"достаточно длинный","timezone":"Марс/Олимп"}"#,
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = json_body(response).await;
+    assert!(
+        json["error"].as_str().unwrap().contains("таймзона"),
+        "причина не названа: {json}"
+    );
+}
+
+#[tokio::test]
+async fn a_wrong_method_on_setup_is_a_json_error_too() {
+    // Маршрут настройки добавлен выше `method_not_allowed_fallback` —
+    // иначе он остался бы с пустым 405 axum'а мимо `ApiError`. Обещание
+    // «тело всегда JSON» держится порядком строк в `router`, а порядок —
+    // этим тестом.
+    let dir = tempfile::tempdir().unwrap();
+    let app = router(a_state(&dir));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/setup")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let json = json_body(response).await;
+    assert!(json.get("error").is_some(), "нет поля error: {json}");
+}
+
+#[tokio::test]
+async fn a_broken_body_is_a_json_error_not_a_bare_400() {
+    // `ApiError` обещает «тело всегда JSON с полем error», и обещание это
+    // общее для маршрута, а не только для веток, которые пишет обработчик.
+    // Отказ самого экстрактора приезжает мимо `ApiError` и отдаёт
+    // `text/plain` — для совместимого клиента это неотличимо от сломанного
+    // сервера.
+    let dir = tempfile::tempdir().unwrap();
+
+    let cases = [
+        // Не JSON вовсе.
+        Body::from("это не json"),
+        // JSON, но не тот: поля `timezone` нет.
+        Body::from(r#"{"login":"кто","password":"достаточно длинный"}"#),
+    ];
+
+    for body in cases {
+        let dir_for_case = tempfile::tempdir_in(dir.path()).unwrap();
+        let response = setup_from(a_state(&dir_for_case), "127.0.0.1:54321", body).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = json_body(response).await;
+        assert!(json.get("error").is_some(), "нет поля error: {json}");
+    }
+}
+
+#[tokio::test]
+async fn a_foreign_address_is_refused_before_the_body_is_even_read() {
+    // Разбор тела стоит после адресной проверки не случайно: экстрактор в
+    // сигнатуре обработчика отработал бы раньше первой строки тела
+    // функции, и чужой с кривым телом услышал бы про формат JSON вместо
+    // «сюда нельзя».
+    let dir = tempfile::tempdir().unwrap();
+
+    let response = setup_from(
+        a_state(&dir),
+        "203.0.113.7:40000",
+        Body::from("это не json"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn setup_over_a_real_socket_sees_the_client_address() {
+    // Второй тест, проходящий через настоящий сокет, и единственный, кто
+    // держит `into_make_service_with_connect_info` в `serve`. С обычным
+    // `into_make_service` расширения `ConnectInfo` в запросе нет, извлечь
+    // его нечем — и настройка с петлевого адреса, то есть единственный
+    // способ поднять инстанс, отвечала бы 500. Через `oneshot` этого не
+    // видно: там адрес кладёт сам тест.
+    let dir = tempfile::tempdir().unwrap();
+    let state = a_state(&dir);
+    let store = state.store.clone();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(wakode_api::serve(listener, state));
+
+    let body = r#"{"login":"swrneko","password":"достаточно длинный","timezone":"Europe/Moscow"}"#;
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST /api/setup HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+
+    assert!(
+        response.starts_with("HTTP/1.1 201 Created"),
+        "настройка с петлевого адреса не прошла: {response}"
+    );
+    // Код ответа сам по себе не доказывает, что дошло до базы.
+    let created = store.user_by_login("swrneko").await.unwrap().unwrap();
+    assert!(created.is_admin, "заведён не администратор");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn the_password_threshold_counts_characters_not_bytes() {
+    // Порог обещан пользователю в символах. Кириллический пароль в шесть
+    // символов — это двенадцать байт, и проверка по `len()` пропустила бы
+    // его, оставшись зелёной на всех остальных тестах.
+    let dir = tempfile::tempdir().unwrap();
+    let state = a_state(&dir);
+
+    let response = setup_from(
+        state,
+        "127.0.0.1:54321",
+        setup_body_with("swrneko", "пароли"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}

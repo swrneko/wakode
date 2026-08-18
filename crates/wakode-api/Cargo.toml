@@ -15,7 +15,9 @@ serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["rt", "net"] }
 tower-http = { workspace = true, features = ["catch-panic", "trace"] }
 tracing.workspace = true
-uuid = { workspace = true, features = ["v7"] }
+# `serde` — ради ответа настройки: идентификатор заведённого администратора
+# уезжает клиенту в JSON.
+uuid = { workspace = true, features = ["v7", "serde"] }
 wakode-auth.workspace = true
 wakode-core.workspace = true
 wakode-store.workspace = true
