@@ -7,11 +7,11 @@ use http_body_util::BodyExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 use wakode_api::{router, ApiError, AppState};
-use wakode_auth::{ApiKeyValue, MasterKey};
+use wakode_auth::{ApiKeyValue, MasterKey, SessionToken};
 use wakode_core::{Category, EntityKind, Micros};
 use wakode_store::{
-    ApiKey, HeartbeatRepo, IncomingHeartbeat, KeyRepo, NewApiKey, NewUser, SqliteStore, StoreError,
-    UserRepo,
+    ApiKey, HeartbeatRepo, IncomingHeartbeat, KeyRepo, NewApiKey, NewSession, NewUser, SessionRepo,
+    SqliteStore, StoreError, UserRepo,
 };
 
 pub fn a_store(dir: &tempfile::TempDir) -> SqliteStore {
@@ -702,4 +702,325 @@ async fn a_malformed_key_says_so_instead_of_pretending_it_was_not_found() {
     let json = json_body(response).await;
     let message = json["error"].as_str().unwrap();
     assert!(message.contains("формат"), "причина не названа: {message}");
+}
+
+/// Пробный маршрут: единственный смысл — потребовать `SessionAuth`.
+///
+/// Маршрутов два по той же причине, что и у `KeyAuth`: `session_id` не
+/// читается больше ниоткуда, и без второго маршрута `Uuid::nil()` прошёл бы
+/// весь набор зелёным.
+fn app_requiring_a_session(state: AppState) -> axum::Router {
+    use axum::routing::get;
+    axum::Router::new()
+        .route(
+            "/я",
+            get(|auth: wakode_api::auth::SessionAuth| async move { auth.user.login }),
+        )
+        .route(
+            "/какая-сессия",
+            get(|auth: wakode_api::auth::SessionAuth| async move { auth.session_id.to_string() }),
+        )
+        .with_state(state)
+}
+
+/// Завести сессию с заданным сроком и вернуть её токен.
+async fn a_session(state: &AppState, user_id: uuid::Uuid, expires_at: Micros) -> SessionToken {
+    let token = SessionToken::generate();
+    state
+        .store
+        .create_session(NewSession {
+            user_id,
+            token_hash: token.hash(),
+            user_agent: Some("Firefox".to_owned()),
+            expires_at,
+        })
+        .await
+        .unwrap();
+    token
+}
+
+/// Заголовок `cookie` с токеном сессии.
+///
+/// Собирается строкой, а не через `Cookie::new`: тесту важно ровно то, что
+/// приезжает по проводу, а не то, как его умеет собрать та же библиотека,
+/// которой значение потом разбирают.
+fn session_cookie(token: &SessionToken) -> String {
+    format!("{}={token}", wakode_api::auth::SESSION_COOKIE)
+}
+
+/// Ответ пробного маршрута на запрос с заданным заголовком `cookie`.
+/// Заголовок подставляется как есть — тестам про соседние cookie и про
+/// мусорное значение нужно управлять им целиком.
+async fn me_with_cookie(state: &AppState, cookie: &str) -> Response {
+    app_requiring_a_session(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/я")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_live_session_identifies_the_user() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _) = a_state_with_a_key(&dir).await;
+    let user = state.store.user_by_login("swrneko").await.unwrap().unwrap();
+    let token = a_session(&state, user.id, Micros::from_secs(4_000_000_000)).await;
+
+    let response = me_with_cookie(&state, &session_cookie(&token)).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"swrneko");
+}
+
+#[tokio::test]
+async fn an_expired_session_is_refused() {
+    // Хранилище отдаёт `expires_at` как есть — доменной валидации в нём нет
+    // по построению. Не проверить срок здесь значит пускать по вечным
+    // сессиям.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _) = a_state_with_a_key(&dir).await;
+    let user = state.store.user_by_login("swrneko").await.unwrap().unwrap();
+    let token = a_session(&state, user.id, Micros::from_secs(1)).await;
+
+    let response = me_with_cookie(&state, &session_cookie(&token)).await;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // Причина проверяется не ради текста: без неё тест остаётся зелёным и
+    // тогда, когда сессия просто не нашлась, — то есть доказывал бы не то,
+    // что обещает именем.
+    let json = json_body(response).await;
+    let message = json["error"].as_str().unwrap();
+    assert!(message.contains("истек"), "причина не та: {message}");
+}
+
+#[tokio::test]
+async fn a_revoked_session_says_so() {
+    // «Отозвана» и «не существует» — разные события: первое владелец сделал
+    // сам (вышел на другом устройстве), второе означает чужой или устаревший
+    // токен. Хранилище это различает, и терять различие на пути наружу
+    // незачем: токен предъявляет тот, у кого он и так есть.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _) = a_state_with_a_key(&dir).await;
+    let user = state.store.user_by_login("swrneko").await.unwrap().unwrap();
+    let token = a_session(&state, user.id, Micros::from_secs(4_000_000_000)).await;
+
+    let found = state
+        .store
+        .session_by_token_hash(token.hash())
+        .await
+        .unwrap()
+        .unwrap();
+    state.store.revoke_session(found.id).await.unwrap();
+
+    let response = me_with_cookie(&state, &session_cookie(&token)).await;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let json = json_body(response).await;
+    let message = json["error"].as_str().unwrap();
+    assert!(message.contains("отозв"), "причина не та: {message}");
+}
+
+#[tokio::test]
+async fn a_session_both_revoked_and_expired_says_it_was_revoked() {
+    // Порядок проверок — обещание комментария в `session.rs`, а без этого
+    // теста он не держится ничем: сессия, отозванная и просроченная разом,
+    // при перестановке проверок молча начала бы отвечать «истекла».
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _) = a_state_with_a_key(&dir).await;
+    let user = state.store.user_by_login("swrneko").await.unwrap().unwrap();
+    let token = a_session(&state, user.id, Micros::from_secs(1)).await;
+
+    let found = state
+        .store
+        .session_by_token_hash(token.hash())
+        .await
+        .unwrap()
+        .unwrap();
+    state.store.revoke_session(found.id).await.unwrap();
+
+    let response = me_with_cookie(&state, &session_cookie(&token)).await;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let json = json_body(response).await;
+    let message = json["error"].as_str().unwrap();
+    assert!(message.contains("отозв"), "названа не та причина: {message}");
+}
+
+#[tokio::test]
+async fn no_cookie_is_unauthorized() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _) = a_state_with_a_key(&dir).await;
+
+    let response = app_requiring_a_session(state)
+        .oneshot(Request::builder().uri("/я").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let json = json_body(response).await;
+    assert!(
+        json["error"].as_str().unwrap().contains("не предъявлена"),
+        "причина не та: {json}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_token_is_unauthorized() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _) = a_state_with_a_key(&dir).await;
+    let stranger = SessionToken::generate();
+
+    let response = me_with_cookie(&state, &session_cookie(&stranger)).await;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // Без проверки причины тест остаётся зелёным и тогда, когда cookie
+    // вообще не читается: «не предъявлена» — это тоже 401.
+    let json = json_body(response).await;
+    assert!(
+        json["error"].as_str().unwrap().contains("не найдена"),
+        "токен не дошёл до поиска в базе: {json}"
+    );
+}
+
+#[tokio::test]
+async fn a_garbage_cookie_says_the_format_is_wrong() {
+    // «Не разобрали» и «не нашли» — разные события: первое означает, что
+    // cookie испортил кто-то по дороге, второе — что сессия закончилась.
+    // Различие есть в коде, и держаться оно обязано тестом.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _) = a_state_with_a_key(&dir).await;
+
+    let response = me_with_cookie(
+        &state,
+        &format!("{}=not-a-real-token", wakode_api::auth::SESSION_COOKIE),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let json = json_body(response).await;
+    assert!(
+        json["error"].as_str().unwrap().contains("формат"),
+        "причина не та: {json}"
+    );
+
+    // Значение не из ASCII до разбора токена не доходит вовсе: заголовок
+    // не представим строкой, и `CookieJar` его молча пропускает — ответ
+    // получается «сессия не предъявлена». Отдельная причина сюда не
+    // дотягивается, но 401 обязан остаться 401.
+    let response = me_with_cookie(
+        &state,
+        &format!("{}=это-не-токен", wakode_api::auth::SESSION_COOKIE),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn the_session_cookie_is_found_among_its_neighbours() {
+    // В браузере cookie никогда не приезжает одна. Разбор, берущий значение
+    // заголовка целиком (или первую пару), проходил бы весь остальной набор
+    // зелёным и ломался бы ровно у настоящего браузера.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _) = a_state_with_a_key(&dir).await;
+    let user = state.store.user_by_login("swrneko").await.unwrap().unwrap();
+    let token = a_session(&state, user.id, Micros::from_secs(4_000_000_000)).await;
+
+    let crowded = format!("theme=dark; {}; lang=ru", session_cookie(&token));
+    let response = me_with_cookie(&state, &crowded).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"swrneko");
+}
+
+/// Завести пользователя без ключа: сессии ключа не требуют.
+async fn a_user(store: &SqliteStore, login: &str) -> wakode_store::User {
+    store
+        .create_user(NewUser {
+            login: login.to_owned(),
+            email: None,
+            password_hash: "непрозрачно".to_owned(),
+            display_name: None,
+            timezone: "Europe/Moscow".parse().unwrap(),
+            timeout_secs: 900,
+            is_admin: false,
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn each_session_identifies_its_own_owner() {
+    // Набор с единственным пользователем оставляет зелёным `user_by_id`,
+    // подменённый на «взять любого»: ровно такой дефект уже проходил мимо
+    // тестов дважды — в задаче 10 прошлого плана и в задаче 10 этого.
+    let dir = tempfile::tempdir().unwrap();
+    let store = a_store(&dir);
+    let first = a_user(&store, "первый").await;
+    let second = a_user(&store, "вторая").await;
+    let state = AppState::new(store, None, false, 30, false);
+
+    let live = Micros::from_secs(4_000_000_000);
+    let tokens = [
+        (a_session(&state, first.id, live).await, "первый"),
+        (a_session(&state, second.id, live).await, "вторая"),
+    ];
+
+    for (token, owner) in tokens {
+        let response = me_with_cookie(&state, &session_cookie(&token)).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap(),
+            owner,
+            "сессия опознала не своего владельца"
+        );
+    }
+}
+
+#[tokio::test]
+async fn session_auth_carries_the_id_of_the_session_that_opened_it() {
+    // Поле никем ещё не читается, и `session_id: Uuid::nil()` прошёл бы
+    // весь набор. По нему пойдёт выход из системы («отозвать текущую
+    // сессию») — молча нулевой идентификатор отзовёт не ту.
+    let dir = tempfile::tempdir().unwrap();
+    let store = a_store(&dir);
+    let user = a_user(&store, "swrneko").await;
+    let state = AppState::new(store, None, false, 30, false);
+
+    // Сессий две: с единственной строкой в таблице «взять любую» неотличимо
+    // от «взять свою».
+    let _other = a_session(&state, user.id, Micros::from_secs(4_000_000_000)).await;
+    let token = a_session(&state, user.id, Micros::from_secs(4_000_000_000)).await;
+    let session = state
+        .store
+        .session_by_token_hash(token.hash())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let response = app_requiring_a_session(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/какая-сессия")
+                .header("cookie", session_cookie(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        String::from_utf8(body.to_vec()).unwrap(),
+        session.id.to_string()
+    );
 }
