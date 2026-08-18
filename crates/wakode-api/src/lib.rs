@@ -52,6 +52,13 @@ pub fn with_layers(router: Router) -> Router {
 /// `?api_key=…` — проверено прогоном и закреплено
 /// `the_query_string_never_reaches_the_log`. Заголовков здесь нет по той
 /// же причине: в `Authorization` лежит тот же ключ в base64.
+///
+/// **Инвариант, который эта функция не может проверить сама:** путь не
+/// несёт секретов. Сегодня это так — `/healthz`, `/api/setup`,
+/// `/api/setup/status`, — но держится соглашением, а не кодом. Маршрут
+/// вида `/api/keys/{ключ}` уронил бы значение ключа в журнал открытым
+/// текстом мимо всех проверок этого файла. Секрет ездит в заголовке, в
+/// теле или в query — не в пути.
 fn request_span(request: &axum::extract::Request) -> tracing::Span {
     tracing::info_span!(
         "request",
