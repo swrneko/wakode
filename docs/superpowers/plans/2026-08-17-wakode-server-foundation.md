@@ -2633,6 +2633,10 @@ git commit -m "feat(api): каркас HTTP-слоя и проба живост�
 
 **Без мастер-ключа ключ проверить нечем** — отпечаток считается под ним. Это состояние недостижимо после шага 4 старта (он не даёт подняться с ключами в базе и без мастер-ключа), но экстрактор обязан ответить осмысленно, а не паниковать: недостижимое сегодня становится достижимым при первом же рефакторинге старта.
 
+**Источники соперничают, а не выбираются по порядку.** Найденное в заголовке не отменяет query-параметр. Сценарий не выдуманный: владелец ставит перед wakode прокси с собственным basic-auth, cli кладёт ключ в query — заголовок разбирается успешно и содержит `admin`. Пока побеждал первый источник, такая установка отвечала `401` на каждую отметку, причём с формулировкой «API-ключ не предъявлен», хотя он был предъявлен. Отсюда: `candidates(parts) -> Vec<String>` собирает всё похожее на ключ, а решает `ApiKeyValue::parse`. Различие «не предъявлен» / «неверный формат» при этом сохраняется — пустой список против непустого без единого разобравшегося.
+
+**Ключ без владельца — это `500`, а не `401`.** `api_keys.user_id` объявлен `REFERENCES users(id) ON DELETE CASCADE` при включённом `PRAGMA foreign_keys`, так что состояние недостижимо; ветка оставлена страховкой на случай базы, открытой без внешних ключей. Отвечать на нарушенный инвариант хранилища «вы не авторизованы» значило бы отправить владельца чинить ключ вместо базы.
+
 - [ ] **Step 1: Написать падающие тесты**
 
 Добавь в `crates/wakode-api/tests/api.rs`:
@@ -2941,16 +2945,29 @@ pub use api_key::KeyAuth;
 - [ ] **Step 4: Прогнать**
 
 Run: `cargo test -p wakode-api`
-Expected: PASS, десять тестов.
+Expected: PASS, 23 теста (7 от задачи 9 + 16 здесь).
 
 - [ ] **Step 5: Мутационная проверка**
 
 | Мутация | Обязан упасть |
 |---|---|
 | убрать проверку `key.revoked_at.is_some()` | `a_revoked_key_says_so_instead_of_pretending_it_never_existed` |
-| `extract_raw_key` игнорирует query-параметр | `a_key_in_the_query_string_works_too` |
+| `Unauthorized("API-ключ отозван")` → `Unauthorized("API-ключ не найден")` | тот же |
+| разбор игнорирует query-параметр | `a_key_in_the_query_string_works_too` |
+| разбор игнорирует заголовок целиком | `a_valid_key_in_the_basic_header_identifies_the_user`, `the_waka_prefix_is_accepted`, `the_authorization_scheme_is_case_insensitive` |
 | ветку без мастер-ключа заменить на `panic!` | `without_a_master_key_the_answer_is_honest_not_a_panic` |
-| `Unauthorized("API-ключ отозван")` → `Unauthorized("API-ключ не найден")` | `a_revoked_key_says_so_instead_of_pretending_it_never_existed` |
+| `user_by_id(key.user_id)` → владелец первого ключа | `each_key_identifies_its_own_owner` |
+| `key_id: key.id` → `Uuid::nil()` | `key_auth_carries_the_id_of_the_key_that_opened_it` |
+| сравнение имени схемы вернуть к регистрозависимому | `the_authorization_scheme_is_case_insensitive` |
+| побеждает первый источник (`or_else` вместо списка) | `a_foreign_authorization_header_does_not_cancel_the_key_in_the_query` |
+| разбирается только первый кандидат | тот же |
+| убрать разбор формы `логин:пароль` | `the_basic_scheme_accepts_the_login_password_form` |
+| убрать `trim` перед декодированием base64 | `spaces_around_the_credentials_are_tolerated_in_both_schemes` |
+| брать любой query-параметр, а не `api_key` | `only_the_parameter_named_api_key_is_taken` |
+| «неверный формат» → «не найден» | `a_malformed_key_says_so_instead_of_pretending_it_was_not_found` |
+| убрать различие «не предъявлен» / «неверный формат» | `only_the_parameter_named_api_key_is_taken` |
+
+Не покрыта и покрыта быть не может ветка «у ключа нет владельца»: публичного пути к ней нет (см. про `ON DELETE CASCADE` выше).
 
 - [ ] **Step 6: Коммит**
 
