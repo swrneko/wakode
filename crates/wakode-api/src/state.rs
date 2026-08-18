@@ -15,20 +15,33 @@ pub struct AppState {
     pub setup_from_any_address: bool,
 }
 
+/// Настройки, которые HTTP-слой берёт из конфига.
+///
+/// Отдельной структурой, а не пятью позиционными аргументами `new`.
+/// Причина конкретная: `registration` и `setup_from_any_address` — два
+/// соседних `bool`, и перестановку их местами компилятор не поймает
+/// никогда. Цена такой перестановки у владельца, включившего регистрацию:
+/// экран первичной настройки открыт всему интернету, пока в базе нет
+/// пользователей. Именной инициализации полей для этой ошибки нужно уже
+/// написать неверное имя — а это видно и глазами, и на ревью.
+///
+/// Проводку из конфига делает задача 14 (подкоманда `serve`); до неё
+/// структура собирается только тестами.
+#[derive(Debug, Clone, Copy)]
+pub struct AppSettings {
+    pub registration: bool,
+    pub session_ttl_days: i64,
+    pub setup_from_any_address: bool,
+}
+
 impl AppState {
-    pub fn new(
-        store: SqliteStore,
-        master_key: Option<MasterKey>,
-        registration: bool,
-        session_ttl_days: i64,
-        setup_from_any_address: bool,
-    ) -> Self {
+    pub fn new(store: SqliteStore, master_key: Option<MasterKey>, settings: AppSettings) -> Self {
         Self {
             store,
             master_key,
-            registration,
-            session_ttl_days,
-            setup_from_any_address,
+            registration: settings.registration,
+            session_ttl_days: settings.session_ttl_days,
+            setup_from_any_address: settings.setup_from_any_address,
         }
     }
 }

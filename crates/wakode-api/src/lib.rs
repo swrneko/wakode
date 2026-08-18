@@ -12,7 +12,7 @@ pub mod setup;
 pub mod state;
 
 pub use error::ApiError;
-pub use state::AppState;
+pub use state::{AppSettings, AppState};
 
 use axum::routing::get;
 use axum::Router;

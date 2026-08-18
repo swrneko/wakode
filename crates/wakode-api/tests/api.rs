@@ -6,7 +6,7 @@ use base64::Engine as _;
 use http_body_util::BodyExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
-use wakode_api::{router, ApiError, AppState};
+use wakode_api::{router, ApiError, AppSettings, AppState};
 use wakode_auth::{ApiKeyValue, MasterKey, SessionToken};
 use wakode_core::{Category, EntityKind, Micros};
 use wakode_store::{
@@ -14,12 +14,24 @@ use wakode_store::{
     SqliteStore, StoreError, UserRepo,
 };
 
+/// Настройки по умолчанию: регистрация закрыта, настройка — только с
+/// петлевого адреса. Тесты, которым важно другое, перекрывают нужное поле
+/// по имени: `registration` и `setup_from_any_address` — два соседних
+/// `bool`, и перепутать их местами компилятор не поможет никогда.
+fn a_settings() -> AppSettings {
+    AppSettings {
+        registration: false,
+        session_ttl_days: 30,
+        setup_from_any_address: false,
+    }
+}
+
 pub fn a_store(dir: &tempfile::TempDir) -> SqliteStore {
     SqliteStore::open(&dir.path().join("wakode.db"), 16).unwrap()
 }
 
 pub fn a_state(dir: &tempfile::TempDir) -> AppState {
-    AppState::new(a_store(dir), None, false, 30, false)
+    AppState::new(a_store(dir), None, a_settings())
 }
 
 /// Тело ответа как JSON. `Content-Type` проверяется здесь же: тест с
@@ -82,7 +94,7 @@ async fn a_state_with_a_key(dir: &tempfile::TempDir) -> (AppState, ApiKeyValue) 
     let store = a_store(dir);
     let (value, _) = a_user_with_a_key(&store, &master, "swrneko").await;
 
-    (AppState::new(store, Some(master), false, 30, false), value)
+    (AppState::new(store, Some(master), a_settings()), value)
 }
 
 /// Пробный маршрут: единственный смысл — потребовать `KeyAuth`.
@@ -236,7 +248,7 @@ async fn state_debug_prints_neither_the_master_key_nor_the_dictionary() {
         .await
         .unwrap();
 
-    let state = AppState::new(store, Some(master.clone()), false, 30, false);
+    let state = AppState::new(store, Some(master.clone()), a_settings());
     let dump = format!("{state:?}");
 
     // Словарь непустой — иначе проверки ниже ничего не значат.
@@ -457,7 +469,7 @@ async fn without_a_master_key_the_answer_is_honest_not_a_panic() {
     // паника в экстракторе — худший способ об этом узнать.
     let dir = tempfile::tempdir().unwrap();
     let store = a_store(&dir);
-    let app = app_requiring_a_key(AppState::new(store, None, false, 30, false));
+    let app = app_requiring_a_key(AppState::new(store, None, a_settings()));
 
     let response = app
         .oneshot(
@@ -483,7 +495,7 @@ async fn each_key_identifies_its_own_owner() {
     let store = a_store(&dir);
     let (first, _) = a_user_with_a_key(&store, &master, "первый").await;
     let (second, _) = a_user_with_a_key(&store, &master, "вторая").await;
-    let state = AppState::new(store, Some(master), false, 30, false);
+    let state = AppState::new(store, Some(master), a_settings());
 
     for (value, owner) in [(first, "первый"), (second, "вторая")] {
         let response = app_requiring_a_key(state.clone())
@@ -515,7 +527,7 @@ async fn key_auth_carries_the_id_of_the_key_that_opened_it() {
     let master = MasterKey::generate();
     let store = a_store(&dir);
     let (value, key) = a_user_with_a_key(&store, &master, "swrneko").await;
-    let app = app_requiring_a_key(AppState::new(store, Some(master), false, 30, false));
+    let app = app_requiring_a_key(AppState::new(store, Some(master), a_settings()));
 
     let response = app
         .oneshot(
@@ -994,7 +1006,7 @@ async fn each_session_identifies_its_own_owner() {
     let store = a_store(&dir);
     let first = a_user(&store, "первый").await;
     let second = a_user(&store, "вторая").await;
-    let state = AppState::new(store, None, false, 30, false);
+    let state = AppState::new(store, None, a_settings());
 
     let tokens = [
         (a_session(&state, first.id, live()).await, "первый"),
@@ -1022,7 +1034,7 @@ async fn session_auth_carries_the_id_of_the_session_that_opened_it() {
     let dir = tempfile::tempdir().unwrap();
     let store = a_store(&dir);
     let user = a_user(&store, "swrneko").await;
-    let state = AppState::new(store, None, false, 30, false);
+    let state = AppState::new(store, None, a_settings());
 
     // Сессий две: с единственной строкой в таблице «взять любую» неотличимо
     // от «взять свою».
@@ -1164,7 +1176,7 @@ async fn a_foreign_address_is_allowed_when_the_owner_says_so() {
     // Зеркало предыдущего: без него «запрещать всегда» прошло бы проверку
     // на запрет и выглядело бы правильным.
     let dir = tempfile::tempdir().unwrap();
-    let state = AppState::new(a_store(&dir), None, false, 30, true);
+    let state = AppState::new(a_store(&dir), None, AppSettings { setup_from_any_address: true, ..a_settings() });
 
     let response = setup_from(state, "203.0.113.7:40000", setup_body("за-прокси")).await;
 
@@ -1197,6 +1209,16 @@ async fn setup_closes_forever_after_the_first_user() {
     assert!(
         state.store.user_by_login("второй").await.unwrap().is_none(),
         "второй администратор всё-таки завёлся"
+    );
+
+    // Текст, а не только код: `403` здесь и `403` за чужой адрес — разные
+    // события, и владелец, ткнувший в закрытый экран, должен прочитать
+    // именно то, которое случилось. До этой проверки подмена текста этой
+    // ветки проходила зелёной.
+    let json = json_body(second).await;
+    assert!(
+        json["error"].as_str().unwrap().contains("уже выполнена"),
+        "причина не названа: {json}"
     );
 
     let json = setup_status(state).await;
@@ -1379,9 +1401,21 @@ async fn a_bad_timezone_is_a_bad_request_not_a_500() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let json = json_body(response).await;
+    let message = json["error"].as_str().unwrap();
+    assert!(message.contains("таймзона"), "причина не названа: {message}");
+
+    // Текст собирается из пользовательского ввода, и до этой проверки
+    // подстановка `request.password` вместо `request.timezone` не роняла
+    // ничего. Сегодня это было бы эхо клиенту самому себе, но задача 13
+    // добавляет журналирование — и тогда ценой той же опечатки стал бы
+    // пароль администратора в логе.
     assert!(
-        json["error"].as_str().unwrap().contains("таймзона"),
-        "причина не названа: {json}"
+        message.contains("Марс/Олимп"),
+        "в сообщении нет самой таймзоны: {message}"
+    );
+    assert!(
+        !message.contains("достаточно длинный"),
+        "в сообщение уехал пароль: {message}"
     );
 }
 
@@ -1523,7 +1557,7 @@ async fn setup_closes_even_when_registration_is_open() {
     // этого обещание держалось бы только тем, что никто не написал
     // `if !state.registration && count > 0`.
     let dir = tempfile::tempdir().unwrap();
-    let state = AppState::new(a_store(&dir), None, true, 30, false);
+    let state = AppState::new(a_store(&dir), None, AppSettings { registration: true, ..a_settings() });
 
     let first = setup_from(state.clone(), "127.0.0.1:54321", setup_body("первый")).await;
     assert_eq!(first.status(), StatusCode::CREATED);
