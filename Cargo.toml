@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/wakode-core", "crates/wakode-store", "crates/wakode-auth", "crates/wakode"]
+members = ["crates/wakode-core", "crates/wakode-store", "crates/wakode-auth", "crates/wakode-api", "crates/wakode"]
 
 [workspace.package]
 edition = "2024"
