@@ -31,6 +31,8 @@ pub enum ApiError {
     Forbidden(&'static str),
     NotFound,
     MethodNotAllowed,
+    /// Запрос осмыслен, но состояние на сервере ему противоречит.
+    Conflict(&'static str),
     BadRequest(String),
     /// Нагрузка временная, повторить стоит. Отдельно от `Internal`, потому
     /// что клиент различает их поведением: `503` с `Retry-After` он дошлёт,
@@ -50,6 +52,7 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized(why) => (StatusCode::UNAUTHORIZED, *why),
             ApiError::Forbidden(why) => (StatusCode::FORBIDDEN, *why),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "нет такого пути"),
+            ApiError::Conflict(why) => (StatusCode::CONFLICT, *why),
             ApiError::MethodNotAllowed => (StatusCode::METHOD_NOT_ALLOWED, "метод не поддержан"),
             ApiError::BadRequest(why) => (StatusCode::BAD_REQUEST, why.as_str()),
             ApiError::Unavailable => (
@@ -90,6 +93,15 @@ impl From<wakode_store::StoreError> for ApiError {
                 tracing::warn!("очередь записи переполнена");
                 ApiError::Unavailable
             }
+            // Занятый и пустой логин — вина того, кто прислал запрос, а
+            // не поломка хранилища. Сегодня недостижимы (в `setup` логин
+            // уже проверен, а `user_count > 0` отсекает дубликат), но
+            // регистрация из плана 3b упрётся ровно сюда, и отвечать ей
+            // `500` на «такой логин занят» значило бы отправить
+            // пользователя писать владельцу вместо того, чтобы выбрать
+            // другой логин.
+            StoreError::LoginTaken(_) => ApiError::Conflict("такой логин уже занят"),
+            StoreError::LoginEmpty => ApiError::BadRequest("логин пуст".to_owned()),
             err => {
                 tracing::error!(error = %err, "ошибка хранилища");
                 ApiError::Internal

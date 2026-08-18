@@ -98,13 +98,6 @@ async fn run() -> anyhow::Result<()> {
 
     let started = startup::start(config, std::env::var("WAKODE_MASTER_KEY").ok()).await?;
 
-    // Версия схемы — то, чего в журнале не хватало больше всего: миграции
-    // применяет `SqliteStore::open` молча, и владелец, обновивший сборку,
-    // видел «сервер поднят», не видя, применилось ли что-нибудь.
-    tracing::info!(
-        schema = started.store.schema_version().await?,
-        "база открыта, миграции применены"
-    );
 
     // Результат придерживается до останова писателя: `?` прямо здесь
     // унёс бы управление мимо `shutdown`.
@@ -119,7 +112,20 @@ async fn run() -> anyhow::Result<()> {
     // настоящей. Ставится заранее, потому что дописать останов задним
     // числом к готовому `serve` — это вспомнить о нём, а вспоминают не
     // всегда.
-    let outcome = dispatch(&started, args.command.unwrap_or(Command::Serve)).await;
+    // Версия схемы — то, чего в журнале не хватало больше всего: миграции
+    // применяет `SqliteStore::open` молча, и владелец, обновивший сборку,
+    // видел «сервер поднят», не видя, применилось ли что-нибудь.
+    //
+    // Ошибка идёт в тот же `outcome`, а не через `?`: `?` здесь унёс бы
+    // управление мимо `shutdown` ровно так же, как в `dispatch` ниже —
+    // и первая же версия этой строки именно так и была написана.
+    let outcome = match started.store.schema_version().await {
+        Ok(schema) => {
+            tracing::info!(schema, "база открыта, миграции применены");
+            dispatch(&started, args.command.unwrap_or(Command::Serve)).await
+        }
+        Err(err) => Err(anyhow::Error::new(err).context("не удалось прочитать версию схемы")),
+    };
 
     if let Err(err) = started.store.shutdown().await {
         // Отказ останова не подменяет собой отказ подкоманды: подменив,
@@ -242,8 +248,12 @@ mod tests {
         config.auth.registration = true;
         config.auth.session_ttl_days = 7;
         config.auth.setup_from_any_address = false;
+        // Не 900: `wakode_core::DEFAULT_TIMEOUT_SECS` равен именно 900, и
+        // с ним проверка проводки была бы вакуумной.
+        config.durations.timeout_secs = 777;
 
         let settings = app_settings(&config);
+        assert_eq!(settings.default_timeout_secs, 777);
         assert!(settings.registration);
         assert_eq!(settings.session_ttl_days, 7);
         assert!(!settings.setup_from_any_address);

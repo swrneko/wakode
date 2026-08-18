@@ -23,7 +23,12 @@ fn a_settings() -> AppSettings {
         registration: false,
         session_ttl_days: 30,
         setup_from_any_address: false,
-        default_timeout_secs: 900,
+        // Намеренно не 900: `wakode_core::DEFAULT_TIMEOUT_SECS` равен
+        // именно 900, и с ним любая проверка «тайм-аут пришёл из
+        // настроек» была бы вакуумной — прошитая константа дала бы тот же
+        // ответ. Ровно эта вакуумность и была найдена финальным ревью на
+        // второй двери создания пользователя.
+        default_timeout_secs: 777,
     }
 }
 
@@ -1130,8 +1135,21 @@ async fn a_loopback_peer_is_not_enough_when_the_request_came_through_a_proxy() {
     // заводить админа через браузер — а инстанс уже занят.
     let dir = tempfile::tempdir().unwrap();
 
-    for header in ["x-forwarded-for", "forwarded", "x-real-ip"] {
-        let state = a_state(&tempfile::tempdir().unwrap());
+    for header in [
+        "x-forwarded-for",
+        "forwarded",
+        "x-forwarded-proto",
+        "x-forwarded-host",
+        "x-real-ip",
+        "via",
+    ] {
+        // Папка держится в переменной: `a_state(&tempfile::tempdir()...)`
+        // удаляет её в конце того же выражения, и тест проходил бы только
+        // потому, что `403` отдаётся до похода в базу. Стоило бы
+        // переставить проверки — и он краснел бы `500`-кой вместо
+        // внятного утверждения.
+        let dir = tempfile::tempdir().unwrap();
+        let state = a_state(&dir);
         let response = setup_from_loopback_with(state, &[(header, "203.0.113.7")]).await;
 
         assert_eq!(
@@ -1190,6 +1208,28 @@ async fn an_unknown_field_in_the_setup_body_is_an_error() {
     .await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn the_created_admin_gets_the_timeout_from_the_settings() {
+    // Вторая дверь создания пользователя. Первая (CLI) уже покрыта
+    // `the_timeout_from_the_config_reaches_the_created_user`, а эта
+    // держалась ни на чём: фикстура задавала 900, что равно
+    // `wakode_core::DEFAULT_TIMEOUT_SECS`, и прошитая константа дала бы
+    // тот же ответ. Ровно та форма дефекта, из-за которой секция
+    // `[durations]` и оказалась мёртвой.
+    let dir = tempfile::tempdir().unwrap();
+    let state = a_state(&dir);
+    let store = state.store.clone();
+
+    let response = setup_from(state, "127.0.0.1:54321", setup_body("swrneko")).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let created = store.user_by_login("swrneko").await.unwrap().unwrap();
+    assert_eq!(
+        created.timeout_secs, 777,
+        "тайм-аут взят из константы, а не из настроек"
+    );
 }
 
 /// Ответ `/api/setup/status` как JSON.
