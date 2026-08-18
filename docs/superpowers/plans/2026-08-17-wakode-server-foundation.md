@@ -2298,8 +2298,8 @@ git commit -m "feat(store): управляемая остановка писат
 - Create: `crates/wakode-api/src/health.rs`
 - Create: `crates/wakode-api/src/compat/mod.rs`
 - Create: `crates/wakode-api/src/internal/mod.rs`
-- Modify: `crates/wakode/src/main.rs`
-- Modify: `crates/wakode/Cargo.toml`
+- Modify: `crates/wakode/src/main.rs` (только комментарий: `wakode-api` теперь существует, но поднимает его подкоманда `serve` из задачи 14)
+- Modify: `crates/wakode/src/startup.rs` (ожидание `dead_code` переадресовано задаче 14 и сужено до `not(test)`)
 - Modify: `Cargo.toml` (корень)
 
 **Interfaces:**
@@ -2307,6 +2307,10 @@ git commit -m "feat(store): управляемая остановка писат
 - Produces: `AppState { store: SqliteStore, master_key: Option<MasterKey>, registration: bool, session_ttl_days: i64, setup_from_any_address: bool }`, `AppState::new(...)`; `ApiError` с `IntoResponse`; `router(state: AppState) -> axum::Router`; `serve(listener: TcpListener, state: AppState) -> std::io::Result<()>`.
 
 **Почему `AppState` не держит весь `Config`.** Слою HTTP нужны четыре поля из него, а не адрес прослушивания и путь к базе. Узкое состояние — это ещё и защита: `Config` со временем обрастёт полями, и часть из них будет чувствительной.
+
+**Обещание «тело всегда JSON» держится двумя вызовами, а не одним.** `fallback` ловит только несовпадение пути; путь, у которого есть обработчик на другой метод, до него не доходит, и axum отдаёт пустой `405`. Нужен ещё `method_not_allowed_fallback`, и ставить его надо **после** всех `route`: он раздаёт запасной обработчик уже зарегистрированным маршрутам, поэтому маршрут, добавленный ниже него, останется с пустым ответом.
+
+**`StoreError::WriteQueueFull` — это `503`, а не `500`.** Обещание записано в докстринге `spawn_writer` («отказ здесь превращается в 503 с `Retry-After`, и cli дошлёт отметки из собственной очереди»), но жило в чужом крейте и не держалось ничем. Разница поведенческая: на `500` клиент отметки выбросит, на `503` с `Retry-After` — дошлёт. Отсюда отдельный вариант `ApiError::Unavailable`.
 
 **`AppState` выводит `Debug` вручную.** `SqliteStore` печатает число строк словаря, а не сам словарь (правка финального ревью плана 2), но `master_key` производный `Debug` напечатал бы, будь он выведен — `MasterKey` от этого защищён своей реализацией. Тест сторожит связку целиком, потому что именно на стыке таких решений утечка и появилась в прошлый раз.
 
@@ -2580,15 +2584,27 @@ pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> std::i
 - [ ] **Step 5: Прогнать**
 
 Run: `cargo test -p wakode-api`
-Expected: PASS, три теста.
+Expected: PASS, семь тестов.
 
 - [ ] **Step 6: Мутационная проверка**
 
 | Мутация | Обязан упасть |
 |---|---|
 | убрать `.fallback(...)` | `an_unknown_path_is_a_json_error_not_an_empty_404` |
+| убрать `.method_not_allowed_fallback(...)` | `a_wrong_method_is_a_json_error_too` |
 | в `Debug` для `AppState` печатать `&self.master_key` | `state_debug_prints_neither_the_master_key_nor_the_dictionary` |
-| `healthz` возвращает пустую строку | `healthz_answers_ok` |
+| `Interner::fmt` печатает `by_id` целиком | `state_debug_prints_neither_the_master_key_nor_the_dictionary` |
+| `healthz` возвращает пустую строку | `healthz_answers_ok`, `serve_actually_answers_on_a_real_socket` |
+| тело `serve` выпотрошено до `Ok(())` | `serve_actually_answers_on_a_real_socket` |
+| `From<StoreError>` отдаёт `BadRequest(err.to_string())` | `a_storage_error_does_not_leak_its_text_to_the_client` |
+| `WriteQueueFull` отображается в `Internal` | `a_full_write_queue_is_a_retryable_503_not_a_500` |
+| `Retry-After` не ставится | `a_full_write_queue_is_a_retryable_503_not_a_500` |
+| тело ошибки отдаётся как `text/plain` | три теста, читающих тело как JSON |
+
+Мутация, которую **не ловит ничто**: `into_make_service()` вместо
+`into_make_service_with_connect_info::<SocketAddr>()`. Потребителя
+`ConnectInfo` до задачи 12 нет, и заводить его ради теста — шов ради шва.
+Осознанный долг: тест на экран первичной настройки покраснеет там.
 
 - [ ] **Step 7: Коммит**
 
