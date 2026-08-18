@@ -553,3 +553,153 @@ async fn the_authorization_scheme_is_case_insensitive() {
         assert_eq!(response.status(), StatusCode::OK, "схема {scheme} не принята");
     }
 }
+
+/// Ответ на запрос к `/кто-я` с произвольным URI и произвольным набором
+/// заголовков. Нужен тестам, где важно, что заголовок и query спорят.
+async fn who_am_i(state: &AppState, uri: &str, headers: &[(&str, &str)]) -> Response {
+    let mut request = Request::builder().uri(uri);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+
+    app_requiring_a_key(state.clone())
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_foreign_authorization_header_does_not_cancel_the_key_in_the_query() {
+    // Владелец ставит перед wakode nginx с собственным basic-auth, а
+    // wakatime-cli кладёт ключ в query. Разбор заголовка обрывался на
+    // первой же неудаче и выходил из всей функции — все отметки получали
+    // 401, причём с ответом «ключ не предъявлен», хотя он был предъявлен.
+    // Именно такой ответ и отправляет владельца чинить не то.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, value) = a_state_with_a_key(&dir).await;
+    let uri = format!("/кто-я?api_key={value}");
+
+    let proxy_basic = format!("Basic {}", STANDARD.encode("admin:secret"));
+    let foreign = [
+        // Прокси со своим basic-auth: заголовок разбирается, но ключ не наш.
+        proxy_basic.as_str(),
+        // Не base64 вовсе.
+        "Basic ??? не base64 ???",
+        // Схема, о которой мы ничего не знаем.
+        "Digest username=\"admin\", realm=\"wakode\"",
+        // Заголовок без схемы вообще.
+        "простотекст",
+    ];
+
+    for header in foreign {
+        let response = who_am_i(&state, &uri, &[("authorization", header)]).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "заголовок {header:?} погасил ключ из query"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_non_ascii_authorization_header_does_not_cancel_the_key_either() {
+    // Отдельно от предыдущего: заголовок, который вообще не представим
+    // строкой, отсекается раньше разбора схемы, и это была своя ветка
+    // выхода из всей функции.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, value) = a_state_with_a_key(&dir).await;
+
+    let mut request = Request::builder().uri(format!("/кто-я?api_key={value}"));
+    request = request.header(
+        "authorization",
+        axum::http::HeaderValue::from_bytes(&[0x42, 0xff, 0xfe]).unwrap(),
+    );
+
+    let response = app_requiring_a_key(state)
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn the_basic_scheme_accepts_the_login_password_form() {
+    // Basic-схема по RFC — это `логин:пароль`. wakatime-cli шлёт голый
+    // ключ, но плагин, положивший его в поле логина, обязан работать:
+    // строка, отрезающая хвост после двоеточия, ради этого и стоит.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, value) = a_state_with_a_key(&dir).await;
+
+    let with_colon = STANDARD.encode(format!("{value}:"));
+    let response = who_am_i_with_authorization(&state, "Basic", &with_colon).await;
+    assert_eq!(response.status(), StatusCode::OK, "форма `ключ:` не принята");
+
+    let with_password = STANDARD.encode(format!("{value}:неважно"));
+    let response = who_am_i_with_authorization(&state, "Basic", &with_password).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "форма `ключ:пароль` не принята"
+    );
+}
+
+#[tokio::test]
+async fn spaces_around_the_credentials_are_tolerated_in_both_schemes() {
+    // Обе схемы терпимы к пробелам, но по разным причинам, и обе причины
+    // записаны комментариями в `api_key.rs` — значит, обе обязаны быть
+    // покрыты, иначе комментарий утверждает больше, чем держит код.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, value) = a_state_with_a_key(&dir).await;
+
+    // `Basic`: `trim` стоит до декодирования. В base64 пробелы не значат
+    // ничего, а `ApiKeyValue::parse` их уже не увидит — он получит
+    // результат декодирования, а не исходную строку.
+    let padded = format!("  {}  ", STANDARD.encode(value.to_string()));
+    let response = who_am_i_with_authorization(&state, "Basic", &padded).await;
+    assert_eq!(response.status(), StatusCode::OK, "Basic не стерпел пробелы");
+
+    // `Bearer`: своего `trim` нет и не нужно — пробелы срезает
+    // `ApiKeyValue::parse`, которому значение достаётся как есть.
+    let response = who_am_i_with_authorization(&state, "Bearer", &format!(" {value} ")).await;
+    assert_eq!(response.status(), StatusCode::OK, "Bearer не стерпел пробелы");
+}
+
+#[tokio::test]
+async fn only_the_parameter_named_api_key_is_taken() {
+    // Имя параметра не проверялось ни одним тестом: разбор, берущий
+    // первый попавшийся параметр, проходил весь набор зелёным. Такой
+    // разбор принял бы `?redirect=...` за ключ и отвечал бы «неверный
+    // формат» вместо «не предъявлен».
+    let dir = tempfile::tempdir().unwrap();
+    let (state, value) = a_state_with_a_key(&dir).await;
+
+    // Ключ не первый — соседний параметр не должен его заслонить.
+    let response = who_am_i(&state, &format!("/кто-я?плагин=vim&api_key={value}"), &[]).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Похожее имя — не то же самое имя.
+    let response = who_am_i(&state, &format!("/кто-я?not_api_key={value}"), &[]).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let json = json_body(response).await;
+    assert!(
+        json["error"].as_str().unwrap().contains("не предъявлен"),
+        "причина не та: {json}"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_key_says_so_instead_of_pretending_it_was_not_found() {
+    // «Не разобрали» и «не нашли» — разные события: первое означает, что
+    // плагин настроен неправильно, второе — что ключ отозван или база не
+    // та. Различие есть в коде и до этого теста не держалось ничем.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _) = a_state_with_a_key(&dir).await;
+
+    let response = who_am_i(&state, "/кто-я?api_key=это-не-uuid", &[]).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let json = json_body(response).await;
+    let message = json["error"].as_str().unwrap();
+    assert!(message.contains("формат"), "причина не названа: {message}");
+}
