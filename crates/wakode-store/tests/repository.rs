@@ -6,7 +6,7 @@ use wakode_core::{Category, EntityKind, Micros};
 use wakode_store::{
     dirty_days_for, find_key_by_lookup, find_session_by_token_hash, find_user_by_id,
     find_user_by_login, first_api_key, insert_api_key, insert_heartbeats, insert_session,
-    insert_user, load_heartbeats, migrate, open_in_memory, revoke_key, revoke_session,
+    insert_user, list_users, load_heartbeats, migrate, open_in_memory, revoke_key, revoke_session,
     schema_version, spawn_writer, touch_key_used, user_count, HeartbeatRepo, IncomingHeartbeat,
     Interner, KeyRepo, NewApiKey, NewSession, NewUser, Outcome, SqliteStore, StoreError, UserRepo,
 };
@@ -254,6 +254,62 @@ fn user_count_follows_the_users_actually_inserted() {
 
     insert_user(&conn, &a_user("второй")).unwrap();
     assert_eq!(user_count(&conn).unwrap(), 2);
+}
+
+#[test]
+fn users_are_listed_oldest_first() {
+    // Что здесь доказано: `list_users` возвращает всех заведённых, с их
+    // полями, и в порядке вставки. Чего НЕ доказано: что порядок даёт
+    // `ORDER BY`, — два пользователя, вставленные подряд, ложатся по
+    // возрастанию и по `created_at`, и по первичному ключу (`users`
+    // объявлена `WITHOUT ROWID`, обход идёт по кластерному индексу
+    // UUIDv7, а тот монотонен по времени). Сортировку можно снять, и этот
+    // тест останется зелёным. Настоящая проверка сортировки —
+    // `list_users_orders_by_created_at_not_by_insertion` в `src/users.rs`,
+    // где `created_at` идёт против порядка вставки. Не удаляй её как дубль.
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+
+    let first = insert_user(&conn, &a_user("первый")).unwrap();
+    let second = insert_user(&conn, &a_user("второй")).unwrap();
+
+    let listed = list_users(&conn).unwrap();
+    let logins: Vec<&str> = listed.iter().map(|user| user.login.as_str()).collect();
+    assert_eq!(logins, vec!["первый", "второй"]);
+    assert_eq!(listed[0].id, first.id);
+    assert_eq!(listed[1].id, second.id);
+}
+
+#[test]
+fn listed_users_carry_every_field() {
+    // `wakode user list` печатает логин и признак администратора, а
+    // `is_admin` в `a_user` по умолчанию `false`. Список, где все поля
+    // взяты из соседних колонок или заполнены умолчаниями, прошёл бы
+    // проверку порядка целиком: она смотрит только на `login` и `id`.
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+
+    let mut new = a_user("swrneko");
+    new.email = Some("swrneko@example.org".to_owned());
+    new.display_name = Some("Швырнеко".to_owned());
+    new.timezone = Tz::Europe__Moscow;
+    new.timeout_secs = 1_200;
+    new.is_admin = true;
+    let created = insert_user(&conn, &new).unwrap();
+
+    let listed = list_users(&conn).unwrap();
+    assert_eq!(listed.len(), 1);
+    let user = &listed[0];
+    assert_eq!(user.id, created.id);
+    assert_eq!(user.login, "swrneko");
+    assert_eq!(user.email.as_deref(), Some("swrneko@example.org"));
+    assert_eq!(user.password_hash, new.password_hash);
+    assert_eq!(user.display_name.as_deref(), Some("Швырнеко"));
+    assert_eq!(user.timezone, Tz::Europe__Moscow);
+    assert_eq!(user.timeout_secs, 1_200);
+    assert!(user.is_admin);
+    assert_eq!(user.created_at, created.created_at);
+    assert_eq!(user.updated_at, created.updated_at);
 }
 
 #[test]

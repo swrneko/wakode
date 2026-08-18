@@ -156,42 +156,35 @@ type UserRow = (
     i64,
 );
 
-fn query_one(
-    conn: &Connection,
-    predicate: &str,
-    params: &[&dyn rusqlite::ToSql],
-) -> StoreResult<Option<User>> {
-    let sql = format!(
-        "SELECT id, login, email, password_hash, display_name, timezone,
-                timeout_secs, is_admin, created_at, updated_at
-         FROM users WHERE {predicate}"
-    );
-    let mut stmt = conn.prepare_cached(&sql)?;
+/// Колонки в том порядке, в каком их ждёт [`UserRow`].
+///
+/// Одной константой на все запросы: список и порядок колонок обязаны
+/// совпадать с разбором в [`read_row`], а две копии этого списка
+/// расходятся молча — на месте `email` оказался бы `password_hash`, и
+/// компилятор бы этого не заметил, обе колонки текстовые.
+const USER_COLUMNS: &str = "id, login, email, password_hash, display_name, timezone,
+                            timeout_secs, is_admin, created_at, updated_at";
 
-    let row: Option<UserRow> = stmt
-        .query_row(params, |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-                row.get(7)?,
-                row.get(8)?,
-                row.get(9)?,
-            ))
-        })
-        .optional()?;
+fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+    ))
+}
 
-    let Some((id, login, email, password_hash, display_name, zone, timeout_secs, admin, created, updated)) =
-        row
-    else {
-        return Ok(None);
-    };
+fn into_user(row: UserRow) -> StoreResult<User> {
+    let (id, login, email, password_hash, display_name, zone, timeout_secs, admin, created, updated) =
+        row;
 
-    Ok(Some(User {
+    Ok(User {
         id: blob_to_uuid(&id)?,
         login,
         email,
@@ -204,7 +197,49 @@ fn query_one(
         is_admin: admin != 0,
         created_at: Micros::new(created),
         updated_at: Micros::new(updated),
-    }))
+    })
+}
+
+fn query_one(
+    conn: &Connection,
+    predicate: &str,
+    params: &[&dyn rusqlite::ToSql],
+) -> StoreResult<Option<User>> {
+    let sql = format!("SELECT {USER_COLUMNS} FROM users WHERE {predicate}");
+    let mut stmt = conn.prepare_cached(&sql)?;
+
+    let row: Option<UserRow> = stmt.query_row(params, read_row).optional()?;
+
+    match row {
+        None => Ok(None),
+        Some(row) => Ok(Some(into_user(row)?)),
+    }
+}
+
+/// Все пользователи, от самого раннего к позднему.
+///
+/// Порядок по `created_at` делает вывод `wakode user list` устойчивым:
+/// список, меняющий порядок между запусками, нельзя ни сравнить глазами,
+/// ни зафиксировать тестом. `id` вторым ключом — потому что `created_at`
+/// снимается с часов в микросекундах и у двух пользователей, заведённых
+/// подряд одним скриптом, может совпасть; UUIDv7 внутри одной
+/// микросекунды порядок уже не гарантирует, но делает его хотя бы
+/// одинаковым от запуска к запуску.
+///
+/// Постранично не отдаётся: пользователей на selfhosted-инстансе десятки,
+/// и курсор здесь был бы механикой без потребителя.
+pub fn list_users(conn: &Connection) -> StoreResult<Vec<User>> {
+    let sql = format!("SELECT {USER_COLUMNS} FROM users ORDER BY created_at, id");
+    let mut stmt = conn.prepare_cached(&sql)?;
+
+    // Строки собираются в `Vec` до разбора: `query_map` держит `stmt`
+    // занятым, а `into_user` может отказать (битый UUID, неизвестная
+    // таймзона) — и тогда `?` посреди итерации по живому курсору.
+    let rows: Vec<UserRow> = stmt
+        .query_map([], read_row)?
+        .collect::<rusqlite::Result<_>>()?;
+
+    rows.into_iter().map(into_user).collect()
 }
 
 #[cfg(test)]
@@ -224,6 +259,48 @@ mod tests {
             timeout_secs: 900,
             is_admin: false,
         }
+    }
+
+    #[test]
+    fn list_users_orders_by_created_at_not_by_insertion() {
+        // Интеграционный тест на порядок не доказывает ничего: два
+        // пользователя, вставленные подряд, ложатся по возрастанию и по
+        // `created_at`, и по первичному ключу — `users` объявлена
+        // `WITHOUT ROWID`, её обход идёт по кластерному индексу UUIDv7, а
+        // тот монотонен по времени. Обход совпадает с `ORDER BY`
+        // случайно, и сортировку можно снять незаметно. На том же уже
+        // обжигались в `first_api_key` и в `load_heartbeats`.
+        //
+        // Здесь `created_at` задаётся напрямую и идёт против порядка
+        // вставки — тогда `ORDER BY` становится единственным, что даёт
+        // верный ответ. Сырой SQL в модульном тесте внутри `src/` для того
+        // и позволен: три места в `tests/repository.rs` — про схему, а это
+        // про то, чего через публичный интерфейс не выразить.
+        let mut conn = open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+
+        let named = |login: &str| NewUser {
+            login: login.to_owned(),
+            ..a_user()
+        };
+        let later = insert_user(&conn, &named("вставлен первым")).unwrap();
+        let earlier = insert_user(&conn, &named("вставлен вторым")).unwrap();
+
+        // Второму по вставке приписываем более раннее время.
+        conn.execute(
+            "UPDATE users SET created_at = ?2 WHERE id = ?1",
+            rusqlite::params![uuid_to_blob(earlier.id), 1_000_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE users SET created_at = ?2 WHERE id = ?1",
+            rusqlite::params![uuid_to_blob(later.id), 2_000_i64],
+        )
+        .unwrap();
+
+        let listed = list_users(&conn).unwrap();
+        let logins: Vec<&str> = listed.iter().map(|user| user.login.as_str()).collect();
+        assert_eq!(logins, vec!["вставлен вторым", "вставлен первым"]);
     }
 
     #[test]

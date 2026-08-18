@@ -33,5 +33,7 @@ pub use keys::{find_key_by_lookup, first_api_key, insert_api_key, revoke_key, to
 pub use migrate::{migrate, schema_version};
 pub use repo::{HeartbeatRepo, KeyRepo, SessionRepo, SqliteStore, UserRepo};
 pub use sessions::{find_session_by_token_hash, insert_session, revoke_session, NewSession, Session};
-pub use users::{find_user_by_id, find_user_by_login, insert_user, user_count, NewUser, User};
+pub use users::{
+    find_user_by_id, find_user_by_login, insert_user, list_users, user_count, NewUser, User,
+};
 pub use writer::{spawn_writer, WriteHandle};

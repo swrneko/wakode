@@ -42,6 +42,7 @@ pub trait UserRepo: Send + Sync {
     fn user_by_login(&self, login: &str) -> impl std::future::Future<Output = StoreResult<Option<User>>> + Send;
     fn user_by_id(&self, id: Uuid) -> impl std::future::Future<Output = StoreResult<Option<User>>> + Send;
     fn user_count(&self) -> impl std::future::Future<Output = StoreResult<i64>> + Send;
+    fn list_users(&self) -> impl std::future::Future<Output = StoreResult<Vec<User>>> + Send;
 }
 
 pub trait KeyRepo: Send + Sync {
@@ -218,6 +219,10 @@ impl UserRepo for SqliteStore {
 
     async fn user_count(&self) -> StoreResult<i64> {
         on_own_connection(self, |conn| crate::user_count(&conn)).await
+    }
+
+    async fn list_users(&self) -> StoreResult<Vec<User>> {
+        on_own_connection(self, |conn| crate::list_users(&conn)).await
     }
 }
 
