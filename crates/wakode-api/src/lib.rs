@@ -3,6 +3,7 @@
 //! Криптографии здесь нет: она целиком в `wakode-auth`, и список
 //! зависимостей этого крейта — способ это проверить.
 
+pub mod auth;
 pub mod compat;
 pub mod error;
 pub mod health;

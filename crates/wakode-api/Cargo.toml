@@ -7,6 +7,9 @@ license.workspace = true
 [dependencies]
 axum.workspace = true
 axum-extra = { workspace = true, features = ["cookie"] }
+# Разбор схемы `Basic` в рабочем коде без base64 не обходится. Это не
+# криптография: вся она живёт в `wakode-auth`.
+base64.workspace = true
 chrono-tz.workspace = true
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["rt", "net"] }
@@ -18,7 +21,6 @@ wakode-core.workspace = true
 wakode-store.workspace = true
 
 [dev-dependencies]
-base64.workspace = true
 http-body-util = "0.1"
 serde_json.workspace = true
 tempfile.workspace = true
