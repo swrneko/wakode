@@ -1,5 +1,5 @@
 use wakode_auth::{ApiKeyValue, MasterKey};
-use wakode_store::{KeyRepo, NewApiKey, SqliteStore, UserRepo};
+use wakode_store::{KeyRepo, NewApiKey, Revocation, SqliteStore, UserRepo};
 
 pub async fn issue(
     store: &SqliteStore,
@@ -39,11 +39,15 @@ pub async fn issue(
 }
 
 pub async fn revoke(store: &SqliteStore, id: uuid::Uuid) -> anyhow::Result<()> {
-    // Отзыв несуществующего ключа отказом не считается: `revoke_key`
-    // обновляет строку по идентификатору, и ноль затронутых строк здесь
-    // неотличим от повторного отзыва. Различать их пришлось бы ради
-    // сообщения, которое ничего не меняет.
-    store.revoke_key(id).await?;
-    println!("отозван {id}");
+    // Три исхода, а не «готово» на всё подряд. Опечатка в идентификаторе —
+    // самый вероятный способ ошибиться в этой подкоманде, и отвечать на неё
+    // «отозван» значит отпустить владельца чинить утечку ключа, который
+    // продолжает работать. Повторный отзыв при этом остаётся успехом:
+    // ретрай не должен выглядеть отказом.
+    match store.revoke_key(id).await? {
+        Revocation::Done => println!("отозван {id}"),
+        Revocation::AlreadyRevoked => println!("{id} уже был отозван"),
+        Revocation::NoSuchKey => anyhow::bail!("нет ключа {id}"),
+    }
     Ok(())
 }

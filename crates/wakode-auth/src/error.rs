@@ -23,6 +23,9 @@ pub enum AuthError {
 
     #[error("не удалось посчитать хеш пароля")]
     PasswordHashFailed,
+
+    #[error("пароль короче {minimum} символов")]
+    PasswordTooShort { minimum: usize },
 }
 
 pub type AuthResult<T> = Result<T, AuthError>;

@@ -43,12 +43,38 @@ fn hasher() -> Argon2<'static> {
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
 }
 
+/// Нижняя граница длины пароля, в символах.
+///
+/// Восемь — не гигиена ради гигиены: этим паролем открывается учётная
+/// запись на инстансе, который смотрит наружу. Верхней границы нет: argon2
+/// длинный ввод переваривает, а на HTTP-входе длину тела и так ограничивает
+/// axum.
+///
+/// Считаются **символы, а не байты**: порог обещан пользователю в символах,
+/// и на кириллическом пароле байтовая длина вдвое больше — граница уехала
+/// бы туда, где её никто не ждёт.
+pub const MIN_PASSWORD_CHARS: usize = 8;
+
 /// Посчитать хеш пароля.
 ///
 /// Возвращается PHC-строка: она самоописывающая — соль и параметры лежат
 /// внутри неё, поэтому хранилищу достаточно одной колонки, а смена
 /// параметров не требует миграции.
+///
+/// **Порог длины проверяется здесь, а не у вызывающих.** Проверка у входа
+/// повторяется столько раз, сколько входов: экран первичной настройки,
+/// `wakode user create`, смена пароля в 3b, регистрация в 3b. Одного
+/// забытого входа хватает, чтобы инвариант перестал существовать — и это
+/// уже случилось: до этой правки CLI заводил администратора с паролем «1»,
+/// пока HTTP требовал восьми символов. Единственная дверь к хешу одна, и
+/// проверка стоит в ней.
 pub fn hash_password(password: &str) -> AuthResult<String> {
+    if password.chars().count() < MIN_PASSWORD_CHARS {
+        return Err(AuthError::PasswordTooShort {
+            minimum: MIN_PASSWORD_CHARS,
+        });
+    }
+
     let salt = SaltString::generate(&mut OsRng);
     hasher()
         .hash_password(password.as_bytes(), &salt)
@@ -123,7 +149,7 @@ mod tests {
         // Параметр по умолчанию, но зафиксированный: argon2i и argon2d
         // слабее против разных классов атак, и молчаливая смена варианта
         // при обновлении крейта должна ронять тест.
-        let hash = hash_password("любой").unwrap();
+        let hash = hash_password("любой пароль подлиннее").unwrap();
         assert!(hash.starts_with("$argon2id$"), "получили {hash}");
 
         // Стоимость проверяется на двух уровнях, и оба нужны.
@@ -187,12 +213,49 @@ mod tests {
         // ошибки. Сверять с ней нечего: такой хеш не откроется ничем и
         // никогда, и отвечать на него «пароль не подошёл» значит прятать
         // поломку данных под обычное событие.
-        let full = hash_password("любой").unwrap();
+        let full = hash_password("любой пароль подлиннее").unwrap();
         let without_digest = &full[..full.rfind('$').unwrap()];
 
         assert!(matches!(
-            verify_password("любой", without_digest),
+            verify_password("любой пароль подлиннее", without_digest),
             Err(AuthError::PasswordHashMalformed)
         ));
+    }
+
+    #[test]
+    fn a_short_password_is_refused_before_it_is_hashed() {
+        // Порог живёт здесь, а не у вызывающих: входов к хешу несколько
+        // (экран первичной настройки, `wakode user create`, регистрация и
+        // смена пароля в 3b), и одного забытого хватает, чтобы инварианта
+        // не стало. Это не гипотеза: CLI заводил администратора с паролем
+        // «1», пока HTTP требовал восьми символов.
+        assert!(matches!(
+            hash_password("1234567"),
+            Err(AuthError::PasswordTooShort { minimum: 8 })
+        ));
+        assert!(hash_password("12345678").is_ok(), "ровно порог — годится");
+    }
+
+    #[test]
+    fn the_threshold_counts_characters_not_bytes() {
+        // Восемь кириллических символов — шестнадцать байт. Проверка по
+        // `len()` пропустила бы пароль вдвое короче обещанного, и граница
+        // уехала бы туда, где её никто не ждёт.
+        let eight_cyrillic = "паролище";
+        assert_eq!(eight_cyrillic.chars().count(), 8);
+        assert_eq!(eight_cyrillic.len(), 16);
+        assert!(hash_password(eight_cyrillic).is_ok());
+
+        let seven_cyrillic = "паролищ";
+        assert_eq!(seven_cyrillic.chars().count(), 7);
+        assert!(hash_password(seven_cyrillic).is_err(), "семь символов приняты");
+    }
+
+    #[test]
+    fn the_threshold_is_pinned_by_a_literal() {
+        // Литерал намеренно: проверка, читающая ту же константу, что и код,
+        // двигалась бы вместе с ней и ослабление пропустила. Порог, а не
+        // равенство — усиление правильное изменение.
+        assert!(MIN_PASSWORD_CHARS >= 8, "порог длины пароля ослаблен");
     }
 }

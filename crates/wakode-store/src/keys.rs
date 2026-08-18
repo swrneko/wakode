@@ -193,6 +193,24 @@ pub fn first_api_key(conn: &Connection) -> StoreResult<Option<ApiKey>> {
     }))
 }
 
+/// Чем кончился отзыв.
+///
+/// Три исхода, а не два, потому что «ключа нет» и «ключ уже был отозван» —
+/// разные события для того, кто отзывает. Второе — обычное дело (ретрай,
+/// двойной клик), первое почти всегда опечатка в идентификаторе. Слив их в
+/// одно «готово», мы отвечали бы «отозван» на опечатку, и владелец,
+/// отзывающий утёкший ключ, считал бы инцидент закрытым, пока ключ
+/// продолжает работать.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Revocation {
+    /// Ключ был действующим, теперь отозван.
+    Done,
+    /// Ключ существует и был отозван раньше. `revoked_at` не тронут.
+    AlreadyRevoked,
+    /// Ключа с таким идентификатором в базе нет.
+    NoSuchKey,
+}
+
 /// Отозвать ключ.
 ///
 /// `AND revoked_at IS NULL` в запросе — не лишнее условие: повторный отзыв
@@ -200,12 +218,35 @@ pub fn first_api_key(conn: &Connection) -> StoreResult<Option<ApiKey>> {
 /// временем, иначе «когда ключ отозвали» превратится в «когда его в
 /// последний раз пытались отозвать». Повтор — обычное дело: ретрай HTTP,
 /// двойной клик в настройках.
-pub fn revoke_key(conn: &Connection, id: Uuid) -> StoreResult<()> {
-    conn.execute(
+///
+/// Второй запрос делается только когда первый не тронул ни одной строки,
+/// то есть на редком пути: различить «нет такого» и «уже отозван» иначе
+/// нечем, а платить за это на успешном отзыве незачем.
+pub fn revoke_key(conn: &Connection, id: Uuid) -> StoreResult<Revocation> {
+    let blob = uuid_to_blob(id);
+
+    let changed = conn.execute(
         "UPDATE api_keys SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
-        rusqlite::params![uuid_to_blob(id), clock::now().get()],
+        rusqlite::params![blob, clock::now().get()],
     )?;
-    Ok(())
+    if changed > 0 {
+        return Ok(Revocation::Done);
+    }
+
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM api_keys WHERE id = ?1",
+            rusqlite::params![blob],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+
+    Ok(if exists {
+        Revocation::AlreadyRevoked
+    } else {
+        Revocation::NoSuchKey
+    })
 }
 
 pub fn touch_key_used(conn: &Connection, id: Uuid) -> StoreResult<()> {
@@ -388,5 +429,38 @@ mod tests {
             assert!(dump.contains(crate::REDACTED), "заглушки не видно: {dump}");
             assert!(dump.contains("ноутбук"), "имя ключа прятать не надо: {dump}");
         }
+    }
+
+    #[test]
+    fn revoking_tells_the_three_cases_apart() {
+        // «Ключа нет» и «уже отозван» — разные события для того, кто
+        // отзывает. Пока `revoke_key` возвращала `()`, ноль затронутых
+        // строк был неотличим от успеха, и CLI отвечал «отозван» на
+        // опечатку в идентификаторе: владелец, отзывающий утёкший ключ,
+        // считал инцидент закрытым, пока ключ продолжал работать.
+        let mut conn = open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        let user = a_user_id(&conn);
+
+        let key = insert_api_key(
+            &conn,
+            &NewApiKey {
+                user_id: user,
+                name: "ноутбук".to_owned(),
+                key_encrypted: ENCRYPTED.to_vec(),
+                key_lookup: LOOKUP.to_vec(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(revoke_key(&conn, key.id).unwrap(), Revocation::Done);
+        assert_eq!(
+            revoke_key(&conn, key.id).unwrap(),
+            Revocation::AlreadyRevoked
+        );
+        assert_eq!(
+            revoke_key(&conn, Uuid::now_v7()).unwrap(),
+            Revocation::NoSuchKey
+        );
     }
 }

@@ -8,7 +8,7 @@ use wakode_core::{Heartbeat, Micros};
 use crate::error::StoreResult;
 use crate::heartbeats::{IncomingHeartbeat, InsertReport};
 use crate::interner::Interner;
-use crate::keys::{ApiKey, NewApiKey};
+use crate::keys::{ApiKey, NewApiKey, Revocation};
 use crate::sessions::{NewSession, Session};
 use crate::users::{NewUser, User};
 use crate::writer::{spawn_writer, WriteHandle};
@@ -48,7 +48,7 @@ pub trait UserRepo: Send + Sync {
 pub trait KeyRepo: Send + Sync {
     fn create_key(&self, new: NewApiKey) -> impl std::future::Future<Output = StoreResult<ApiKey>> + Send;
     fn key_by_lookup(&self, lookup: Vec<u8>) -> impl std::future::Future<Output = StoreResult<Option<ApiKey>>> + Send;
-    fn revoke_key(&self, id: Uuid) -> impl std::future::Future<Output = StoreResult<()>> + Send;
+    fn revoke_key(&self, id: Uuid) -> impl std::future::Future<Output = StoreResult<Revocation>> + Send;
     fn first_key(&self) -> impl std::future::Future<Output = StoreResult<Option<ApiKey>>> + Send;
 }
 
@@ -235,7 +235,7 @@ impl KeyRepo for SqliteStore {
         on_own_connection(self, move |conn| crate::find_key_by_lookup(&conn, &lookup)).await
     }
 
-    async fn revoke_key(&self, id: Uuid) -> StoreResult<()> {
+    async fn revoke_key(&self, id: Uuid) -> StoreResult<Revocation> {
         on_own_connection(self, move |conn| crate::revoke_key(&conn, id)).await
     }
 

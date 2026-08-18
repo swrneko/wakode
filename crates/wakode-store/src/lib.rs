@@ -29,7 +29,7 @@ pub use dirty::dirty_days_for;
 pub use error::{StoreError, StoreResult};
 pub use heartbeats::{insert_heartbeats, load_heartbeats, IncomingHeartbeat, InsertReport, Outcome};
 pub use interner::Interner;
-pub use keys::{find_key_by_lookup, first_api_key, insert_api_key, revoke_key, touch_key_used, ApiKey, NewApiKey};
+pub use keys::{find_key_by_lookup, first_api_key, insert_api_key, revoke_key, touch_key_used, ApiKey, NewApiKey, Revocation};
 pub use migrate::{migrate, schema_version};
 pub use repo::{HeartbeatRepo, KeyRepo, SessionRepo, SqliteStore, UserRepo};
 pub use sessions::{find_session_by_token_hash, insert_session, revoke_session, NewSession, Session};

@@ -464,10 +464,25 @@ fn backup_produces_a_readable_copy() {
 
 #[test]
 fn serve_comes_up_and_answers() {
-    // Единственный тест, который доказывает, что бинарь вообще слушает.
+    // Единственная пара тестов, доказывающая, что бинарь вообще слушает.
     // Всё остальное здесь запускает подкоманды, которые завершаются, — и
     // `serve`, потерявшая `bind` или вызов `wakode_api::serve`, выглядела
     // бы снаружи ровно так же: процесс, который «стартовал».
+    serve_answers(&["serve"]);
+}
+
+#[test]
+fn no_subcommand_means_serve() {
+    // `cli/mod.rs` обещает «подразумевается, если подкоманда не указана»,
+    // и это обещание не держалось ничем: `unwrap_or(Command::Serve)`,
+    // заменённый на любую другую ветку, проходил весь набор зелёным.
+    // Именно в этой форме бинарь и запускают из systemd —
+    // `ExecStart=/usr/bin/wakode --config /etc/wakode.toml`.
+    serve_answers(&[]);
+}
+
+/// Поднять бинарь с заданным хвостом аргументов и дождаться `/healthz`.
+fn serve_answers(tail: &[&str]) {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("wakode.toml");
 
@@ -489,9 +504,12 @@ fn serve_comes_up_and_answers() {
     )
     .unwrap();
 
+    let mut args = vec!["--config".to_owned(), config.to_str().unwrap().to_owned()];
+    args.extend(tail.iter().map(|arg| (*arg).to_owned()));
+
     let mut child = Killed(
         wakode()
-            .args(["--config", config.to_str().unwrap(), "serve"])
+            .args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -672,6 +690,94 @@ fn key_revoke_marks_the_key() {
     let conn = wakode_store::open(&db).unwrap();
     let stored = wakode_store::first_api_key(&conn).unwrap().unwrap();
     assert!(stored.revoked_at.is_some(), "отзыв не записан");
+    let revoked_at = stored.revoked_at;
+    drop(conn);
+
+    // Повтор — успех, и время отзыва не переписывается. Ретрай и двойной
+    // клик в настройках обязаны быть безобидными.
+    let again = revoke(&config, &master, &id.to_string());
+    assert!(again.status.success(), "повторный отзыв объявлен отказом");
+    assert!(
+        String::from_utf8_lossy(&again.stdout).contains("уже был отозван"),
+        "повтор неотличим от первого отзыва: {}",
+        String::from_utf8_lossy(&again.stdout)
+    );
+
+    let conn = wakode_store::open(&db).unwrap();
+    assert_eq!(
+        wakode_store::first_api_key(&conn).unwrap().unwrap().revoked_at,
+        revoked_at,
+        "повторный отзыв переписал время: «когда отозвали» стало «когда в последний раз пытались»"
+    );
+}
+
+#[test]
+fn revoking_a_key_that_does_not_exist_is_a_failure_not_a_shrug() {
+    // Опечатка в UUID — самый вероятный способ ошибиться в этой
+    // подкоманде. Пока ответом было «отозван», владелец, отзывающий
+    // утёкший ключ, считал инцидент закрытым, а ключ продолжал работать.
+    let (_dir, config, master) = a_setup();
+    assert!(
+        create_user(&config, "swrneko", "достаточно длинный пароль")
+            .status
+            .success()
+    );
+
+    let stranger = uuid::Uuid::now_v7().to_string();
+    let output = revoke(&config, &master, &stranger);
+
+    assert!(
+        !output.status.success(),
+        "отзыв несуществующего ключа объявлен успехом"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&stranger),
+        "в отказе нет идентификатора, по которому искать опечатку: {stderr}"
+    );
+}
+
+/// Отозвать ключ по идентификатору.
+fn revoke(config: &std::path::Path, master: &str, id: &str) -> std::process::Output {
+    wakode()
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "key",
+            "revoke",
+            "--id",
+            id,
+        ])
+        .env("WAKODE_MASTER_KEY", master)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn a_short_password_is_refused_by_the_cli_too() {
+    // Один инвариант, два входа. Пока порог стоял только в HTTP-экране,
+    // `wakode user create` заводил администратора с паролем «1» — и
+    // владелец, воспользовавшийся CLI вместо экрана, получал ровно то, от
+    // чего экран его берёг.
+    let (dir, config, _) = a_setup();
+
+    let output = create_user(&config, "слабый", "1234567");
+    assert!(!output.status.success(), "семисимвольный пароль принят");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("короче"),
+        "причина не названа: {stderr}"
+    );
+
+    // И пользователя не осталось: отказ обязан быть до записи.
+    let conn = wakode_store::open(&dir.path().join("wakode.db")).unwrap();
+    assert!(
+        wakode_store::find_user_by_login(&conn, "слабый")
+            .unwrap()
+            .is_none(),
+        "пользователь со слабым паролем всё-таки заведён"
+    );
 }
 
 #[test]
