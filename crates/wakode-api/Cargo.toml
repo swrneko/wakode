@@ -22,5 +22,5 @@ base64.workspace = true
 http-body-util = "0.1"
 serde_json.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }
 tower = { workspace = true, features = ["util"] }

@@ -15,10 +15,18 @@ pub use state::AppState;
 use axum::routing::get;
 use axum::Router;
 
+/// Собрать маршрутизатор.
+///
+/// `method_not_allowed_fallback` ставится **после** всех `route`: он
+/// раздаёт запасной обработчик уже зарегистрированным маршрутам, и
+/// маршрут, добавленный ниже, останется с пустым `405` axum'а. Обещание
+/// «тело всегда JSON» держится порядком этих строк, а не типом, поэтому
+/// новые маршруты добавляются выше, а не ниже.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health::healthz))
         .fallback(|| async { ApiError::NotFound })
+        .method_not_allowed_fallback(|| async { ApiError::MethodNotAllowed })
         .with_state(state)
 }
 
