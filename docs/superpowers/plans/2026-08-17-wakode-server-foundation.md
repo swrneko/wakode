@@ -3283,6 +3283,16 @@ git commit -m "feat(api): опознание пользователя по се�
 
 **После первого пользователя эндпоинт закрывается навсегда** — независимо от `registration`. Регистрация обычных пользователей появится в 3b; здесь только администратор.
 
+**Адрес проверяется раньше базы, а не наоборот.** Проверка адреса авторизационная: чужой запрос не должен гонять сервер в базу. Побочно это закрывает оракул — чужой получает один и тот же ответ на настроенном и на ненастроенном инстансе. Цена: владелец за прокси на уже настроенном инстансе услышит про адрес, а не про «уже выполнена»; рядом есть публичный `/api/setup/status`, который отвечает на второй вопрос.
+
+**Тело берётся как `Result<Json<SetupRequest>, JsonRejection>`, а не распакованным `Json`.** С распакованным экстрактор отрабатывает до первой строки функции, и это два дефекта сразу: кривое тело уезжает `text/plain`-ом мимо `ApiError`, ломая обещание «тело всегда JSON», а чужой с кривым телом получает `400` про формат вместо `403`. Оба случая были красными до правки.
+
+**Порог пароля считается в символах, а не в байтах.** `len()` пропустил бы кириллический пароль из шести символов — в UTF-8 это двенадцать байт. Логин `trim`-ится и сохраняется обрезанным: логин со случайным пробелом иначе навсегда недостижим с формы входа, а экран настройки к тому моменту уже закрыт.
+
+**Гонка названа, а не закрыта.** Два одновременных запроса оба видят `user_count() == 0`, и администраторов заводится два. Окно узкое и требует петлевого доступа. Закрытие потребовало бы единой транзакции «посчитать и создать», то есть нового метода в `wakode-store`: `create_user` идёт своим соединением мимо очереди записи.
+
+**Настройки состояния — именная структура `AppSettings`, а не пять позиционных аргументов.** `registration` и `setup_from_any_address` — два соседних `bool`, и перестановку их местами компилятор не поймает никогда. Цена такой перестановки у владельца, включившего регистрацию: экран первичной настройки открыт всему интернету, пока в базе нет пользователей.
+
 - [ ] **Step 1: Написать падающие тесты**
 
 ```rust
@@ -3564,17 +3574,30 @@ pub async fn setup(
 - [ ] **Step 4: Прогнать**
 
 Run: `cargo test -p wakode-api`
-Expected: PASS, двадцать один тест.
+Expected: PASS, 53 интеграционных теста и 2 юнит-теста в `session.rs`.
 
 - [ ] **Step 5: Мутационная проверка**
 
 | Мутация | Обязан упасть |
 |---|---|
-| убрать проверку `user_count() > 0` | `setup_closes_forever_after_the_first_user` |
-| убрать проверку петлевого адреса | `setup_from_a_foreign_address_is_refused_by_default` |
-| проверку заменить на «запрещать всегда» | `a_foreign_address_is_allowed_when_the_owner_says_so` |
-| `is_admin: false` | `setup_from_loopback_creates_the_first_admin` |
-| `password_hash: request.password` | `setup_from_loopback_creates_the_first_admin` |
+| убрать проверку `user_count() > 0` | `setup_closes_forever_after_the_first_user`, `setup_closes_even_when_registration_is_open` |
+| убрать проверку петлевого адреса | `setup_from_a_foreign_address_is_refused_by_default` и ещё два |
+| проверку адреса заменить на «запрещать всегда» | `a_foreign_address_is_allowed_when_the_owner_says_so` |
+| игнорировать `setup_from_any_address` | тот же |
+| петлевым считать ровно `127.0.0.1` | `an_ipv6_loopback_is_loopback_too` |
+| проверять базу раньше адреса (порядок исходного плана) | `the_address_is_checked_before_the_database` |
+| `is_admin: true` → `false` | `setup_from_loopback_creates_the_first_admin` |
+| `password_hash: request.password` | тот же и `the_created_password_verifies` |
+| `password_hash: "мусор"` | `the_created_password_verifies` |
+| порог пароля в байтах вместо символов | `the_password_threshold_counts_characters_not_bytes` |
+| `<` → `<=` на пороге пароля | `a_password_of_exactly_the_minimum_length_is_accepted` |
+| убрать `trim` логина | `an_empty_login_is_refused`, `a_login_is_stored_without_its_stray_spaces` |
+| таймзону разбирать через `unwrap_or(Tz::UTC)` | `a_bad_timezone_is_a_bad_request_not_a_500` |
+| в текст про таймзону подставить пароль | тот же |
+| подменить текст «первичная настройка уже выполнена» | `setup_closes_forever_after_the_first_user` |
+| распакованный `Json<SetupRequest>` вместо `Result<..>` | `a_broken_body_is_a_json_error_not_a_bare_400`, `a_foreign_address_is_refused_before_the_body_is_even_read` |
+| маршрут `/api/setup` ниже `method_not_allowed_fallback` | `a_wrong_method_on_setup_is_a_json_error_too` |
+| `into_make_service()` вместо `into_make_service_with_connect_info` | `setup_over_a_real_socket_sees_the_client_address` — **закрывает парковку задачи 9** |
 
 - [ ] **Step 6: Коммит**
 
