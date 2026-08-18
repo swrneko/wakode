@@ -28,3 +28,6 @@ serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }
 tower = { workspace = true, features = ["util"] }
+# Только ради тестов журнала: они читают то, что подписчик действительно
+# напечатал, — иначе «в лог не попадает» проверялось бы рассуждением.
+tracing-subscriber.workspace = true

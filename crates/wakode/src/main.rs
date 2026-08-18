@@ -9,6 +9,19 @@ use config::Config;
 /// в которую задача 14 добавит разбор подкоманд, не переписывая всё.
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Без подписчика события `tracing` никуда не идут: макросы
+    // отрабатывают вхолостую. Перечислены именно те цели, которые сегодня
+    // что-то пишут, — сам бинарь, `wakode_api` и `tower_http`, на котором
+    // держится журнал запросов. Список — белый: крейт, который начнёт
+    // писать под своей целью, придётся добавить сюда, иначе он будет молчать.
+    // `RUST_LOG` перекрывает всё целиком.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "wakode=info,wakode_api=info,tower_http=info".into()),
+        )
+        .init();
+
     let config = match Config::load(None) {
         Ok(config) => config,
         Err(err) => {

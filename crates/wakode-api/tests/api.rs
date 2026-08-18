@@ -1565,3 +1565,312 @@ async fn setup_closes_even_when_registration_is_open() {
     let second = setup_from(state, "127.0.0.1:54322", setup_body("второй")).await;
     assert_eq!(second.status(), StatusCode::FORBIDDEN);
 }
+
+/// Текст паники: он обязан оказаться в журнале и не оказаться у клиента.
+const PANIC_TEXT: &str = "нарочно";
+
+/// Паника с полезной нагрузкой `&'static str` — так выглядит `panic!` с
+/// литералом, `unwrap` на `None` и `assert!` без сообщения. Литерал
+/// повторяет `PANIC_TEXT` буквально: `panic!` с подстановкой дал бы уже
+/// `String`, то есть другую ветку `handle_panic`.
+async fn panics_with_a_str() -> &'static str {
+    panic!("нарочно")
+}
+
+/// Паника с полезной нагрузкой `String` — так выглядит любой `panic!` с
+/// подстановкой, включая `unwrap` на `Err`. Два маршрута, потому что
+/// `handle_panic` разбирает эти два случая разными ветками, и с одним
+/// маршрутом вторая ветка была бы украшением.
+async fn panics_with_a_string() -> &'static str {
+    panic!("{PANIC_TEXT} и с подстановкой")
+}
+
+/// Маршруты, которые паникуют, и соседний, который нет.
+///
+/// Состояние сюда не заводится: перехват паники и журналирование до
+/// хранилища не дотягиваются, а лишний `SqliteStore` в тесте только
+/// создавал бы впечатление, что дотягиваются.
+fn app_that_panics() -> axum::Router {
+    wakode_api::with_layers(
+        axum::Router::new()
+            .route("/взрыв", axum::routing::get(panics_with_a_str))
+            .route("/взрыв-строкой", axum::routing::get(panics_with_a_string))
+            .route("/жив", axum::routing::get(|| async { "да" })),
+    )
+}
+
+/// Писатель журнала в память: `tracing_subscriber` берёт по писателю на
+/// каждое событие, поэтому буфер общий и под замком.
+struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Выполнить запрос и вернуть ответ вместе с тем, что за это время
+/// напечатал журнал.
+///
+/// Подписчик ставится через `set_default`, а не `init`: он глобальный на
+/// весь тестовый бинарь, а тесты бегут параллельно — общий подписчик
+/// смешал бы вывод соседей и сделал бы проверки «в журнале нет секрета»
+/// случайными. `set_default` действует на текущий поток, а `#[tokio::test]`
+/// без `flavor = "multi_thread"` крутит будущее на нём же, так что запрос
+/// проходит под этим подписчиком.
+///
+/// Уровень `TRACE` — чтобы проверять содержимое строк, а не отсечку по
+/// уровню; для отсечки есть `response_and_log_at`.
+async fn response_and_log(app: axum::Router, request: Request<Body>) -> (Response, String) {
+    response_and_log_at(tracing::Level::TRACE, app, request).await
+}
+
+/// То же, но с заданным потолком уровня: так проверяется, что запись
+/// вообще переживёт боевой фильтр, а не только что в ней нет лишнего.
+async fn response_and_log_at(
+    level: tracing::Level,
+    app: axum::Router,
+    request: Request<Body>,
+) -> (Response, String) {
+    let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_ansi(false)
+        .with_writer({
+            let buffer = buffer.clone();
+            move || LogBuffer(buffer.clone())
+        })
+        .finish();
+
+    let response = {
+        let _guard = tracing::subscriber::set_default(subscriber);
+        app.oneshot(request).await.unwrap()
+    };
+
+    let log = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    (response, log)
+}
+
+#[tokio::test]
+async fn a_panicking_handler_becomes_a_500() {
+    let app = app_that_panics();
+
+    let response = app
+        .oneshot(Request::builder().uri("/взрыв").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn the_process_survives_a_panicking_handler() {
+    // Отдельно от предыдущего: 500 могла бы прийти и от упавшей задачи.
+    // Здесь проверяется, что после паники сервер продолжает отвечать.
+    let app = app_that_panics();
+
+    let _ = app
+        .clone()
+        .oneshot(Request::builder().uri("/взрыв").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(Request::builder().uri("/жив").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn the_panic_response_is_json_like_every_other_error() {
+    let app = app_that_panics();
+
+    let response = app
+        .oneshot(Request::builder().uri("/взрыв").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    let json = json_body(response).await;
+    assert!(json.get("error").is_some(), "тело не JSON с error: {json}");
+    assert!(
+        !json.to_string().contains("нарочно"),
+        "текст паники уехал клиенту: {json}"
+    );
+}
+
+/// Значение, которое клиент присылает как ключ. В журнале ему не место ни
+/// в каком виде: `api_key` в открытом тексте равносилен самому ключу.
+const SECRET_KEY: &str = "waka_00000000-1111-2222-3333-444444444444";
+
+#[tokio::test]
+async fn the_query_string_never_reaches_the_log() {
+    // `?api_key=…` — штатный способ прислать ключ у совместимых клиентов.
+    // `DefaultMakeSpan` из `TraceLayer::new_for_http()` пишет поле `uri`
+    // целиком, вместе с query-строкой, то есть кладёт ключ в журнал
+    // открытым текстом.
+    let app = wakode_api::with_layers(
+        axum::Router::new().route("/тихо", axum::routing::get(|| async { "да" })),
+    );
+
+    let (response, log) = response_and_log(
+        app,
+        Request::builder()
+            .uri(format!("/тихо?api_key={SECRET_KEY}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // Без этого проверка «секрета нет» проходила бы и на журнале, который
+    // не пишет ничего вообще.
+    assert!(
+        log.contains("/тихо"),
+        "запрос не журналируется вовсе, проверять нечего:\n{log}"
+    );
+    assert!(
+        !log.contains(SECRET_KEY),
+        "ключ из query-строки попал в журнал:\n{log}"
+    );
+}
+
+#[tokio::test]
+async fn the_authorization_header_never_reaches_the_log() {
+    // Второй путь того же ключа: совместимые клиенты шлют его схемой
+    // `Basic` в base64. Base64 — не шифрование, в журнале это тот же ключ
+    // открытым текстом, поэтому проверяется и предъявленное значение, и
+    // сам ключ.
+    let credentials = STANDARD.encode(SECRET_KEY);
+    let app = wakode_api::with_layers(
+        axum::Router::new().route("/тихо", axum::routing::get(|| async { "да" })),
+    );
+
+    let (response, log) = response_and_log(
+        app,
+        Request::builder()
+            .uri("/тихо")
+            .header("authorization", format!("Basic {credentials}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        log.contains("/тихо"),
+        "запрос не журналируется вовсе, проверять нечего:\n{log}"
+    );
+    assert!(
+        !log.contains(&credentials),
+        "заголовок `Authorization` попал в журнал:\n{log}"
+    );
+    assert!(
+        !log.contains(SECRET_KEY),
+        "ключ из заголовка попал в журнал:\n{log}"
+    );
+}
+
+#[tokio::test]
+async fn a_panic_message_reaches_the_log_but_not_the_client() {
+    // Половина «не уехало клиенту» выполняется и реализацией, которая молчит
+    // вообще: владелец получил бы `500` без единой зацепки о причине.
+    // Обе полезные нагрузки паники проверяются здесь же — `handle_panic`
+    // разбирает их разными ветками.
+    for path in ["/взрыв", "/взрыв-строкой"] {
+        let (response, log) = response_and_log(
+            app_that_panics(),
+            Request::builder().uri(path).body(Body::empty()).unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            log.contains(PANIC_TEXT),
+            "текста паники нет в журнале ({path}):\n{log}"
+        );
+
+        let json = json_body(response).await;
+        assert!(
+            !json.to_string().contains(PANIC_TEXT),
+            "текст паники уехал клиенту ({path}): {json}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_panicking_request_is_journalled_as_a_completed_500() {
+    // Порядок слоёв: `TraceLayer` снаружи `CatchPanicLayer`, и держится он
+    // только тем, в каком порядке написаны вызовы `layer`. Если перевернуть,
+    // паника пойдёт вверх мимо журнала: запись о ней потеряет контекст
+    // запроса, а строки о завершении с кодом не будет вовсе — владелец
+    // увидит панику без единого признака, какой запрос её вызвал.
+    let (_, log) = response_and_log(
+        app_that_panics(),
+        Request::builder().uri("/взрыв").body(Body::empty()).unwrap(),
+    )
+    .await;
+
+    let about_the_panic = log
+        .lines()
+        .find(|line| line.contains("паника в обработчике"))
+        .unwrap_or_else(|| panic!("нет записи о панике:\n{log}"));
+    assert!(
+        about_the_panic.contains("/взрыв"),
+        "запись о панике вне контекста запроса: {about_the_panic}"
+    );
+    assert!(
+        log.contains("status=500"),
+        "завершение запроса не журналируется:\n{log}"
+    );
+}
+
+#[tokio::test]
+async fn the_real_router_journals_a_request_without_its_query() {
+    // Всё остальное про журнал проверяется на своих маршрутах через
+    // `with_layers`. Здесь проверяется проводка: боевой `router` эти слои
+    // тоже несёт, а не собирается голым.
+    let dir = tempfile::tempdir().unwrap();
+
+    let (response, log) = response_and_log(
+        router(a_state(&dir)),
+        Request::builder()
+            .uri(format!("/healthz?api_key={SECRET_KEY}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        log.contains("/healthz"),
+        "запрос к боевому маршрутизатору не журналируется:\n{log}"
+    );
+    assert!(!log.contains(SECRET_KEY), "ключ попал в журнал:\n{log}");
+}
+
+#[tokio::test]
+async fn a_finished_request_is_journalled_at_info() {
+    // Умолчание `tower-http` — `DEBUG`, а бинарь фильтрует по `info`: со
+    // слоем на месте журнал запросов оказался бы пуст, и владелец увидел бы
+    // тишину, неотличимую от «сервер не получает запросов».
+    let (_, log) = response_and_log_at(
+        tracing::Level::INFO,
+        wakode_api::with_layers(
+            axum::Router::new().route("/тихо", axum::routing::get(|| async { "да" })),
+        ),
+        Request::builder().uri("/тихо").body(Body::empty()).unwrap(),
+    )
+    .await;
+
+    assert!(
+        log.contains("/тихо") && log.contains("status=200"),
+        "на уровне info о запросе не написано ничего:\n{log}"
+    );
+}
