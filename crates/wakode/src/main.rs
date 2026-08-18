@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod signal;
 mod startup;
 
 use std::process::ExitCode;
