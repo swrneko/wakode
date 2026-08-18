@@ -100,7 +100,13 @@ impl From<wakode_store::StoreError> for ApiError {
             // `500` на «такой логин занят» значило бы отправить
             // пользователя писать владельцу вместо того, чтобы выбрать
             // другой логин.
-            StoreError::LoginTaken(_) => ApiError::Conflict("такой логин уже занят"),
+            StoreError::LoginTaken(login) => {
+                // В журнал — предупреждением, а не молчанием: конфликт
+                // логинов на инстансе с открытой регистрацией владельцу
+                // видеть полезно, а `error!` для него слишком громко.
+                tracing::warn!(%login, "логин занят");
+                ApiError::Conflict("такой логин уже занят")
+            }
             StoreError::LoginEmpty => ApiError::BadRequest("логин пуст".to_owned()),
             err => {
                 tracing::error!(error = %err, "ошибка хранилища");

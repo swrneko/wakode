@@ -322,6 +322,29 @@ async fn a_full_write_queue_is_a_retryable_503_not_a_500() {
 }
 
 #[tokio::test]
+async fn a_login_conflict_is_a_409_and_an_empty_login_a_400() {
+    // Оба варианта сегодня недостижимы через HTTP: в `setup` логин уже
+    // проверен, а `user_count > 0` отсекает дубликат. Регистрация из плана
+    // 3b упрётся ровно сюда, и отвечать ей `500` на «такой логин занят»
+    // значило бы отправить пользователя писать владельцу вместо того,
+    // чтобы выбрать другой логин. Отображение держалось ни на чём —
+    // мутация «убрать обе ветки» проходила весь набор зелёной.
+    let taken = ApiError::from(StoreError::LoginTaken("swrneko".to_owned())).into_response();
+    assert_eq!(taken.status(), StatusCode::CONFLICT);
+    let json = json_body(taken).await;
+    assert!(json.get("error").is_some(), "тело не JSON с error: {json}");
+    assert!(
+        !json.to_string().contains("swrneko"),
+        "логин уехал клиенту: {json}"
+    );
+
+    let empty = ApiError::from(StoreError::LoginEmpty).into_response();
+    assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+    let json = json_body(empty).await;
+    assert!(json.get("error").is_some(), "тело не JSON с error: {json}");
+}
+
+#[tokio::test]
 async fn serve_actually_answers_on_a_real_socket() {
     // Единственный тест, который проходит через настоящий сокет. Всё
     // остальное здесь зовёт `router` напрямую через `oneshot`, поэтому
