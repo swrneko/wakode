@@ -1514,3 +1514,20 @@ async fn the_password_threshold_counts_characters_not_bytes() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn setup_closes_even_when_registration_is_open() {
+    // Комментарий в `setup.rs` обещает, что закрытие не зависит от
+    // `registration`: здесь заводится администратор, а не обычный аккаунт.
+    // Все остальные тесты настройки идут с выключенной регистрацией, и без
+    // этого обещание держалось бы только тем, что никто не написал
+    // `if !state.registration && count > 0`.
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(a_store(&dir), None, true, 30, false);
+
+    let first = setup_from(state.clone(), "127.0.0.1:54321", setup_body("первый")).await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    let second = setup_from(state, "127.0.0.1:54322", setup_body("второй")).await;
+    assert_eq!(second.status(), StatusCode::FORBIDDEN);
+}
