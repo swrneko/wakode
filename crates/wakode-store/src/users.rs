@@ -84,9 +84,43 @@ impl fmt::Debug for NewUser {
     }
 }
 
+/// Завести пользователя.
+///
+/// **Логин триммится и не может быть пустым, и проверка стоит здесь.** У
+/// создания пользователя две двери — экран первичной настройки и
+/// `wakode user create`, — а в плане 3b добавятся регистрация и правка
+/// профиля. Проверка у двери повторяется столько раз, сколько дверей, и
+/// одной забытой хватает, чтобы инварианта не стало. Это не гипотеза: до
+/// этой правки экран триммил и отвергал пустой, а CLI заводил
+/// пользователя с логином `"  админ  "`, которым потом нельзя было
+/// войти — форма входа триммит.
+///
+/// Тот же приём, что с порогом длины пароля в `wakode_auth::hash_password`:
+/// дверь к записи одна, проверка стоит в ней.
 pub fn insert_user(conn: &Connection, new: &NewUser) -> StoreResult<User> {
+    let login = new.login.trim();
+    if login.is_empty() {
+        return Err(StoreError::LoginEmpty);
+    }
+
     let id = Uuid::now_v7();
     let now = crate::clock::now();
+
+    // Нарушение уникальности логина — вина вызывающего, а не поломка
+    // хранилища, и наружу оно обязано уехать доменной ошибкой. Тип
+    // `StoreError` для того и заведён: «вызывающий не должен разбирать коды
+    // SQLite, чтобы понять, что произошло». Без этой ветки CLI печатал
+    // `база данных: UNIQUE constraint failed: users.login: Error code 2067`
+    // — то есть подавал занятый логин как отказ базы, да ещё языком, на
+    // котором в этом проекте не говорят.
+    let taken = |err: rusqlite::Error| match &err {
+        rusqlite::Error::SqliteFailure(code, _)
+            if code.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            StoreError::LoginTaken(login.to_owned())
+        }
+        _ => StoreError::from(err),
+    };
 
     conn.execute(
         "INSERT INTO users
@@ -95,7 +129,7 @@ pub fn insert_user(conn: &Connection, new: &NewUser) -> StoreResult<User> {
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
         rusqlite::params![
             uuid_to_blob(id),
-            new.login,
+            login,
             new.email,
             new.password_hash,
             new.display_name,
@@ -104,11 +138,12 @@ pub fn insert_user(conn: &Connection, new: &NewUser) -> StoreResult<User> {
             i64::from(new.is_admin),
             now.get(),
         ],
-    )?;
+    )
+    .map_err(taken)?;
 
     Ok(User {
         id,
-        login: new.login.clone(),
+        login: login.to_owned(),
         email: new.email.clone(),
         password_hash: new.password_hash.clone(),
         display_name: new.display_name.clone(),
@@ -320,5 +355,64 @@ mod tests {
             assert!(dump.contains("swrneko@example.org"), "почту прятать не надо: {dump}");
             assert!(dump.contains("Швырнеко"), "имя прятать не надо: {dump}");
         }
+    }
+
+    #[test]
+    fn a_login_is_trimmed_and_cannot_be_empty() {
+        // Инвариант живёт здесь, а не у дверей: дверей две сегодня
+        // (экран настройки, `wakode user create`) и станет четыре в 3b.
+        // До этой правки экран триммил, а CLI — нет, и логин `"  админ  "`
+        // сохранялся с пробелами; войти им было нельзя, потому что форма
+        // входа триммит.
+        let mut conn = open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+
+        let named = |login: &str| NewUser {
+            login: login.to_owned(),
+            ..a_user()
+        };
+
+        let user = insert_user(&conn, &named("  админ  ")).unwrap();
+        assert_eq!(user.login, "админ", "логин сохранён с пробелами");
+        assert!(
+            find_user_by_login(&conn, "админ").unwrap().is_some(),
+            "по обрезанному логину пользователь не находится"
+        );
+
+        assert!(matches!(
+            insert_user(&conn, &named("")),
+            Err(StoreError::LoginEmpty)
+        ));
+        assert!(
+            matches!(
+                insert_user(&conn, &named("   ")),
+                Err(StoreError::LoginEmpty)
+            ),
+            "логин из одних пробелов принят"
+        );
+    }
+
+    #[test]
+    fn a_taken_login_is_a_domain_error_not_a_raw_sqlite_failure() {
+        // `StoreError` заведён ровно за этим: «вызывающий не должен
+        // разбирать коды SQLite, чтобы понять, что произошло». Без
+        // классификации CLI печатал занятый логин как
+        // `база данных: UNIQUE constraint failed: users.login: Error code
+        // 2067` — поломку хранилища вместо вины вызывающего, да ещё
+        // языком, на котором в этом проекте не говорят.
+        let mut conn = open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+
+        insert_user(&conn, &a_user()).unwrap();
+        let err = insert_user(&conn, &a_user()).unwrap_err();
+
+        assert!(
+            matches!(&err, StoreError::LoginTaken(login) if login == "swrneko"),
+            "получили {err:?}"
+        );
+        assert!(
+            !err.to_string().contains("UNIQUE"),
+            "сырой текст SQLite уехал наружу: {err}"
+        );
     }
 }

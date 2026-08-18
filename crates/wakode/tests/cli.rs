@@ -799,3 +799,173 @@ fn a_missing_named_config_is_refused_before_anything_is_created() {
         "путь не назван: {stderr}"
     );
 }
+
+#[test]
+fn without_the_admin_flag_the_user_is_not_an_admin() {
+    // Односторонняя проверка: тест «с флагом получается админ» есть, а
+    // мутация «игнорировать флаг и всегда ставить true» не роняла ничего
+    // во всём workspace. `wakode user create --login teammate` без флага —
+    // самый частый вызов этой подкоманды, и регрессия в проводке молча
+    // раздавала бы админство всем. Узнали бы об этом в 3b, когда появятся
+    // админские эндпоинты.
+    let (_dir, config, _) = a_setup();
+    assert!(
+        create_user(&config, "коллега", "достаточно длинный пароль")
+            .status
+            .success()
+    );
+
+    let listed = wakode()
+        .args(["--config", config.to_str().unwrap(), "user", "list"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(listed.stdout).unwrap();
+    let line = text
+        .lines()
+        .find(|line| line.contains("коллега"))
+        .expect(&format!("в списке нет пользователя: {text}"));
+    assert!(
+        !line.contains("админ"),
+        "пользователь без флага оказался администратором: {line}"
+    );
+}
+
+#[test]
+fn the_cli_holds_the_same_login_invariant_as_the_setup_screen() {
+    // Экран первичной настройки триммит логин и отвергает пустой, а CLI
+    // до этой правки не делал ни того, ни другого: `--login ""` заводил
+    // пользователя с пустым логином, `--login "  админ  "` — с пробелами.
+    // Войти вторым нельзя никогда: форма входа триммит. Инвариант переехал
+    // в `insert_user`, то есть в единственную дверь записи.
+    let (dir, config, _) = a_setup();
+
+    let empty = create_user(&config, "", "достаточно длинный пароль");
+    assert!(!empty.status.success(), "пустой логин принят");
+
+    let spaces = create_user(&config, "   ", "достаточно длинный пароль");
+    assert!(!spaces.status.success(), "логин из пробелов принят");
+
+    assert!(
+        create_user(&config, "  админ  ", "достаточно длинный пароль")
+            .status
+            .success()
+    );
+
+    let conn = wakode_store::open(&dir.path().join("wakode.db")).unwrap();
+    assert!(
+        wakode_store::find_user_by_login(&conn, "админ")
+            .unwrap()
+            .is_some(),
+        "логин сохранён с пробелами — войти им будет нельзя"
+    );
+}
+
+#[test]
+fn the_timeout_from_the_config_reaches_the_created_user() {
+    // Секция `[durations]` не читалась вообще: обе двери создания
+    // пользователя прошивали `wakode_core::DEFAULT_TIMEOUT_SECS`. Владелец
+    // писал `timeout_secs = 300`, перезапускал, заводил пользователя — и в
+    // базе оказывалось 900, без единого слова куда-либо, а способа
+    // исправить строку в 3a не было вовсе.
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("wakode.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[database]\npath = {:?}\n\n[durations]\ntimeout_secs = 300\n",
+            dir.path().join("wakode.db").to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    assert!(
+        create_user(&config, "swrneko", "достаточно длинный пароль")
+            .status
+            .success()
+    );
+
+    let conn = wakode_store::open(&dir.path().join("wakode.db")).unwrap();
+    let user = wakode_store::find_user_by_login(&conn, "swrneko")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        user.timeout_secs, 300,
+        "тайм-аут взят из константы, а не из конфига"
+    );
+}
+
+#[test]
+fn the_startup_log_names_absolute_paths_and_the_schema() {
+    // Относительный путь в журнале не говорит ничего: рабочий каталог под
+    // systemd задаёт unit, а не тот, кто читает лог. Число миграций
+    // отсутствовало вовсе — `SqliteStore::open` применяет их молча, и
+    // владелец, обновивший сборку, видел «сервер поднят», не видя,
+    // применилось ли что-нибудь.
+    // Флаг и путь к базе задаются **относительными**, а рабочий каталог
+    // процесса — временной папкой. Иначе проверка вакуумна: `a_setup`
+    // отдаёт абсолютные пути, и вывод «как есть» неотличим от вывода
+    // через `std::path::absolute`.
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("wakode.toml");
+    std::fs::write(&config, "[database]\npath = \"wakode.db\"\n").unwrap();
+
+    let output = wakode()
+        .current_dir(dir.path())
+        .args(["--config", "wakode.toml", "migrate"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = String::from_utf8_lossy(&output.stderr);
+    // `canonicalize` у путей внутри временной папки: на macOS `/tmp` —
+    // символическая ссылка, и `absolute` в дочернем процессе даёт
+    // `/private/...`. Сравнивать надо разрешённые пути, иначе тест
+    // рассказывает про символические ссылки, а не про журнал.
+    let root = dir.path().canonicalize().unwrap();
+    assert!(
+        log.contains(root.join("wakode.db").to_str().unwrap())
+            || log.contains(dir.path().join("wakode.db").to_str().unwrap()),
+        "путь к базе в журнале не абсолютный:\n{log}"
+    );
+    assert!(
+        log.contains(root.join("wakode.toml").to_str().unwrap())
+            || log.contains(dir.path().join("wakode.toml").to_str().unwrap()),
+        "путь к конфигу в журнале не абсолютный:\n{log}"
+    );
+    assert!(
+        log.contains("schema=1"),
+        "в журнале не названа версия схемы:\n{log}"
+    );
+}
+
+#[test]
+fn a_duplicate_login_is_refused_in_plain_words() {
+    // Занятый логин — вина вызывающего. Пока он ехал наружу сырым текстом
+    // SQLite (`база данных: UNIQUE constraint failed: users.login: Error
+    // code 2067`, продублированным цепочкой причин), он подавался как
+    // поломка базы и расходился по форме с соседней подкомандой, где
+    // сказано «нет пользователя {login}».
+    let (_dir, config, _) = a_setup();
+    assert!(
+        create_user(&config, "swrneko", "достаточно длинный пароль")
+            .status
+            .success()
+    );
+
+    let again = create_user(&config, "swrneko", "другой длинный пароль");
+    assert!(!again.status.success(), "дубликат логина принят");
+
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    assert!(
+        stderr.contains("swrneko") && stderr.contains("уже есть"),
+        "причина не названа по-человечески: {stderr}"
+    );
+    assert!(
+        !stderr.contains("UNIQUE") && !stderr.contains("2067"),
+        "сырой текст SQLite уехал владельцу: {stderr}"
+    );
+}

@@ -43,6 +43,7 @@ fn a_state(dir: &tempfile::TempDir) -> AppState {
             registration: false,
             session_ttl_days: 30,
             setup_from_any_address: false,
+            default_timeout_secs: 900,
         },
     )
 }

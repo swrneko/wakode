@@ -13,6 +13,7 @@ pub struct AppState {
     pub registration: bool,
     pub session_ttl_days: i64,
     pub setup_from_any_address: bool,
+    pub default_timeout_secs: i64,
 }
 
 /// Настройки, которые HTTP-слой берёт из конфига.
@@ -32,6 +33,15 @@ pub struct AppSettings {
     pub registration: bool,
     pub session_ttl_days: i64,
     pub setup_from_any_address: bool,
+    /// Тайм-аут сессии кодирования для заводимых пользователей, в секундах.
+    ///
+    /// Берётся из `[durations]`, а не из `wakode_core::DEFAULT_TIMEOUT_SECS`.
+    /// Пока константа была прошита в обеих дверях создания пользователя,
+    /// секция конфига не читалась вообще: владелец писал
+    /// `timeout_secs = 300`, перезапускал, заводил пользователя — и в базе
+    /// оказывалось 900, без единого слова куда-либо. Исправить строку в
+    /// 3a было нечем.
+    pub default_timeout_secs: i64,
 }
 
 impl AppState {
@@ -42,6 +52,7 @@ impl AppState {
             registration: settings.registration,
             session_ttl_days: settings.session_ttl_days,
             setup_from_any_address: settings.setup_from_any_address,
+            default_timeout_secs: settings.default_timeout_secs,
         }
     }
 }
@@ -54,6 +65,7 @@ impl std::fmt::Debug for AppState {
             .field("registration", &self.registration)
             .field("session_ttl_days", &self.session_ttl_days)
             .field("setup_from_any_address", &self.setup_from_any_address)
+            .field("default_timeout_secs", &self.default_timeout_secs)
             .finish()
     }
 }

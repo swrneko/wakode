@@ -23,6 +23,7 @@ fn a_settings() -> AppSettings {
         registration: false,
         session_ttl_days: 30,
         setup_from_any_address: false,
+        default_timeout_secs: 900,
     }
 }
 
@@ -1097,6 +1098,98 @@ async fn setup_from(state: AppState, peer: &str, body: Body) -> Response {
         ))
         .await
         .unwrap()
+}
+
+/// Запрос настройки с петлевого адреса и заданными доп. заголовками.
+async fn setup_from_loopback_with(state: AppState, headers: &[(&str, &str)]) -> Response {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/setup")
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+
+    router(state)
+        .oneshot(with_peer(
+            request.body(setup_body("через-прокси")).unwrap(),
+            "127.0.0.1:54321",
+        ))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_loopback_peer_is_not_enough_when_the_request_came_through_a_proxy() {
+    // Дыра, найденная финальным ревью ветки, и она не теоретическая. При
+    // штатной установке — nginx на том же хосте, `proxy_pass
+    // http://127.0.0.1:9000` — TCP-пиром всегда оказывается сам прокси,
+    // то есть `127.0.0.1`. Проверка «пир петлевой» истинна для кого угодно
+    // из интернета, и экран первичной настройки стоит открытым до первого
+    // постучавшегося. Владелец делает `systemctl start wakode`, идёт
+    // заводить админа через браузер — а инстанс уже занят.
+    let dir = tempfile::tempdir().unwrap();
+
+    for header in ["x-forwarded-for", "forwarded", "x-real-ip"] {
+        let state = a_state(&tempfile::tempdir().unwrap());
+        let response = setup_from_loopback_with(state, &[(header, "203.0.113.7")]).await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "заголовок {header} не закрыл настройку"
+        );
+        let json = json_body(response).await;
+        assert!(
+            json["error"].as_str().unwrap().contains("прокси"),
+            "причина не названа: {json}"
+        );
+    }
+
+    // Зеркало: без заголовков посредника настройка с петлевого адреса
+    // проходит. Без этой половины «запрещать всегда» выглядело бы верным.
+    let response = setup_from_loopback_with(a_state(&dir), &[]).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn the_owner_behind_a_proxy_can_still_say_so() {
+    // Заголовок посредника не должен переигрывать явное разрешение
+    // владельца: иначе установка за прокси стала бы ненастраиваемой
+    // вообще, и починить её было бы можно только через CLI.
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(
+        a_store(&dir),
+        None,
+        AppSettings {
+            setup_from_any_address: true,
+            ..a_settings()
+        },
+    );
+
+    let response = setup_from_loopback_with(state, &[("x-forwarded-for", "203.0.113.7")]).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn an_unknown_field_in_the_setup_body_is_an_error() {
+    // Та же логика, что у `deny_unknown_fields` в конфиге (задача 6):
+    // опечатка в имени поля иначе молча даёт умолчание. Сегодня безвредно
+    // — все три поля обязательны, — но в 3b поля станут необязательными,
+    // и `"is_admin": false`, проглоченный молча, будет ровно тем дефектом,
+    // который в конфиге уже чинили.
+    let dir = tempfile::tempdir().unwrap();
+
+    let response = setup_from(
+        a_state(&dir),
+        "127.0.0.1:54321",
+        Body::from(
+            r#"{"login":"кто","password":"достаточно длинный","timezone":"UTC","is_admin":false}"#,
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 /// Ответ `/api/setup/status` как JSON.

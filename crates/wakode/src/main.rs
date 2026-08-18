@@ -49,8 +49,15 @@ async fn main() -> ExitCode {
 /// идентификатор заведённого. Строка журнала, попавшая в тот же поток,
 /// уехала бы в `wakode user list | …` наравне с данными.
 fn init_tracing() {
+    // Раскраска — только когда stderr действительно терминал. В журнале
+    // systemd или в файле escape-последовательности превращаются в мусор
+    // вокруг каждого значения, и `grep schema=1` по такому логу ничего не
+    // находит: между именем поля и значением стоят коды.
+    let ansi = std::io::IsTerminal::is_terminal(&std::io::stderr());
+
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_ansi(ansi)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "wakode=info,wakode_api=info,tower_http=info".into()),
@@ -73,13 +80,31 @@ async fn run() -> anyhow::Result<()> {
     }
 
     let config = Config::load(args.config.as_deref())?;
+
+    // Пути печатаются абсолютными. Относительный путь в журнале ничего не
+    // говорит: рабочий каталог под systemd задаёт unit, а не тот, кто
+    // читает лог, и `database="./wakode.db"` отсылает владельца искать
+    // файл там, где его нет. Отказ конфигурации это уже делал (задача 6),
+    // успешный путь — нет.
+    let config_path = args
+        .config
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from(config::DEFAULT_CONFIG_PATH));
     tracing::info!(
-        config = ?args.config.as_deref().unwrap_or(std::path::Path::new(config::DEFAULT_CONFIG_PATH)),
-        database = ?config.database.path,
+        config = %shown(&config_path),
+        database = %shown(&config.database.path),
         "конфигурация прочитана"
     );
 
     let started = startup::start(config, std::env::var("WAKODE_MASTER_KEY").ok()).await?;
+
+    // Версия схемы — то, чего в журнале не хватало больше всего: миграции
+    // применяет `SqliteStore::open` молча, и владелец, обновивший сборку,
+    // видел «сервер поднят», не видя, применилось ли что-нибудь.
+    tracing::info!(
+        schema = started.store.schema_version().await?,
+        "база открыта, миграции применены"
+    );
 
     // Результат придерживается до останова писателя: `?` прямо здесь
     // унёс бы управление мимо `shutdown`.
@@ -106,6 +131,20 @@ async fn run() -> anyhow::Result<()> {
     outcome
 }
 
+/// Путь для журнала: абсолютный, если это выразимо.
+///
+/// `std::path::absolute` не ходит в файловую систему и не разрешает
+/// символические ссылки — она отвечает на вопрос «относительно чего»,
+/// а именно его владелец и задаёт себе, читая лог. Отказ (пустой путь,
+/// недоступный рабочий каталог) оставляет путь как есть: сказать
+/// «./wakode.db» лучше, чем не сказать ничего.
+fn shown(path: &std::path::Path) -> String {
+    std::path::absolute(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
 fn master_key(command: &MasterKeyCommand) -> anyhow::Result<()> {
     match command {
         MasterKeyCommand::Generate => {
@@ -129,7 +168,16 @@ async fn dispatch(started: &startup::Startup, command: Command) -> anyhow::Resul
             login,
             admin,
             timezone,
-        }) => cli::user::create(&started.store, login, admin, timezone).await,
+        }) => {
+            cli::user::create(
+                &started.store,
+                login,
+                admin,
+                timezone,
+                started.config.durations.timeout_secs,
+            )
+            .await
+        }
         Command::User(UserCommand::List) => cli::user::list(&started.store).await,
         Command::Key(KeyCommand::Issue { user, name }) => {
             cli::key::issue(&started.store, started.master_key.as_ref(), user, name).await
@@ -173,6 +221,7 @@ fn app_settings(config: &Config) -> AppSettings {
         registration: config.auth.registration,
         session_ttl_days: config.auth.session_ttl_days,
         setup_from_any_address: config.auth.setup_from_any_address,
+        default_timeout_secs: config.durations.timeout_secs,
     }
 }
 

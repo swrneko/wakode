@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{ConnectInfo, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use wakode_store::{NewUser, UserRepo};
@@ -42,7 +42,27 @@ pub async fn status(State(state): State<AppState>) -> Result<Json<SetupStatus>, 
     }))
 }
 
-#[derive(Deserialize)]
+/// Заголовки, наличие которых означает «запрос пришёл через посредника».
+///
+/// Список закрытый и намеренно короткий: это те заголовки, которые
+/// добавляют nginx, Caddy, Traefik и Cloudflare в конфигурациях по
+/// умолчанию. Содержимое их не читается — см. обоснование в `setup`.
+const PROXY_HEADERS: [&str; 3] = ["forwarded", "x-forwarded-for", "x-real-ip"];
+
+const SETUP_IS_LOCAL_ONLY: &str = "первичная настройка доступна только с локального адреса; \
+     разрешите setup_from_any_address или создайте пользователя через `wakode user create`";
+
+const SETUP_THROUGH_A_PROXY: &str =
+    "запрос пришёл через обратный прокси, и адрес клиента отсюда неизвестен; \
+     разрешите setup_from_any_address или создайте пользователя через `wakode user create`";
+
+/// Есть ли в запросе заголовок с таким именем.
+fn parts_have(headers: &HeaderMap, name: &str) -> bool {
+    headers.contains_key(name)
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetupRequest {
     pub login: String,
     pub password: String,
@@ -58,6 +78,7 @@ pub struct SetupResponse {
 pub async fn setup(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     // Тело берётся `Result`ом, а не распакованным `Json`: экстрактор в
     // сигнатуре отрабатывает до первой строки функции, и его собственный
     // отказ уехал бы клиенту как `text/plain` мимо `ApiError` — то самое
@@ -66,14 +87,48 @@ pub async fn setup(
     // чужому незачем слышать про формат JSON.
     request: Result<Json<SetupRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<SetupResponse>), ApiError> {
-    // Смотрим на адрес клиента, а не на адрес прослушивания: за обратным
-    // прокси второй петлевой, а первый — нет, и проверка по `listen`
-    // открыла бы настройку всему интернету.
-    if !state.setup_from_any_address && !peer.ip().is_loopback() {
-        return Err(ApiError::Forbidden(
-            "первичная настройка доступна только с локального адреса; \
-             разрешите setup_from_any_address или создайте пользователя через CLI",
-        ));
+    if !state.setup_from_any_address {
+        // Смотрим на адрес клиента, а не на адрес прослушивания: проверка
+        // по `listen` открыла бы настройку всему интернету на любом
+        // инстансе, слушающем `0.0.0.0`.
+        if !peer.ip().is_loopback() {
+            return Err(ApiError::Forbidden(SETUP_IS_LOCAL_ONLY));
+        }
+
+        // Но одного петлевого пира мало, и это не педантизм. При штатной
+        // установке — nginx на том же хосте, `proxy_pass
+        // http://127.0.0.1:9000` — TCP-пиром всегда оказывается сам
+        // прокси, то есть `127.0.0.1`. Проверка выше в такой установке
+        // истинна для кого угодно из интернета, и экран первичной
+        // настройки, который она обязана закрывать, стоит открытым до
+        // первого постучавшегося.
+        //
+        // Заголовок здесь используется **по факту наличия, а не по
+        // содержимому**. Доверять тому, что в нём написано, нельзя: его
+        // подделает кто угодно. А вот его присутствие — надёжное
+        // свидетельство, что запрос прошёл через посредника и адрес пира
+        // не говорит о клиенте ничего. Отказ в эту сторону безопасен:
+        // подделав заголовок, чужой добьётся только собственного отказа.
+        //
+        // Владелец за прокси ставит `setup_from_any_address = true` или
+        // заводит администратора через `wakode user create` — ровно то,
+        // что спека и обещала ему сделать один раз.
+        //
+        // Чего это НЕ закрывает: прокси, не добавляющий ни одного из этих
+        // заголовков. Настоящее решение — белый список доверенных
+        // посредников, и оно относится к плану 3b; здесь закрыт тот
+        // случай, который встречается на практике, и закрыт в безопасную
+        // сторону.
+        if let Some(header) = PROXY_HEADERS
+            .iter()
+            .find(|name| parts_have(&headers, name))
+        {
+            tracing::warn!(
+                header = %header,
+                "первичная настройка запрошена через посредника — адрес клиента неизвестен"
+            );
+            return Err(ApiError::Forbidden(SETUP_THROUGH_A_PROXY));
+        }
     }
 
     // Закрыт навсегда после первого пользователя — независимо от того,
@@ -138,7 +193,7 @@ pub async fn setup(
             password_hash,
             display_name: None,
             timezone,
-            timeout_secs: wakode_core::DEFAULT_TIMEOUT_SECS,
+            timeout_secs: state.default_timeout_secs,
             is_admin: true,
         })
         .await?;

@@ -27,6 +27,10 @@ pub async fn create(
     login: String,
     admin: bool,
     timezone: String,
+    // Из `[durations]`, а не из `wakode_core::DEFAULT_TIMEOUT_SECS`: пока
+    // константа была прошита здесь и в экране первичной настройки, секция
+    // конфига не читалась вообще, и `timeout_secs = 300` не значил ничего.
+    timeout_secs: i64,
 ) -> anyhow::Result<()> {
     // Таймзона разбирается до того, как спрошен пароль: опечатка в ней
     // иначе всплывала бы после ввода, и вводить пришлось бы заново.
@@ -49,7 +53,7 @@ pub async fn create(
             password_hash: wakode_auth::hash_password(&password)?,
             display_name: None,
             timezone,
-            timeout_secs: wakode_core::DEFAULT_TIMEOUT_SECS,
+            timeout_secs,
             is_admin: admin,
         })
         .await?;
