@@ -140,11 +140,15 @@ mod tests {
         let before_epoch = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
         assert_eq!(now_at(before_epoch), None);
 
-        // Часы, ушедшие за пределы `i64` микросекунд: всё просрочено.
+        // Часы, ушедшие за пределы `i64` микросекунд, насыщаются вверх.
+        // Утверждение про сам `now_at`, а не про `is_expired` от него:
+        // через `is_expired` эта проверка держалась бы на решении «равенство
+        // — истечение», и осознанный пересмотр того решения ронял бы её не
+        // по делу, показывая не туда, где ошибка.
         let far_future = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1 << 60);
-        let now = now_at(far_future).expect("часы после эпохи обязаны читаться");
-        assert!(
-            is_expired(Micros::new(i64::MAX), now),
+        assert_eq!(
+            now_at(far_future),
+            Some(Micros::new(i64::MAX)),
             "переполнение обязано насыщаться вверх, а не заворачиваться в отрицательное"
         );
     }

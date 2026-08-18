@@ -739,6 +739,34 @@ async fn a_session(state: &AppState, user_id: uuid::Uuid, expires_at: Micros) ->
     token
 }
 
+/// Момент, отстоящий от **настоящего** «сейчас» на заданное число секунд.
+///
+/// Сроки сессий в тестах считаются отсюда, а не константами вроде
+/// `Micros::from_secs(4_000_000_000)`. Разница не косметическая: с
+/// абсолютными константами набор доказывал лишь то, что часы сервера
+/// находятся где-то между 1970 и 2096 годом. Часы, замороженные на 2033-м
+/// или отставшие на десять лет, проходили весь набор зелёными — а на живом
+/// инстансе с уехавшим RTC (типовое на бездисковых VM и в контейнерах)
+/// сессия со сроком в 30 дней не истекает никогда, и украденная cookie
+/// живёт вечно. Со смещением от «сейчас» окно доказательства сужается со
+/// ста двадцати шести лет до секунд.
+fn from_now(secs: i64) -> Micros {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("часы теста до эпохи");
+    Micros::new(now.as_micros() as i64 + secs * 1_000_000)
+}
+
+/// Срок, до которого сессия заведомо жива.
+fn live() -> Micros {
+    from_now(3600)
+}
+
+/// Срок, который заведомо истёк.
+fn expired() -> Micros {
+    from_now(-1)
+}
+
 /// Заголовок `cookie` с токеном сессии.
 ///
 /// Собирается строкой, а не через `Cookie::new`: тесту важно ровно то, что
@@ -769,7 +797,7 @@ async fn a_live_session_identifies_the_user() {
     let dir = tempfile::tempdir().unwrap();
     let (state, _) = a_state_with_a_key(&dir).await;
     let user = state.store.user_by_login("swrneko").await.unwrap().unwrap();
-    let token = a_session(&state, user.id, Micros::from_secs(4_000_000_000)).await;
+    let token = a_session(&state, user.id, live()).await;
 
     let response = me_with_cookie(&state, &session_cookie(&token)).await;
 
@@ -786,7 +814,7 @@ async fn an_expired_session_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let (state, _) = a_state_with_a_key(&dir).await;
     let user = state.store.user_by_login("swrneko").await.unwrap().unwrap();
-    let token = a_session(&state, user.id, Micros::from_secs(1)).await;
+    let token = a_session(&state, user.id, expired()).await;
 
     let response = me_with_cookie(&state, &session_cookie(&token)).await;
 
@@ -808,7 +836,7 @@ async fn a_revoked_session_says_so() {
     let dir = tempfile::tempdir().unwrap();
     let (state, _) = a_state_with_a_key(&dir).await;
     let user = state.store.user_by_login("swrneko").await.unwrap().unwrap();
-    let token = a_session(&state, user.id, Micros::from_secs(4_000_000_000)).await;
+    let token = a_session(&state, user.id, live()).await;
 
     let found = state
         .store
@@ -834,7 +862,7 @@ async fn a_session_both_revoked_and_expired_says_it_was_revoked() {
     let dir = tempfile::tempdir().unwrap();
     let (state, _) = a_state_with_a_key(&dir).await;
     let user = state.store.user_by_login("swrneko").await.unwrap().unwrap();
-    let token = a_session(&state, user.id, Micros::from_secs(1)).await;
+    let token = a_session(&state, user.id, expired()).await;
 
     let found = state
         .store
@@ -923,13 +951,15 @@ async fn a_garbage_cookie_says_the_format_is_wrong() {
 
 #[tokio::test]
 async fn the_session_cookie_is_found_among_its_neighbours() {
-    // В браузере cookie никогда не приезжает одна. Разбор, берущий значение
-    // заголовка целиком (или первую пару), проходил бы весь остальной набор
-    // зелёным и ломался бы ровно у настоящего браузера.
+    // В браузере cookie никогда не приезжает одна. Разбор, берущий из
+    // заголовка первую пару, проходил бы весь остальной набор зелёным и
+    // ломался бы ровно у настоящего браузера — этот тест держит только его.
+    // (Разбор, берущий заголовок целиком, ломает и `a_live_session_...`;
+    // он тут ни при чём.)
     let dir = tempfile::tempdir().unwrap();
     let (state, _) = a_state_with_a_key(&dir).await;
     let user = state.store.user_by_login("swrneko").await.unwrap().unwrap();
-    let token = a_session(&state, user.id, Micros::from_secs(4_000_000_000)).await;
+    let token = a_session(&state, user.id, live()).await;
 
     let crowded = format!("theme=dark; {}; lang=ru", session_cookie(&token));
     let response = me_with_cookie(&state, &crowded).await;
@@ -966,10 +996,9 @@ async fn each_session_identifies_its_own_owner() {
     let second = a_user(&store, "вторая").await;
     let state = AppState::new(store, None, false, 30, false);
 
-    let live = Micros::from_secs(4_000_000_000);
     let tokens = [
-        (a_session(&state, first.id, live).await, "первый"),
-        (a_session(&state, second.id, live).await, "вторая"),
+        (a_session(&state, first.id, live()).await, "первый"),
+        (a_session(&state, second.id, live()).await, "вторая"),
     ];
 
     for (token, owner) in tokens {
@@ -997,8 +1026,8 @@ async fn session_auth_carries_the_id_of_the_session_that_opened_it() {
 
     // Сессий две: с единственной строкой в таблице «взять любую» неотличимо
     // от «взять свою».
-    let _other = a_session(&state, user.id, Micros::from_secs(4_000_000_000)).await;
-    let token = a_session(&state, user.id, Micros::from_secs(4_000_000_000)).await;
+    let _other = a_session(&state, user.id, live()).await;
+    let token = a_session(&state, user.id, live()).await;
     let session = state
         .store
         .session_by_token_hash(token.hash())
