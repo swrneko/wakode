@@ -3818,6 +3818,14 @@ git commit -m "feat(api): перехват паники и журналиров�
 
 **Значение ключа печатается один раз.** Расшифровать его потом можно — за этим и хранится шифротекст, — но подсматривать через CLI незачем: для показа есть настройки в интерфейсе.
 
+**Порог длины пароля живёт в `wakode-auth`, внутри `hash_password`.** Проверка у входа повторяется столько раз, сколько входов — экран первичной настройки, `wakode user create`, регистрация и смена пароля в 3b, — и одного забытого хватает, чтобы инварианта не стало. Это не гипотеза: CLI заводил администратора с паролем «1», пока HTTP требовал восьми символов. Дверь к хешу одна, проверка стоит в ней; `setup.rs` дублирует её только ради внятного `400` вместо `500` и читает ту же константу.
+
+**`revoke_key` возвращает три исхода, а не `()`.** «Ключа нет» и «ключ уже отозван» — разные события: второе обычное (ретрай, двойной клик), первое почти всегда опечатка в идентификаторе. Пока они были неразличимы, `key revoke` отвечал «отозван» на опечатку, и владелец, отзывающий утёкший ключ, считал инцидент закрытым, пока ключ продолжал работать. Второй запрос делается только на редком пути — когда `UPDATE` не тронул ни строки.
+
+**Журнал уходит в stderr.** Stdout подкоманд — это данные: значение выданного ключа, список пользователей, идентификатор заведённого. Строка журнала в том же потоке уехала бы в `wakode user list | …` наравне с данными.
+
+**Подпись `AppState::new` изменилась** относительно первоначального текста этого раздела: `AppState::new(store, master_key, AppSettings { … })`. Проводка вынесена в `fn app_settings(&Config) -> AppSettings` и покрыта юнит-тестом с несовпадающими значениями — с одинаковыми перестановка двух соседних `bool` неразличима.
+
 - [ ] **Step 1: Написать падающие тесты**
 
 `crates/wakode/tests/cli.rs`:
@@ -4476,8 +4484,21 @@ Expected: PASS. Предупреждений нет ни на этапе ком�
 |---|---|
 | `user create` принимает `--password` | `user_create_reads_the_password_from_stdin_not_a_flag` |
 | `list` печатает `password_hash` | `user_create_then_list_shows_the_user` |
+| журнал пишется в stdout | тот же |
+| `user create` кладёт в `password_hash` мусор | `user_create_stores_a_hash_that_opens` |
+| порог длины пароля снят / считается в байтах | `a_short_password_is_refused_by_the_cli_too`, `the_threshold_counts_characters_not_bytes` |
 | `key issue` при отсутствии мастер-ключа пишет пустой `key_encrypted` | `key_issue_without_a_master_key_fails_loudly` |
+| `key issue` шифрует, но не печатает значение | `key_issue_prints_the_value_once_and_it_authenticates` |
+| `revoke_key` не различает «нет такого» и «уже отозван» | `revoking_a_key_that_does_not_exist_is_a_failure_not_a_shrug`, `revoking_tells_the_three_cases_apart` |
 | `master-key generate` печатает константу | `master_key_generate_prints_a_usable_key` |
+| `app_settings` меняет местами два `bool` | `the_config_reaches_the_state_without_swapping_its_flags` |
+| `serve` не зовёт `wakode_api::serve` / биндит не тот адрес | `serve_comes_up_and_answers` |
+| `unwrap_or(Command::Serve)` заменён другой веткой | `no_subcommand_means_serve` |
+| `--config` игнорируется | 13 тестов из 19 |
+| `--timezone` игнорируется | `user_create_stores_the_timezone_it_was_given` |
+| `list_users` без `ORDER BY created_at, id` | `list_users_orders_by_created_at_not_by_insertion` — и **только он**: `users_are_listed_oldest_first` остаётся зелёным, потому что `users` объявлена `WITHOUT ROWID` и обход по кластерному UUIDv7 совпадает с порядком вставки |
+
+Не ловится ничем: подмена флага прямо в `serve` (`AppSettings { setup_from_any_address: true, ..app_settings(&config) }`). Закрыть сегодня нечем — `registration` в `wakode-api` нигде не читается, а `setup_from_any_address` различим только по не-петлевому адресу клиента, которого на том же хосте не взять.
 
 - [ ] **Step 7: Коммит**
 
