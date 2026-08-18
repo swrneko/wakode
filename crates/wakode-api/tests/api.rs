@@ -354,16 +354,13 @@ async fn serve_actually_answers_on_a_real_socket() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let server = tokio::spawn(wakode_api::serve(listener, a_state(&dir)));
+    let server = tokio::spawn(wakode_api::serve(
+        listener,
+        a_state(&dir),
+        std::future::pending::<()>(),
+    ));
 
-    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    stream
-        .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .await
-        .unwrap();
-
-    let mut response = String::new();
-    stream.read_to_string(&mut response).await.unwrap();
+    let response = raw_get(addr, "/healthz").await;
 
     assert!(
         response.starts_with("HTTP/1.1 200 OK"),
@@ -372,6 +369,58 @@ async fn serve_actually_answers_on_a_real_socket() {
     assert!(response.ends_with("ok"), "нет тела ответа: {response}");
 
     server.abort();
+}
+
+/// Сырой `GET` через настоящий сокет, без клиента HTTP.
+///
+/// Вынесено из `serve_actually_answers_on_a_real_socket`: второму тесту с
+/// настоящим сокетом нужен тот же примитив.
+async fn raw_get(addr: std::net::SocketAddr, path: &str) -> String {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    response
+}
+
+#[tokio::test]
+async fn serve_returns_when_asked_to_stop_and_releases_the_port() {
+    // Без этого теста завершение по сигналу держится обещанием: `serve`,
+    // потерявшая `with_graceful_shutdown`, снаружи выглядит точно так же —
+    // сервер работает, — а SIGTERM в бинаре просто убивал бы процесс мимо
+    // остановки писателя.
+    let dir = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(wakode_api::serve(listener, a_state(&dir), async move {
+        let _ = stopped.await;
+    }));
+
+    // Сначала — что сервер вообще поднялся: иначе «вернулась сразу»
+    // прошло бы этот тест зелёным.
+    assert!(
+        raw_get(addr, "/healthz").await.starts_with("HTTP/1.1 200 OK"),
+        "сервер не ответил до сигнала"
+    );
+
+    stop.send(()).unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .expect("serve не вернулась через пять секунд после сигнала")
+        .expect("задача с serve упала");
+
+    // Порт отпущен — доказательство, что слушатель уничтожен, а не просто
+    // функция вернулась, оставив приём соединений жить.
+    tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("порт всё ещё занят: слушатель пережил останов");
 }
 
 #[tokio::test]
@@ -1657,7 +1706,11 @@ async fn setup_over_a_real_socket_sees_the_client_address() {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(wakode_api::serve(listener, state));
+    let server = tokio::spawn(wakode_api::serve(
+        listener,
+        state,
+        std::future::pending::<()>(),
+    ));
 
     let body = r#"{"login":"swrneko","password":"достаточно длинный","timezone":"Europe/Moscow"}"#;
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
