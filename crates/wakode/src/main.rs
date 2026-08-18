@@ -106,16 +106,15 @@ async fn run() -> anyhow::Result<()> {
     // первая версия строки с версией схемы была написана через `?` и
     // молча унесла управление мимо останова.
     //
-    // Честно про цену этой конструкции сегодня: она почти ничего не
-    // спасает. Подкоманды идут своими соединениями мимо очереди писателя
-    // (`create_user`, `create_key`) и коммитятся до возврата, а `serve`
-    // возвращается только на io-ошибке — штатного завершения по сигналу
-    // ещё нет, и SIGTERM убивает процесс, не дав `shutdown` отработать.
-    // Смысл появится вместе с эндпоинтом приёма отметок: через очередь
-    // пойдёт поток записей, и вот тогда потеря принятого станет
-    // настоящей. Ставится заранее, потому что дописать останов задним
-    // числом к готовому `serve` — это вспомнить о нём, а вспоминают не
-    // всегда.
+    // `serve` возвращается по сигналу (`signal::wait_for_signal` в паре с
+    // `signal::wait_for_drain`), и останов писателя ниже — не задел на
+    // будущее, а работающий путь: SIGTERM больше не убивает процесс мимо
+    // `shutdown`, и это держится тестом
+    // `sigterm_stops_the_server_cleanly_and_stops_the_writer`. Подкоманды
+    // при этом по-прежнему идут своими соединениями мимо очереди писателя
+    // (`create_user`, `create_key`) и коммитятся до возврата — конструкция
+    // ниже нужна им лишь постольку, поскольку общий путь `run` один на
+    // все ветки `dispatch`.
     // Версия схемы — то, чего в журнале не хватало больше всего: миграции
     // применяет `SqliteStore::open` молча, и владелец, обновивший сборку,
     // видел «сервер поднят», не видя, применилось ли что-нибудь.
@@ -131,11 +130,15 @@ async fn run() -> anyhow::Result<()> {
         Err(err) => Err(anyhow::Error::new(err).context("не удалось прочитать версию схемы")),
     };
 
-    if let Err(err) = started.store.shutdown().await {
+    match started.store.shutdown().await {
+        // Строка не косметическая: до неё у инварианта «останов зовётся
+        // всегда» не было наблюдаемого признака, и тест на SIGTERM не мог
+        // отличить «остановили писателя» от «процесс умер вовремя».
+        Ok(()) => tracing::info!("писатель остановлен, база отпущена"),
         // Отказ останова не подменяет собой отказ подкоманды: подменив,
         // мы сообщили бы про писателя вместо того, что владелец просил
         // сделать. Отдельной строкой в журнал — и всё.
-        tracing::warn!(error = %err, "останов писателя завершился с ошибкой");
+        Err(err) => tracing::warn!(error = %err, "останов писателя завершился с ошибкой"),
     }
 
     outcome
@@ -198,7 +201,7 @@ async fn dispatch(started: &startup::Startup, command: Command) -> anyhow::Resul
     }
 }
 
-/// Шаг 6 старта: поднять HTTP-слой.
+/// Шаг 6 старта: поднять HTTP-слой и работать до сигнала.
 async fn serve(started: &startup::Startup) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&started.config.server.listen)
         .await
@@ -215,7 +218,35 @@ async fn serve(started: &startup::Startup) -> anyhow::Result<()> {
         app_settings(&started.config),
     );
 
-    wakode_api::serve(listener, state).await?;
+    // Сигнал нужен обеим сторонам: сервер по нему перестаёт принимать
+    // соединения, а предел ожидания по нему же начинает течь. Ждать одну
+    // футуру дважды нельзя, поэтому факт сигнала раздаётся через канал.
+    let (signalled, wait_signalled) = tokio::sync::oneshot::channel();
+    let shutdown = async move {
+        let name = signal::wait_for_signal().await;
+        tracing::info!(signal = name, "сигнал завершения: закрываем приём новых соединений");
+        let _ = signalled.send(());
+    };
+
+    let served = wakode_api::serve(listener, state, shutdown);
+    let drained = signal::wait_for_drain(
+        served,
+        async move {
+            let _ = wait_signalled.await;
+        },
+        signal::GRACE,
+    )
+    .await;
+
+    if drained {
+        tracing::info!("начатые запросы дочитаны");
+    } else {
+        tracing::warn!(
+            grace_secs = signal::GRACE.as_secs(),
+            "не все соединения закрылись в срок; бросаем начатое и завершаемся"
+        );
+    }
+
     Ok(())
 }
 

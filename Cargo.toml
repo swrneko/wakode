@@ -44,6 +44,9 @@ tower = "0.5"
 tower-http = "0.7"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+# Только в тестах и только ради `kill`: послать сигнал собственному
+# ребёнку из std нечем, а тащить ради одного вызова `nix` — несоразмерно.
+libc = "0.2"
 wakode-core = { version = "0.1.0", path = "crates/wakode-core" }
 wakode-api = { version = "0.1.0", path = "crates/wakode-api" }
 wakode-auth = { version = "0.1.0", path = "crates/wakode-auth" }

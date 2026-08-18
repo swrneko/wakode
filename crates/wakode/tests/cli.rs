@@ -468,7 +468,7 @@ fn serve_comes_up_and_answers() {
     // Всё остальное здесь запускает подкоманды, которые завершаются, — и
     // `serve`, потерявшая `bind` или вызов `wakode_api::serve`, выглядела
     // бы снаружи ровно так же: процесс, который «стартовал».
-    serve_answers(&["serve"]);
+    a_serving_child(&["serve"]);
 }
 
 #[test]
@@ -478,18 +478,47 @@ fn no_subcommand_means_serve() {
     // заменённый на любую другую ветку, проходил весь набор зелёным.
     // Именно в этой форме бинарь и запускают из systemd —
     // `ExecStart=/usr/bin/wakode --config /etc/wakode.toml`.
-    serve_answers(&[]);
+    a_serving_child(&[]);
+}
+
+/// Поднятый дочерний `wakode serve`: процесс, адрес и журнал.
+///
+/// `dir` держится живым намеренно: в нём лежат конфиг, база и файл
+/// журнала, и уничтожение папки раньше времени вырвало бы их из-под
+/// работающего сервера.
+struct Serving {
+    // Ни `dir`, ни `addr` не читаются ни одним тестом этой задачи: `dir`
+    // держат живым ради побочного эффекта `Drop` (файлы под работающим
+    // сервером), а не ради значения, а `addr` понадобится задаче 3 —
+    // проверять сервер живым запросом, а не только по журналу. До неё оба
+    // поля честно неиспользуемы, и `#[allow(dead_code)]` говорит именно
+    // это, а не прячет забытый код.
+    #[allow(dead_code)]
+    dir: tempfile::TempDir,
+    child: Killed,
+    #[allow(dead_code)]
+    addr: std::net::SocketAddr,
+    log: std::path::PathBuf,
+}
+
+impl Serving {
+    /// Всё, что сервер написал в stderr к этому моменту.
+    fn log(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
 }
 
 /// Поднять бинарь с заданным хвостом аргументов и дождаться `/healthz`.
-fn serve_answers(tail: &[&str]) {
+///
+/// Журнал уходит в файл, а не в трубу: труба живого процесса читается
+/// только до EOF, то есть до его смерти, а тестам задачи 3 журнал нужен,
+/// пока сервер работает.
+fn a_serving_child(tail: &[&str]) -> Serving {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("wakode.toml");
 
     // Порт занимается и отпускается: узнать свободный номер заранее иначе
     // нечем, а передать готовый слушатель дочернему процессу нельзя.
-    // Окно между отпусканием и `bind` в ребёнке существует; ошибка в нём
-    // будет видна как отказ старта в stderr, который тест печатает.
     let addr = {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap()
@@ -504,47 +533,105 @@ fn serve_answers(tail: &[&str]) {
     )
     .unwrap();
 
+    let log = dir.path().join("server.log");
+    let sink = std::fs::File::create(&log).unwrap();
+
     let mut args = vec!["--config".to_owned(), config.to_str().unwrap().to_owned()];
     args.extend(tail.iter().map(|arg| (*arg).to_owned()));
 
-    let mut child = Killed(
+    let child = Killed(
         wakode()
             .args(&args)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::from(sink))
             .spawn()
             .unwrap(),
     );
 
+    let mut serving = Serving { dir, child, addr, log };
+
     let deadline = Instant::now() + Duration::from_secs(20);
-    // Присваивается на каждом витке до проверки срока, поэтому начального
-    // значения не имеет: любое было бы мёртвым.
     let mut last: String;
-    let answered = loop {
-        if let Some(status) = child.0.try_wait().unwrap() {
-            panic!("процесс `serve` завершился, не начав слушать: {status}");
+    loop {
+        if let Some(status) = serving.child.0.try_wait().unwrap() {
+            panic!(
+                "процесс `serve` завершился, не начав слушать: {status}\nstderr:\n{}",
+                serving.log()
+            );
         }
         match healthz(addr) {
-            Ok(response) if response.starts_with("HTTP/1.1 200 OK") => break response,
+            Ok(response) if response.starts_with("HTTP/1.1 200 OK") => {
+                assert!(response.ends_with("ok"), "нет тела ответа: {response}");
+                return serving;
+            }
             Ok(response) => last = format!("сервер ответил не тем: {response}"),
             Err(err) => last = format!("соединение не установилось: {err}"),
         }
         if Instant::now() >= deadline {
-            // Процесс убивается до чтения stderr: пока он жив, поток не
-            // дойдёт до EOF, и `read_to_string` повис бы вместо того,
-            // чтобы показать, на что жаловался сервер.
-            let _ = child.0.kill();
-            let _ = child.0.wait();
-            let mut log = String::new();
-            if let Some(stderr) = child.0.stderr.as_mut() {
-                let _ = stderr.read_to_string(&mut log);
-            }
-            panic!("{last}\nstderr сервера:\n{log}");
+            panic!("{last}\nstderr сервера:\n{}", serving.log());
         }
         std::thread::sleep(Duration::from_millis(50));
-    };
+    }
+}
 
-    assert!(answered.ends_with("ok"), "нет тела ответа: {answered}");
+#[cfg(unix)]
+#[test]
+fn sigterm_stops_the_server_cleanly_and_stops_the_writer() {
+    // Три утверждения об одном: процесс уходит сам (а не висит с
+    // проглоченным сигналом), уходит успехом (systemd иначе считает
+    // штатную остановку отказом и пишет `Failed with result exit-code`),
+    // и по дороге останавливает писателя.
+    //
+    // Последнее — единственный наблюдаемый признак инварианта «shutdown
+    // зовётся всегда», который до этого плана не держался ничем: до
+    // появления обработчика сигнала SIGTERM убивал процесс на месте.
+    let mut serving = a_serving_child(&["serve"]);
+    let pid = serving.child.0.id();
+
+    // Безопасность: `pid` взят у живого ребёнка, которого мы сами
+    // породили, и до `wait` его номер не переиспользуется.
+    assert_eq!(
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) },
+        0,
+        "kill не отправился"
+    );
+
+    let status = wait_for_exit(&mut serving.child.0, Duration::from_secs(20))
+        .expect("процесс не завершился по SIGTERM за двадцать секунд");
+
+    assert!(
+        status.success(),
+        "SIGTERM — штатная остановка, а не отказ: {status}\n{}",
+        serving.log()
+    );
+
+    let log = serving.log();
+    assert!(
+        log.contains("сигнал завершения"),
+        "сигнал не отмечен в журнале:\n{log}"
+    );
+    assert!(
+        log.contains("писатель остановлен"),
+        "останов писателя не отработал по пути сигнала:\n{log}"
+    );
+}
+
+/// Дождаться завершения процесса, но не дольше срока.
+#[cfg(unix)]
+fn wait_for_exit(
+    child: &mut std::process::Child,
+    within: Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + within;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Сырой `GET /healthz` через настоящий сокет.
