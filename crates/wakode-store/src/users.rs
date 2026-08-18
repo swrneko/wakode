@@ -84,9 +84,46 @@ impl fmt::Debug for NewUser {
     }
 }
 
+/// Завести пользователя.
+///
+/// **Логин триммится и не может быть пустым, и проверка стоит здесь.** У
+/// создания пользователя две двери — экран первичной настройки и
+/// `wakode user create`, — а в плане 3b добавятся регистрация и правка
+/// профиля. Проверка у двери повторяется столько раз, сколько дверей, и
+/// одной забытой хватает, чтобы инварианта не стало. Это не гипотеза: до
+/// этой правки экран триммил и отвергал пустой, а CLI заводил
+/// пользователя с логином `"  админ  "`. Форма входа появится в плане
+/// 3b, и логин она получит из поля ввода — с пробелами, случайно
+/// скопированными вместе со строкой, или без них; какой бы вариант она ни
+/// выбрала, один из двух таких пользователей окажется недостижим. Решать
+/// это надо здесь, а не там.
+///
+/// Тот же приём, что с порогом длины пароля в `wakode_auth::hash_password`:
+/// дверь к записи одна, проверка стоит в ней.
 pub fn insert_user(conn: &Connection, new: &NewUser) -> StoreResult<User> {
+    let login = new.login.trim();
+    if login.is_empty() {
+        return Err(StoreError::LoginEmpty);
+    }
+
     let id = Uuid::now_v7();
     let now = crate::clock::now();
+
+    // Нарушение уникальности логина — вина вызывающего, а не поломка
+    // хранилища, и наружу оно обязано уехать доменной ошибкой. Тип
+    // `StoreError` для того и заведён: «вызывающий не должен разбирать коды
+    // SQLite, чтобы понять, что произошло». Без этой ветки CLI печатал
+    // `база данных: UNIQUE constraint failed: users.login: Error code 2067`
+    // — то есть подавал занятый логин как отказ базы, да ещё языком, на
+    // котором в этом проекте не говорят.
+    let taken = |err: rusqlite::Error| match &err {
+        rusqlite::Error::SqliteFailure(code, _)
+            if code.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            StoreError::LoginTaken(login.to_owned())
+        }
+        _ => StoreError::from(err),
+    };
 
     conn.execute(
         "INSERT INTO users
@@ -95,7 +132,7 @@ pub fn insert_user(conn: &Connection, new: &NewUser) -> StoreResult<User> {
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
         rusqlite::params![
             uuid_to_blob(id),
-            new.login,
+            login,
             new.email,
             new.password_hash,
             new.display_name,
@@ -104,11 +141,12 @@ pub fn insert_user(conn: &Connection, new: &NewUser) -> StoreResult<User> {
             i64::from(new.is_admin),
             now.get(),
         ],
-    )?;
+    )
+    .map_err(taken)?;
 
     Ok(User {
         id,
-        login: new.login.clone(),
+        login: login.to_owned(),
         email: new.email.clone(),
         password_hash: new.password_hash.clone(),
         display_name: new.display_name.clone(),
@@ -120,7 +158,23 @@ pub fn insert_user(conn: &Connection, new: &NewUser) -> StoreResult<User> {
     })
 }
 
+/// Сколько всего пользователей в базе.
+///
+/// Нужно экрану первичной настройки: он открыт ровно до появления первого
+/// пользователя и закрывается навсегда после.
+pub fn user_count(conn: &Connection) -> StoreResult<i64> {
+    let mut stmt = conn.prepare_cached("SELECT count(*) FROM users")?;
+    Ok(stmt.query_row([], |row| row.get(0))?)
+}
+
+/// Найти пользователя по логину.
+///
+/// Логин триммится — той же рукой, что и в [`insert_user`]. Асимметрия
+/// была бы хуже отсутствия обеих: в базе лежит обрезанный логин, а поиск
+/// по `"  swrneko  "` его бы не нашёл, и `wakode key issue --user` со
+/// случайным пробелом сообщал бы «нет пользователя» про существующего.
 pub fn find_user_by_login(conn: &Connection, login: &str) -> StoreResult<Option<User>> {
+    let login = login.trim();
     query_one(conn, "login = ?1", rusqlite::params![login])
 }
 
@@ -147,42 +201,35 @@ type UserRow = (
     i64,
 );
 
-fn query_one(
-    conn: &Connection,
-    predicate: &str,
-    params: &[&dyn rusqlite::ToSql],
-) -> StoreResult<Option<User>> {
-    let sql = format!(
-        "SELECT id, login, email, password_hash, display_name, timezone,
-                timeout_secs, is_admin, created_at, updated_at
-         FROM users WHERE {predicate}"
-    );
-    let mut stmt = conn.prepare_cached(&sql)?;
+/// Колонки в том порядке, в каком их ждёт [`UserRow`].
+///
+/// Одной константой на все запросы: список и порядок колонок обязаны
+/// совпадать с разбором в [`read_row`], а две копии этого списка
+/// расходятся молча — на месте `email` оказался бы `password_hash`, и
+/// компилятор бы этого не заметил, обе колонки текстовые.
+const USER_COLUMNS: &str = "id, login, email, password_hash, display_name, timezone,
+                            timeout_secs, is_admin, created_at, updated_at";
 
-    let row: Option<UserRow> = stmt
-        .query_row(params, |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-                row.get(7)?,
-                row.get(8)?,
-                row.get(9)?,
-            ))
-        })
-        .optional()?;
+fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+    ))
+}
 
-    let Some((id, login, email, password_hash, display_name, zone, timeout_secs, admin, created, updated)) =
-        row
-    else {
-        return Ok(None);
-    };
+fn into_user(row: UserRow) -> StoreResult<User> {
+    let (id, login, email, password_hash, display_name, zone, timeout_secs, admin, created, updated) =
+        row;
 
-    Ok(Some(User {
+    Ok(User {
         id: blob_to_uuid(&id)?,
         login,
         email,
@@ -195,7 +242,49 @@ fn query_one(
         is_admin: admin != 0,
         created_at: Micros::new(created),
         updated_at: Micros::new(updated),
-    }))
+    })
+}
+
+fn query_one(
+    conn: &Connection,
+    predicate: &str,
+    params: &[&dyn rusqlite::ToSql],
+) -> StoreResult<Option<User>> {
+    let sql = format!("SELECT {USER_COLUMNS} FROM users WHERE {predicate}");
+    let mut stmt = conn.prepare_cached(&sql)?;
+
+    let row: Option<UserRow> = stmt.query_row(params, read_row).optional()?;
+
+    match row {
+        None => Ok(None),
+        Some(row) => Ok(Some(into_user(row)?)),
+    }
+}
+
+/// Все пользователи, от самого раннего к позднему.
+///
+/// Порядок по `created_at` делает вывод `wakode user list` устойчивым:
+/// список, меняющий порядок между запусками, нельзя ни сравнить глазами,
+/// ни зафиксировать тестом. `id` вторым ключом — потому что `created_at`
+/// снимается с часов в микросекундах и у двух пользователей, заведённых
+/// подряд одним скриптом, может совпасть; UUIDv7 внутри одной
+/// микросекунды порядок уже не гарантирует, но делает его хотя бы
+/// одинаковым от запуска к запуску.
+///
+/// Постранично не отдаётся: пользователей на selfhosted-инстансе десятки,
+/// и курсор здесь был бы механикой без потребителя.
+pub fn list_users(conn: &Connection) -> StoreResult<Vec<User>> {
+    let sql = format!("SELECT {USER_COLUMNS} FROM users ORDER BY created_at, id");
+    let mut stmt = conn.prepare_cached(&sql)?;
+
+    // Строки собираются в `Vec` до разбора: `query_map` держит `stmt`
+    // занятым, а `into_user` может отказать (битый UUID, неизвестная
+    // таймзона) — и тогда `?` посреди итерации по живому курсору.
+    let rows: Vec<UserRow> = stmt
+        .query_map([], read_row)?
+        .collect::<rusqlite::Result<_>>()?;
+
+    rows.into_iter().map(into_user).collect()
 }
 
 #[cfg(test)]
@@ -218,6 +307,48 @@ mod tests {
     }
 
     #[test]
+    fn list_users_orders_by_created_at_not_by_insertion() {
+        // Интеграционный тест на порядок не доказывает ничего: два
+        // пользователя, вставленные подряд, ложатся по возрастанию и по
+        // `created_at`, и по первичному ключу — `users` объявлена
+        // `WITHOUT ROWID`, её обход идёт по кластерному индексу UUIDv7, а
+        // тот монотонен по времени. Обход совпадает с `ORDER BY`
+        // случайно, и сортировку можно снять незаметно. На том же уже
+        // обжигались в `first_api_key` и в `load_heartbeats`.
+        //
+        // Здесь `created_at` задаётся напрямую и идёт против порядка
+        // вставки — тогда `ORDER BY` становится единственным, что даёт
+        // верный ответ. Сырой SQL в модульном тесте внутри `src/` для того
+        // и позволен: три места в `tests/repository.rs` — про схему, а это
+        // про то, чего через публичный интерфейс не выразить.
+        let mut conn = open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+
+        let named = |login: &str| NewUser {
+            login: login.to_owned(),
+            ..a_user()
+        };
+        let later = insert_user(&conn, &named("вставлен первым")).unwrap();
+        let earlier = insert_user(&conn, &named("вставлен вторым")).unwrap();
+
+        // Второму по вставке приписываем более раннее время.
+        conn.execute(
+            "UPDATE users SET created_at = ?2 WHERE id = ?1",
+            rusqlite::params![uuid_to_blob(earlier.id), 1_000_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE users SET created_at = ?2 WHERE id = ?1",
+            rusqlite::params![uuid_to_blob(later.id), 2_000_i64],
+        )
+        .unwrap();
+
+        let listed = list_users(&conn).unwrap();
+        let logins: Vec<&str> = listed.iter().map(|user| user.login.as_str()).collect();
+        assert_eq!(logins, vec!["вставлен вторым", "вставлен первым"]);
+    }
+
+    #[test]
     fn debug_hides_the_password_hash_but_keeps_everything_else() {
         let mut conn = open_in_memory().unwrap();
         migrate(&mut conn).unwrap();
@@ -234,5 +365,79 @@ mod tests {
             assert!(dump.contains("swrneko@example.org"), "почту прятать не надо: {dump}");
             assert!(dump.contains("Швырнеко"), "имя прятать не надо: {dump}");
         }
+    }
+
+    #[test]
+    fn a_login_is_trimmed_and_cannot_be_empty() {
+        // Инвариант живёт здесь, а не у дверей: дверей две сегодня
+        // (экран настройки, `wakode user create`) и станет четыре в 3b.
+        // До этой правки экран триммил, а CLI — нет, и логин `"  админ  "`
+        // сохранялся с пробелами.
+        let mut conn = open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+
+        let named = |login: &str| NewUser {
+            login: login.to_owned(),
+            ..a_user()
+        };
+
+        let user = insert_user(&conn, &named("  админ  ")).unwrap();
+        assert_eq!(user.login, "админ", "логин сохранён с пробелами");
+        assert!(
+            find_user_by_login(&conn, "админ").unwrap().is_some(),
+            "по обрезанному логину пользователь не находится"
+        );
+
+        assert!(matches!(
+            insert_user(&conn, &named("")),
+            Err(StoreError::LoginEmpty)
+        ));
+        assert!(
+            matches!(
+                insert_user(&conn, &named("   ")),
+                Err(StoreError::LoginEmpty)
+            ),
+            "логин из одних пробелов принят"
+        );
+    }
+
+    #[test]
+    fn a_taken_login_is_a_domain_error_not_a_raw_sqlite_failure() {
+        // `StoreError` заведён ровно за этим: «вызывающий не должен
+        // разбирать коды SQLite, чтобы понять, что произошло». Без
+        // классификации CLI печатал занятый логин как
+        // `база данных: UNIQUE constraint failed: users.login: Error code
+        // 2067` — поломку хранилища вместо вины вызывающего, да ещё
+        // языком, на котором в этом проекте не говорят.
+        let mut conn = open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+
+        insert_user(&conn, &a_user()).unwrap();
+        let err = insert_user(&conn, &a_user()).unwrap_err();
+
+        assert!(
+            matches!(&err, StoreError::LoginTaken(login) if login == "swrneko"),
+            "получили {err:?}"
+        );
+        assert!(
+            !err.to_string().contains("UNIQUE"),
+            "сырой текст SQLite уехал наружу: {err}"
+        );
+    }
+
+    #[test]
+    fn lookup_trims_the_login_the_same_way_insertion_does() {
+        // Асимметрия хуже отсутствия обеих проверок: в базе лежит
+        // обрезанный логин, а поиск по строке с пробелами его не находит,
+        // и `wakode key issue --user "  swrneko  "` сообщает «нет
+        // пользователя» про существующего.
+        let mut conn = open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+
+        insert_user(&conn, &a_user()).unwrap();
+        assert!(
+            find_user_by_login(&conn, "  swrneko  ").unwrap().is_some(),
+            "вставка триммит, а поиск — нет"
+        );
     }
 }

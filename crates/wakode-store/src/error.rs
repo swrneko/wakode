@@ -27,6 +27,12 @@ pub enum StoreError {
 
     #[error("фоновая задача упала")]
     TaskPanicked,
+
+    #[error("логин пуст")]
+    LoginEmpty,
+
+    #[error("пользователь {0} уже есть")]
+    LoginTaken(String),
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;

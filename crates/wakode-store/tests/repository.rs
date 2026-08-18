@@ -5,10 +5,10 @@ use chrono_tz::Tz;
 use wakode_core::{Category, EntityKind, Micros};
 use wakode_store::{
     dirty_days_for, find_key_by_lookup, find_session_by_token_hash, find_user_by_id,
-    find_user_by_login, insert_api_key, insert_heartbeats, insert_session, insert_user,
-    load_heartbeats, migrate, open_in_memory, revoke_key, revoke_session, schema_version,
-    spawn_writer, touch_key_used, HeartbeatRepo, IncomingHeartbeat, Interner, NewApiKey,
-    NewSession, NewUser, Outcome, SqliteStore, StoreError, UserRepo,
+    find_user_by_login, first_api_key, insert_api_key, insert_heartbeats, insert_session,
+    insert_user, list_users, load_heartbeats, migrate, open_in_memory, revoke_key, revoke_session,
+    schema_version, spawn_writer, touch_key_used, user_count, HeartbeatRepo, IncomingHeartbeat,
+    Interner, KeyRepo, NewApiKey, NewSession, NewUser, Outcome, SqliteStore, StoreError, UserRepo,
 };
 
 fn a_user(login: &str) -> NewUser {
@@ -233,6 +233,152 @@ fn missing_user_is_none_not_an_error() {
 
     assert!(find_user_by_login(&conn, "нет такого").unwrap().is_none());
     assert!(find_user_by_id(&conn, uuid::Uuid::now_v7()).unwrap().is_none());
+}
+
+#[test]
+fn an_empty_database_has_no_users_and_no_keys() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+
+    assert_eq!(user_count(&conn).unwrap(), 0);
+    assert!(first_api_key(&conn).unwrap().is_none());
+}
+
+#[test]
+fn user_count_follows_the_users_actually_inserted() {
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+
+    insert_user(&conn, &a_user("первый")).unwrap();
+    assert_eq!(user_count(&conn).unwrap(), 1);
+
+    insert_user(&conn, &a_user("второй")).unwrap();
+    assert_eq!(user_count(&conn).unwrap(), 2);
+}
+
+#[test]
+fn users_are_listed_oldest_first() {
+    // Что здесь доказано: `list_users` возвращает всех заведённых, с их
+    // полями, и в порядке вставки. Чего НЕ доказано: что порядок даёт
+    // `ORDER BY`, — два пользователя, вставленные подряд, ложатся по
+    // возрастанию и по `created_at`, и по первичному ключу (`users`
+    // объявлена `WITHOUT ROWID`, обход идёт по кластерному индексу
+    // UUIDv7, а тот монотонен по времени). Сортировку можно снять, и этот
+    // тест останется зелёным. Настоящая проверка сортировки —
+    // `list_users_orders_by_created_at_not_by_insertion` в `src/users.rs`,
+    // где `created_at` идёт против порядка вставки. Не удаляй её как дубль.
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+
+    let first = insert_user(&conn, &a_user("первый")).unwrap();
+    let second = insert_user(&conn, &a_user("второй")).unwrap();
+
+    let listed = list_users(&conn).unwrap();
+    let logins: Vec<&str> = listed.iter().map(|user| user.login.as_str()).collect();
+    assert_eq!(logins, vec!["первый", "второй"]);
+    assert_eq!(listed[0].id, first.id);
+    assert_eq!(listed[1].id, second.id);
+}
+
+#[test]
+fn listed_users_carry_every_field() {
+    // `wakode user list` печатает логин и признак администратора, а
+    // `is_admin` в `a_user` по умолчанию `false`. Список, где все поля
+    // взяты из соседних колонок или заполнены умолчаниями, прошёл бы
+    // проверку порядка целиком: она смотрит только на `login` и `id`.
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+
+    let mut new = a_user("swrneko");
+    new.email = Some("swrneko@example.org".to_owned());
+    new.display_name = Some("Швырнеко".to_owned());
+    new.timezone = Tz::Europe__Moscow;
+    new.timeout_secs = 1_200;
+    new.is_admin = true;
+    let created = insert_user(&conn, &new).unwrap();
+
+    let listed = list_users(&conn).unwrap();
+    assert_eq!(listed.len(), 1);
+    let user = &listed[0];
+    assert_eq!(user.id, created.id);
+    assert_eq!(user.login, "swrneko");
+    assert_eq!(user.email.as_deref(), Some("swrneko@example.org"));
+    assert_eq!(user.password_hash, new.password_hash);
+    assert_eq!(user.display_name.as_deref(), Some("Швырнеко"));
+    assert_eq!(user.timezone, Tz::Europe__Moscow);
+    assert_eq!(user.timeout_secs, 1_200);
+    assert!(user.is_admin);
+    assert_eq!(user.created_at, created.created_at);
+    assert_eq!(user.updated_at, created.updated_at);
+}
+
+#[test]
+fn first_api_key_returns_the_oldest_one() {
+    // Порядок обязан быть воспроизводимым: шаг 5 старта расшифровывает
+    // именно этот ключ, и «какой-нибудь» здесь означал бы, что проверка
+    // мастер-ключа то проходит, то нет.
+    //
+    // Сам `ORDER BY` этот тест НЕ доказывает: ключи вставляются подряд, и
+    // порядок совпадает с сортировкой случайно. Настоящая проверка —
+    // `first_api_key_orders_by_created_at_not_by_insertion` в
+    // `src/keys.rs`, где `created_at` идёт против порядка вставки.
+    // Не удаляй её как дубль.
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    let user = insert_user(&conn, &a_user("swrneko")).unwrap();
+
+    let older = insert_api_key(
+        &conn,
+        &NewApiKey {
+            user_id: user.id,
+            name: "старый".to_owned(),
+            key_encrypted: vec![1],
+            key_lookup: vec![1],
+        },
+    )
+    .unwrap();
+    insert_api_key(
+        &conn,
+        &NewApiKey {
+            user_id: user.id,
+            name: "новый".to_owned(),
+            key_encrypted: vec![2],
+            key_lookup: vec![2],
+        },
+    )
+    .unwrap();
+
+    let found = first_api_key(&conn).unwrap().unwrap();
+    assert_eq!(found.id, older.id);
+    assert_eq!(found.key_encrypted, vec![1]);
+}
+
+#[test]
+fn first_api_key_sees_keys_of_every_user() {
+    // Шаг 5 старта проверяет мастер-ключ инстанса целиком, а не одного
+    // пользователя: ключ любого владельца зашифрован тем же мастер-ключом.
+    //
+    // Первый пользователь заводится намеренно и остаётся без ключей. Без
+    // него тест не проверял бы ничего: при единственном пользователе его
+    // прошла бы и реализация, ищущая ключи только у самого раннего или
+    // только у администратора.
+    let mut conn = open_in_memory().unwrap();
+    migrate(&mut conn).unwrap();
+    insert_user(&conn, &a_user("без ключей")).unwrap();
+    let other = insert_user(&conn, &a_user("другой")).unwrap();
+
+    insert_api_key(
+        &conn,
+        &NewApiKey {
+            user_id: other.id,
+            name: "чужой".to_owned(),
+            key_encrypted: vec![9],
+            key_lookup: vec![9],
+        },
+    )
+    .unwrap();
+
+    assert!(first_api_key(&conn).unwrap().is_some());
 }
 
 #[test]
@@ -1211,6 +1357,29 @@ async fn store_goes_through_the_trait_end_to_end() {
 }
 
 #[tokio::test]
+async fn the_store_answers_both_questions_through_the_traits() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(&dir.path().join("wakode.db"), 16).unwrap();
+
+    assert_eq!(store.user_count().await.unwrap(), 0);
+    assert!(store.first_key().await.unwrap().is_none());
+
+    let user = store.create_user(a_user("swrneko")).await.unwrap();
+    store
+        .create_key(NewApiKey {
+            user_id: user.id,
+            name: "ключ".to_owned(),
+            key_encrypted: vec![3],
+            key_lookup: vec![3],
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(store.user_count().await.unwrap(), 1);
+    assert_eq!(store.first_key().await.unwrap().unwrap().key_encrypted, vec![3]);
+}
+
+#[tokio::test]
 async fn backup_produces_a_readable_copy() {
     let dir = tempfile::tempdir().unwrap();
     let store = SqliteStore::open(&dir.path().join("wakode.db"), 16).unwrap();
@@ -1264,6 +1433,163 @@ async fn opening_the_store_applies_migrations() {
 
     let conn = wakode_store::open(&path).unwrap();
     assert_eq!(schema_version(&conn).unwrap(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_writer_that_was_shut_down_reports_it_is_gone() {
+    // Долг плана 2: до появления shutdown у `WriterGone` не было ни одного
+    // достижимого пути, и вариант ошибки существовал на веру.
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(&dir.path().join("wakode.db"), 8).unwrap();
+    let user = store.create_user(a_user("swrneko")).await.unwrap();
+
+    store
+        .record_heartbeats(user.id, vec![incoming(1_000, "f.rs", None)], user.timezone)
+        .await
+        .unwrap();
+
+    store.shutdown().await.unwrap();
+
+    let err = store
+        .record_heartbeats(user.id, vec![incoming(2_000, "f.rs", None)], user.timezone)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::WriterGone), "получили {err:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_lets_the_writer_finish_what_it_accepted() {
+    // Остановка не должна терять уже принятое: cli, получивший успех,
+    // стёр отметки у себя, и «приняли, но не записали» — потеря.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wakode.db");
+    let store = SqliteStore::open(&path, 64).unwrap();
+    let user = store.create_user(a_user("swrneko")).await.unwrap();
+
+    let batch: Vec<IncomingHeartbeat> = (0..5_000)
+        .map(|i| incoming(1_000 + i, "f.rs", Some("wakode")))
+        .collect();
+    let report = store
+        .record_heartbeats(user.id, batch, user.timezone)
+        .await
+        .unwrap();
+    assert_eq!(report.inserted(), 5_000);
+
+    store.shutdown().await.unwrap();
+
+    let conn = wakode_store::open(&path).unwrap();
+    let loaded = load_heartbeats(
+        &conn,
+        user.id,
+        Micros::from_secs(0),
+        Micros::from_secs(999_999),
+    )
+    .unwrap();
+    assert_eq!(loaded.len(), 5_000);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_works_after_the_queue_has_overflowed() {
+    // Останов проходит после того, как очередь переполнялась и писатель
+    // был занят долгим батчем.
+    //
+    // Честно про пределы: замену `send().await` на `try_send` в `shutdown`
+    // этот тест **не** ловит. К моменту вызова все заявки-наполнители уже
+    // дождались ответа, слот освободился, и `try_send` прошёл бы тоже.
+    // Поймать разницу можно только вызвав `shutdown` ровно в тот момент,
+    // когда буфер занят, а это гонка, а не тест. Почему `send().await`
+    // всё-таки правильный выбор: отметки при полной очереди отклонять
+    // нужно — cli дошлёт их из своей, — а сигнал остановки отклонять
+    // некуда, и вызывающему нечем обработать такой отказ.
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(&dir.path().join("wakode.db"), 1).unwrap();
+    let user = store.create_user(a_user("swrneko")).await.unwrap();
+
+    // Забить писателя надолго и не дожидаться ответа.
+    let batch: Vec<IncomingHeartbeat> = (0..20_000)
+        .map(|i| incoming(1_000 + i, "f.rs", Some("wakode")))
+        .collect();
+    let busy = {
+        let store = store.clone();
+        let tz = user.timezone;
+        tokio::spawn(async move { store.record_heartbeats(user.id, batch, tz).await })
+    };
+
+    // Пока писатель занят, наполнить очередь ёмкости 1 до отказа. Заявки
+    // уходят параллельно и не дожидаются ответа: последовательное
+    // ожидание освобождало бы слот перед каждой следующей, и очередь не
+    // копилась бы никогда.
+    let mut pending = Vec::new();
+    for i in 0..64 {
+        let store = store.clone();
+        let tz = user.timezone;
+        let id = user.id;
+        pending.push(tokio::spawn(async move {
+            store
+                .record_heartbeats(id, vec![incoming(900_000 + i, "g.rs", None)], tz)
+                .await
+        }));
+    }
+
+    let mut refused = 0;
+    for task in pending {
+        if let Ok(Err(StoreError::WriteQueueFull)) = task.await {
+            refused += 1;
+        }
+    }
+    assert!(refused > 0, "очередь не переполнилась, тест ничего не проверяет");
+
+    store
+        .shutdown()
+        .await
+        .expect("останов не прошёл при полной очереди");
+
+    let _ = busy.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn data_written_before_shutdown_is_readable_after_it() {
+    // Останов не теряет принятого: cli, получивший успех, стёр отметки у
+    // себя, и «приняли, но при остановке потеряли» — потеря.
+    //
+    // Честно про пределы: порядок «отпустить соединение до подтверждения»
+    // этот тест не проверяет. В WAL-режиме второе соединение открывается и
+    // читает закоммиченное независимо от того, живо ли первое, — то есть
+    // перестановка `drop(conn)` и отправки подтверждения снаружи
+    // неразличима. Порядок оставлен правильным по построению: получивший
+    // подтверждение вправе считать базу отпущенной, и следующая задача,
+    // которой это понадобится по-настоящему, не будет гадать.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wakode.db");
+    let store = SqliteStore::open(&path, 8).unwrap();
+    let user = store.create_user(a_user("swrneko")).await.unwrap();
+
+    store
+        .record_heartbeats(user.id, vec![incoming(1_000, "f.rs", None)], user.timezone)
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+
+    let conn = wakode_store::open(&path).unwrap();
+    let loaded = load_heartbeats(
+        &conn,
+        user.id,
+        Micros::from_secs(0),
+        Micros::from_secs(9_999),
+    )
+    .unwrap();
+    assert_eq!(loaded.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_twice_is_not_an_error() {
+    // Останов зовут и при штатном завершении, и из обработчика сигнала;
+    // второй вызов не должен превращаться в отказ.
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(&dir.path().join("wakode.db"), 8).unwrap();
+
+    store.shutdown().await.unwrap();
+    store.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

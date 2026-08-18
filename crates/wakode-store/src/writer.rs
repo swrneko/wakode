@@ -9,12 +9,19 @@ use crate::error::{StoreError, StoreResult};
 use crate::heartbeats::{insert_heartbeats, IncomingHeartbeat, InsertReport};
 use crate::interner::Interner;
 
-/// Заявка на запись и канал для ответа.
-struct WriteJob {
-    user: Uuid,
-    batch: Vec<IncomingHeartbeat>,
-    tz: Tz,
-    reply: oneshot::Sender<StoreResult<InsertReport>>,
+/// Заявка писателю.
+enum WriteJob {
+    Insert {
+        user: Uuid,
+        batch: Vec<IncomingHeartbeat>,
+        tz: Tz,
+        reply: oneshot::Sender<StoreResult<InsertReport>>,
+    },
+    /// Сигнал остановиться. Писатель отвечает и выходит из цикла, уничтожая
+    /// приёмник, — после этого все отправители получают `WriterGone`.
+    Stop {
+        ack: oneshot::Sender<()>,
+    },
 }
 
 /// Ручка к пишущей задаче. Клонируется свободно, все копии шлют в один канал.
@@ -41,24 +48,59 @@ pub struct WriteHandle {
 ///
 /// Паника внутри `insert_heartbeats` (например, `ids[cursor]` в
 /// `heartbeats.rs` или один из `.expect("словарь отравлен паникой")` в
-/// `interner.rs`) молча убивает этот поток: `while let` не переживёт её,
-/// и все заявки после этого момента до конца жизни процесса получат
-/// `StoreError::WriterGone`. Супервизора, который бы поднимал писателя
-/// заново, в волне 0 нет — это осознанно, а не недосмотр: поведение
-/// fail-closed, ложный успех наружу не уходит и закоммиченное раньше не
-/// теряется, просто новые записи перестают приниматься.
+/// `interner.rs`) писателя **не убивает**: тело вставки идёт под
+/// `catch_unwind`, отправитель получает `StoreError::TaskPanicked`, и
+/// следующая заявка обрабатывается как ни в чём не бывало. До этого
+/// паника уносила поток молча, а единственным сигналом наружу был
+/// `WriterGone`, неотличимый от штатной остановки.
+///
+/// Оговорка: отравленный `RwLock` словаря `catch_unwind` не лечит — все
+/// последующие заявки будут паниковать снова и снова возвращать
+/// `TaskPanicked`. Это деградация, но не молчаливая, и в отличие от
+/// прежнего поведения она видна вызывающему на каждой заявке.
 pub fn spawn_writer(mut conn: Connection, interner: Arc<Interner>, capacity: usize) -> WriteHandle {
     let (tx, mut rx) = mpsc::channel::<WriteJob>(capacity);
 
     // Отдельный поток, а не задача tokio: работа тут блокирующая, и держать
     // её на исполнителе асинхронных задач нельзя.
     std::thread::spawn(move || {
+        let mut stop_ack: Option<oneshot::Sender<()>> = None;
+
         while let Some(job) = rx.blocking_recv() {
-            let result = insert_heartbeats(&mut conn, &interner, job.user, &job.batch, job.tz);
-            // Ответ уходит только после того, как транзакция закоммичена
-            // внутри insert_heartbeats. Отправитель мог уйти — это не наша
-            // беда, запись уже состоялась.
-            let _ = job.reply.send(result);
+            match job {
+                WriteJob::Stop { ack } => {
+                    // Подтверждение уходит не здесь, а после выхода из
+                    // цикла — когда соединение уже отпущено. Ответить
+                    // раньше значило бы сказать «остановился», продолжая
+                    // держать базу: вызывающий, переоткрывающий файл сразу
+                    // после `shutdown`, попал бы на живое соединение.
+                    stop_ack = Some(ack);
+                    break;
+                }
+                WriteJob::Insert { user, batch, tz, reply } => {
+                    // Ответ уходит только после того, как транзакция
+                    // закоммичена внутри insert_heartbeats. Отправитель мог
+                    // уйти — это не наша беда, запись уже состоялась.
+                    //
+                    // Паника внутри вставки не должна убивать писателя
+                    // навсегда: до этого она уносила поток молча, и
+                    // единственным сигналом наружу был `WriterGone`,
+                    // неотличимый от штатной остановки.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        insert_heartbeats(&mut conn, &interner, user, &batch, tz)
+                    }))
+                    .unwrap_or(Err(StoreError::TaskPanicked));
+
+                    let _ = reply.send(result);
+                }
+            }
+        }
+
+        // Соединение закрывается до подтверждения: получивший `ack` вправе
+        // считать, что база отпущена и файл можно переоткрывать.
+        drop(conn);
+        if let Some(ack) = stop_ack {
+            let _ = ack.send(());
         }
     });
 
@@ -74,7 +116,7 @@ impl WriteHandle {
         tz: Tz,
     ) -> StoreResult<InsertReport> {
         let (reply, wait) = oneshot::channel();
-        let job = WriteJob { user, batch, tz, reply };
+        let job = WriteJob::Insert { user, batch, tz, reply };
 
         // try_send, а не send: ждать места в очереди значило бы копить
         // запросы в памяти. Отказ здесь превращается в 503 с Retry-After,
@@ -85,5 +127,21 @@ impl WriteHandle {
         })?;
 
         wait.await.map_err(|_| StoreError::WriterGone)?
+    }
+
+    /// Остановить писателя, дождавшись, пока он разберёт принятое.
+    ///
+    /// Повторный вызов не ошибка: останов зовут и при штатном завершении,
+    /// и из обработчика сигнала, и эти пути пересекаются.
+    pub async fn shutdown(&self) -> StoreResult<()> {
+        let (ack, wait) = oneshot::channel();
+        match self.tx.send(WriteJob::Stop { ack }).await {
+            Ok(()) => {
+                let _ = wait.await;
+                Ok(())
+            }
+            // Приёмник уже уничтожен — писатель остановлен, цель достигнута.
+            Err(_) => Ok(()),
+        }
     }
 }

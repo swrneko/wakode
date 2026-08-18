@@ -1,12 +1,18 @@
 [workspace]
 resolver = "3"
-members = ["crates/wakode-core", "crates/wakode-store"]
+members = ["crates/wakode-core", "crates/wakode-store", "crates/wakode-auth", "crates/wakode-api", "crates/wakode"]
 
 [workspace.package]
 edition = "2024"
 license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
+# Только в бинаре: подкоманды CLI сводят отказы хранилища, криптографии и
+# конфига в один тип, и заводить ради этого свой enum на восемь вариантов,
+# каждый из которых печатается один раз, — работа без потребителя.
+# Библиотечные крейты остаются на `thiserror`: у их ошибок есть вызывающий,
+# который обязан их различать.
+anyhow = "1.0.104"
 # Без `clock`: он тянет iana-time-zone, а тот читает /etc/localtime. Изоляция
 # wakode-core от файловой системы обязана держаться на списке зависимостей, а не
 # на честном слове. Крейту, которому понадобится `Local::now()`, включать фичу у
@@ -20,8 +26,25 @@ proptest = "1"
 serde_json = "1"
 rusqlite = "0.40.2"
 thiserror = "2.0.20"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+base64 = "0.23"
 tokio = "1.53.1"
 uuid = "1.24.1"
 xxhash-rust = "0.8.18"
 tempfile = "3.27.0"
+axum = "0.8"
+axum-extra = "0.12"
+clap = "4.6"
+toml = "1.1"
+tower = "0.5"
+tower-http = "0.7"
+tracing = "0.1"
+tracing-subscriber = "0.3"
 wakode-core = { version = "0.1.0", path = "crates/wakode-core" }
+wakode-api = { version = "0.1.0", path = "crates/wakode-api" }
+wakode-auth = { version = "0.1.0", path = "crates/wakode-auth" }
+wakode-store = { version = "0.1.0", path = "crates/wakode-store" }

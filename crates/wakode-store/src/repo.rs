@@ -8,7 +8,7 @@ use wakode_core::{Heartbeat, Micros};
 use crate::error::StoreResult;
 use crate::heartbeats::{IncomingHeartbeat, InsertReport};
 use crate::interner::Interner;
-use crate::keys::{ApiKey, NewApiKey};
+use crate::keys::{ApiKey, NewApiKey, Revocation};
 use crate::sessions::{NewSession, Session};
 use crate::users::{NewUser, User};
 use crate::writer::{spawn_writer, WriteHandle};
@@ -41,12 +41,15 @@ pub trait UserRepo: Send + Sync {
     fn create_user(&self, new: NewUser) -> impl std::future::Future<Output = StoreResult<User>> + Send;
     fn user_by_login(&self, login: &str) -> impl std::future::Future<Output = StoreResult<Option<User>>> + Send;
     fn user_by_id(&self, id: Uuid) -> impl std::future::Future<Output = StoreResult<Option<User>>> + Send;
+    fn user_count(&self) -> impl std::future::Future<Output = StoreResult<i64>> + Send;
+    fn list_users(&self) -> impl std::future::Future<Output = StoreResult<Vec<User>>> + Send;
 }
 
 pub trait KeyRepo: Send + Sync {
     fn create_key(&self, new: NewApiKey) -> impl std::future::Future<Output = StoreResult<ApiKey>> + Send;
     fn key_by_lookup(&self, lookup: Vec<u8>) -> impl std::future::Future<Output = StoreResult<Option<ApiKey>>> + Send;
-    fn revoke_key(&self, id: Uuid) -> impl std::future::Future<Output = StoreResult<()>> + Send;
+    fn revoke_key(&self, id: Uuid) -> impl std::future::Future<Output = StoreResult<Revocation>> + Send;
+    fn first_key(&self) -> impl std::future::Future<Output = StoreResult<Option<ApiKey>>> + Send;
 }
 
 pub trait SessionRepo: Send + Sync {
@@ -81,6 +84,16 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
+    /// Версия схемы в открытом файле.
+    ///
+    /// Нужна старту, чтобы сказать в журнал, какую схему он получил.
+    /// Без этого владелец, обновивший сборку, видит «сервер поднят» и не
+    /// видит, применилось ли что-нибудь, — а миграции применяет
+    /// `SqliteStore::open` молча.
+    pub async fn schema_version(&self) -> StoreResult<i32> {
+        on_own_connection(self, |conn| crate::schema_version(&conn)).await
+    }
+
     /// Открыть (или создать) базу по пути и поднять пишущую задачу.
     ///
     /// `write_queue` — ёмкость канала пишущей задачи, обычно из конфига
@@ -102,6 +115,11 @@ impl SqliteStore {
             writer,
             interner,
         })
+    }
+
+    /// Остановить пишущую задачу и дождаться, пока она разберёт принятое.
+    pub async fn shutdown(&self) -> StoreResult<()> {
+        self.writer.shutdown().await
     }
 
     /// Консистентный снимок живой базы.
@@ -208,6 +226,14 @@ impl UserRepo for SqliteStore {
     async fn user_by_id(&self, id: Uuid) -> StoreResult<Option<User>> {
         on_own_connection(self, move |conn| crate::find_user_by_id(&conn, id)).await
     }
+
+    async fn user_count(&self) -> StoreResult<i64> {
+        on_own_connection(self, |conn| crate::user_count(&conn)).await
+    }
+
+    async fn list_users(&self) -> StoreResult<Vec<User>> {
+        on_own_connection(self, |conn| crate::list_users(&conn)).await
+    }
 }
 
 impl KeyRepo for SqliteStore {
@@ -219,8 +245,12 @@ impl KeyRepo for SqliteStore {
         on_own_connection(self, move |conn| crate::find_key_by_lookup(&conn, &lookup)).await
     }
 
-    async fn revoke_key(&self, id: Uuid) -> StoreResult<()> {
+    async fn revoke_key(&self, id: Uuid) -> StoreResult<Revocation> {
         on_own_connection(self, move |conn| crate::revoke_key(&conn, id)).await
+    }
+
+    async fn first_key(&self) -> StoreResult<Option<ApiKey>> {
+        on_own_connection(self, |conn| crate::first_api_key(&conn)).await
     }
 }
 

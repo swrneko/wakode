@@ -144,6 +144,73 @@ pub fn find_key_by_lookup(conn: &Connection, lookup: &[u8]) -> StoreResult<Optio
     }))
 }
 
+/// Самый ранний API-ключ в базе, если он есть.
+///
+/// Последовательность старта берёт им две вещи разом: сам факт наличия
+/// ключей (без мастер-ключа стартовать нельзя) и шифротекст для проверки,
+/// что мастер-ключ тот самый. Порядок по `created_at` делает проверку
+/// воспроизводимой — «какой-нибудь» ключ означал бы, что она то проходит,
+/// то нет.
+///
+/// Отозванные ключи функция **видит**: они зашифрованы тем же мастер-ключом
+/// и для проверки годятся так же, а инстанс, где единственный ключ отозвали,
+/// обязан продолжать отказываться стартовать с чужим мастер-ключом.
+/// Отсюда обязательство на будущее: ротация мастер-ключа, когда её напишут,
+/// перешифровывает **в том числе отозванные** ключи. Иначе старт упрётся в
+/// самый старый неперешифрованный и отвергнет корректный новый мастер-ключ.
+pub fn first_api_key(conn: &Connection) -> StoreResult<Option<ApiKey>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, user_id, name, key_encrypted, created_at, last_used_at, revoked_at
+         FROM api_keys ORDER BY created_at, id LIMIT 1",
+    )?;
+
+    let row = stmt
+        .query_row([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+            ))
+        })
+        .optional()?;
+
+    let Some((id, user_id, name, key_encrypted, created, used, revoked)) = row else {
+        return Ok(None);
+    };
+
+    Ok(Some(ApiKey {
+        id: blob_to_uuid(&id)?,
+        user_id: blob_to_uuid(&user_id)?,
+        name,
+        key_encrypted,
+        created_at: Micros::new(created),
+        last_used_at: used.map(Micros::new),
+        revoked_at: revoked.map(Micros::new),
+    }))
+}
+
+/// Чем кончился отзыв.
+///
+/// Три исхода, а не два, потому что «ключа нет» и «ключ уже был отозван» —
+/// разные события для того, кто отзывает. Второе — обычное дело (ретрай,
+/// двойной клик), первое почти всегда опечатка в идентификаторе. Слив их в
+/// одно «готово», мы отвечали бы «отозван» на опечатку, и владелец,
+/// отзывающий утёкший ключ, считал бы инцидент закрытым, пока ключ
+/// продолжает работать.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Revocation {
+    /// Ключ был действующим, теперь отозван.
+    Done,
+    /// Ключ существует и был отозван раньше. `revoked_at` не тронут.
+    AlreadyRevoked,
+    /// Ключа с таким идентификатором в базе нет.
+    NoSuchKey,
+}
+
 /// Отозвать ключ.
 ///
 /// `AND revoked_at IS NULL` в запросе — не лишнее условие: повторный отзыв
@@ -151,12 +218,35 @@ pub fn find_key_by_lookup(conn: &Connection, lookup: &[u8]) -> StoreResult<Optio
 /// временем, иначе «когда ключ отозвали» превратится в «когда его в
 /// последний раз пытались отозвать». Повтор — обычное дело: ретрай HTTP,
 /// двойной клик в настройках.
-pub fn revoke_key(conn: &Connection, id: Uuid) -> StoreResult<()> {
-    conn.execute(
+///
+/// Второй запрос делается только когда первый не тронул ни одной строки,
+/// то есть на редком пути: различить «нет такого» и «уже отозван» иначе
+/// нечем, а платить за это на успешном отзыве незачем.
+pub fn revoke_key(conn: &Connection, id: Uuid) -> StoreResult<Revocation> {
+    let blob = uuid_to_blob(id);
+
+    let changed = conn.execute(
         "UPDATE api_keys SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
-        rusqlite::params![uuid_to_blob(id), clock::now().get()],
+        rusqlite::params![blob, clock::now().get()],
     )?;
-    Ok(())
+    if changed > 0 {
+        return Ok(Revocation::Done);
+    }
+
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM api_keys WHERE id = ?1",
+            rusqlite::params![blob],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+
+    Ok(if exists {
+        Revocation::AlreadyRevoked
+    } else {
+        Revocation::NoSuchKey
+    })
 }
 
 pub fn touch_key_used(conn: &Connection, id: Uuid) -> StoreResult<()> {
@@ -176,6 +266,129 @@ mod tests {
     /// не мог совпасть с куском времени или UUID случайно.
     const ENCRYPTED: &[u8] = &[222, 173, 190, 239];
     const LOOKUP: &[u8] = &[13, 240, 13, 240];
+
+    /// Завести пользователя и вернуть его идентификатор.
+    fn a_user_id(conn: &Connection) -> Uuid {
+        insert_user(
+            conn,
+            &NewUser {
+                login: "swrneko".to_owned(),
+                email: None,
+                password_hash: "непрозрачно".to_owned(),
+                display_name: None,
+                timezone: "UTC".parse().unwrap(),
+                timeout_secs: 900,
+                is_admin: false,
+            },
+        )
+        .unwrap()
+        .id
+    }
+
+    #[test]
+    fn first_api_key_orders_by_created_at_not_by_insertion() {
+        // Интеграционный тест на порядок не доказывает ничего: два ключа,
+        // вставленные подряд, ложатся по возрастанию и по `created_at`, и
+        // по первичному ключу — `api_keys` объявлена `WITHOUT ROWID`, её
+        // обход идёт по кластерному индексу UUIDv7, а тот монотонен по
+        // времени. Поэтому обход совпадает с `ORDER BY` случайно, и
+        // сортировку можно снять незаметно. На том же в `load_heartbeats`
+        // уже обжигались, только там причиной был индекс `hb_time`.
+        //
+        // Здесь `created_at` задаётся напрямую и идёт против порядка
+        // вставки — тогда `ORDER BY` становится единственным, что даёт
+        // верный ответ. Сырой SQL в модульном тесте внутри `src/` для того
+        // и позволен: три места в `tests/repository.rs` — про схему, а это
+        // про то, чего через публичный интерфейс не выразить.
+        let mut conn = open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        let user = a_user_id(&conn);
+
+        let later = insert_api_key(
+            &conn,
+            &NewApiKey {
+                user_id: user,
+                name: "вставлен первым".to_owned(),
+                key_encrypted: ENCRYPTED.to_vec(),
+                key_lookup: LOOKUP.to_vec(),
+            },
+        )
+        .unwrap();
+        let earlier = insert_api_key(
+            &conn,
+            &NewApiKey {
+                user_id: user,
+                name: "вставлен вторым".to_owned(),
+                key_encrypted: vec![1, 2, 3],
+                key_lookup: vec![4, 5, 6],
+            },
+        )
+        .unwrap();
+
+        // Второму по вставке приписываем более раннее время.
+        conn.execute(
+            "UPDATE api_keys SET created_at = ?2 WHERE id = ?1",
+            rusqlite::params![uuid_to_blob(earlier.id), 1_000_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE api_keys SET created_at = ?2 WHERE id = ?1",
+            rusqlite::params![uuid_to_blob(later.id), 2_000_i64],
+        )
+        .unwrap();
+
+        let found = first_api_key(&conn).unwrap().unwrap();
+        assert_eq!(
+            found.id, earlier.id,
+            "порядок пришёл от обхода таблицы, а не от ORDER BY"
+        );
+
+        // При совпавшем времени выбирается меньший `id`. Совпадение
+        // реально: `created_at` в микросекундах, а два ключа, выданные
+        // одним пакетным вызовом, вполне лягут в одну.
+        //
+        // Честно про пределы этой проверки: снятие `, id` из `ORDER BY` её
+        // не роняет. `api_keys` объявлена `WITHOUT ROWID`, обход идёт по
+        // кластерному индексу первичного ключа, и при равенстве времени
+        // результат совпадает с сортировкой по `id` сам собой. Тайбрейкер
+        // остаётся в запросе потому, что делает гарантию явной, а не
+        // зависящей от физического порядка хранения, — но доказать его
+        // отдельным тестом нечем, как и `ORDER BY time` в
+        // `load_heartbeats`.
+        conn.execute("UPDATE api_keys SET created_at = 1000", rusqlite::params![])
+            .unwrap();
+
+        let smaller = if earlier.id < later.id { earlier.id } else { later.id };
+        assert_eq!(first_api_key(&conn).unwrap().unwrap().id, smaller);
+    }
+
+    #[test]
+    fn first_api_key_sees_revoked_keys_too() {
+        // Шаг 5 старта расшифровывает этим ключом пробное значение, чтобы
+        // убедиться, что мастер-ключ тот самый. Отозванный ключ зашифрован
+        // тем же мастер-ключом и для проверки годится ровно так же, а
+        // инстанс, где единственный ключ отозвали, обязан продолжать
+        // отказываться стартовать с чужим мастер-ключом.
+        let mut conn = open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        let user = a_user_id(&conn);
+
+        let key = insert_api_key(
+            &conn,
+            &NewApiKey {
+                user_id: user,
+                name: "отозванный".to_owned(),
+                key_encrypted: ENCRYPTED.to_vec(),
+                key_lookup: LOOKUP.to_vec(),
+            },
+        )
+        .unwrap();
+        revoke_key(&conn, key.id).unwrap();
+
+        let found = first_api_key(&conn).unwrap().unwrap();
+        assert_eq!(found.id, key.id);
+        assert!(found.revoked_at.is_some());
+    }
 
     #[test]
     fn debug_hides_the_key_material_but_keeps_the_name() {
@@ -216,5 +429,38 @@ mod tests {
             assert!(dump.contains(crate::REDACTED), "заглушки не видно: {dump}");
             assert!(dump.contains("ноутбук"), "имя ключа прятать не надо: {dump}");
         }
+    }
+
+    #[test]
+    fn revoking_tells_the_three_cases_apart() {
+        // «Ключа нет» и «уже отозван» — разные события для того, кто
+        // отзывает. Пока `revoke_key` возвращала `()`, ноль затронутых
+        // строк был неотличим от успеха, и CLI отвечал «отозван» на
+        // опечатку в идентификаторе: владелец, отзывающий утёкший ключ,
+        // считал инцидент закрытым, пока ключ продолжал работать.
+        let mut conn = open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        let user = a_user_id(&conn);
+
+        let key = insert_api_key(
+            &conn,
+            &NewApiKey {
+                user_id: user,
+                name: "ноутбук".to_owned(),
+                key_encrypted: ENCRYPTED.to_vec(),
+                key_lookup: LOOKUP.to_vec(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(revoke_key(&conn, key.id).unwrap(), Revocation::Done);
+        assert_eq!(
+            revoke_key(&conn, key.id).unwrap(),
+            Revocation::AlreadyRevoked
+        );
+        assert_eq!(
+            revoke_key(&conn, Uuid::now_v7()).unwrap(),
+            Revocation::NoSuchKey
+        );
     }
 }
