@@ -3612,11 +3612,26 @@ git commit -m "feat(api): экран первичной настройки и з
 
 **Files:**
 - Modify: `crates/wakode-api/src/lib.rs`
-- Modify: `crates/wakode-api/tests/api.rs`
+- Create: `crates/wakode-api/tests/log.rs`
+- Modify: `crates/wakode-api/Cargo.toml`, `crates/wakode/Cargo.toml`
 - Modify: `crates/wakode/src/main.rs`
 
 **Interfaces:**
-- Produces: `router` с `CatchPanicLayer` и `TraceLayer`; инициализация подписчика `tracing` в бинаре.
+- Produces: `wakode_api::with_layers(Router) -> Router`; `router` возвращает `with_layers(...)`; инициализация подписчика `tracing` в бинаре.
+
+**Query-строка действительно утекает — это проверено прогоном, а не документацией.** `TraceLayer::new_for_http()` берёт `DefaultMakeSpan`, и он пишет поле `uri` целиком:
+
+```
+INFO request{method=GET uri=/тихо?api_key=waka_0000…4444 version=HTTP/1.1}: tower_http::trace::on_response
+```
+
+Поэтому `new_for_http()` в чистом виде брать нельзя: нужен свой `make_span_with`, берущий `request.uri().path()`. Заголовок `Authorization`, наоборот, по умолчанию не пишется (`include_headers` выключен) — но сторож на это всё равно нужен, иначе `include_headers(true)`, добавленный кем-нибудь ради отладки, унесёт ключ в журнал.
+
+**Инвариант, который код проверить не может:** путь не несёт секретов. Сегодня это так, но маршрут вида `/api/keys/{ключ}` уронил бы значение в журнал мимо всех проверок. Записано в докблоке `request_span`.
+
+**`on_response` поднимается до `INFO`.** Умолчание `tower-http` — `DEBUG`, а боевой фильтр в бинаре — `tower_http=info`: с умолчанием журнал запросов был бы пуст при стоящем слое, и обещание «метод, путь, код, длительность журналируются» оказалось бы ложью.
+
+**Тесты с захватом журнала живут в отдельном бинаре.** После этой задачи **все** маршруты идут через `with_layers`, то есть каждый тест в `api.rs` дёргает те же callsite'ы `tracing` — и дёргает их без установленного подписчика. `tracing` кеширует «интерес» к callsite глобально на процесс, поэтому соседи отравляли кеш тем немногим тестам, у которых подписчик есть: набор падал примерно в одном прогоне из четырёх под нагрузкой, без единой правки кода. Мьютекс вокруг `set_default` не помогал — дело не в одновременности подписчиков. В `tests/log.rs` подписчик ровно один и глобальный, а разводятся тесты потоко-локальными буферами; отсечка по уровню делается при разборе накопленного, а не подписчиком.
 
 **Паника в обработчике не должна ронять процесс.** Без перехвата паника уносит задачу соединения; соседние запросы выживают, но клиент получает оборванное соединение вместо ответа, и в логе не остаётся ничего внятного. `CatchPanicLayer` превращает её в `500` с тем же телом, что у остальных ошибок.
 
@@ -3756,14 +3771,23 @@ fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> axum::response:
 - [ ] **Step 4: Прогнать**
 
 Run: `cargo test -p wakode-api`
-Expected: PASS, двадцать четыре теста.
+Expected: PASS — 53 теста в `api.rs`, 10 в `log.rs`, 2 юнита в `session.rs`.
 
 - [ ] **Step 5: Мутационная проверка**
 
 | Мутация | Обязан упасть |
 |---|---|
-| убрать `CatchPanicLayer` | `a_panicking_handler_becomes_a_500` |
+| убрать `CatchPanicLayer` | все пять тестов паники |
 | `handle_panic` возвращает текст паники в теле | `the_panic_response_is_json_like_every_other_error` |
+| `handle_panic` ничего не пишет в лог | `a_panic_message_reaches_the_log_but_not_the_client`, `a_panicking_request_is_journalled_as_a_completed_500` |
+| `handle_panic` паникует на чужой нагрузке | `an_unusual_panic_payload_is_survived_and_named` |
+| убрать ветку `&str` / ветку `String` в `handle_panic` | `a_panic_message_reaches_the_log_but_not_the_client` |
+| вернуть `DefaultMakeSpan` (`new_for_http()`) | `the_query_string_never_reaches_the_log`, `the_real_router_journals_a_request_without_its_query` |
+| писать `uri` вместо `path` | те же |
+| `include_headers(true)` в span | `the_authorization_header_never_reaches_the_log` |
+| `on_response` вернуть к умолчанию `DEBUG`, `info_span!` → `debug_span!` | `a_finished_request_is_journalled_at_info` |
+| переставить слои (`TraceLayer` внутрь) | `a_panicking_request_is_journalled_as_a_completed_500` |
+| `router` возвращает голый маршрутизатор без `with_layers` | `the_real_router_journals_a_request_without_its_query` — и **только он**: тесты паники собирают свой маршрут через `with_layers` напрямую, поэтому проводку `router` нужно сторожить отдельным тестом |
 
 - [ ] **Step 6: Коммит**
 
