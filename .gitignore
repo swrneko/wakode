@@ -6,3 +6,6 @@ dist/
 *.db-shm
 .env
 .superpowers/
+
+# Локальные настройки Claude Code, не для репозитория
+.claude/settings.local.json
