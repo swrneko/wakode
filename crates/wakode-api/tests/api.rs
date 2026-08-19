@@ -1925,7 +1925,12 @@ async fn setup_closes_even_when_registration_is_open() {
 #[tokio::test]
 async fn a_correct_token_opens_setup_from_any_address() {
     // Ради этого всё и делается: владелец за обратным прокси заводит
-    // администратора, не открывая настройку всему интернету.
+    // администратора, не открывая настройку всему интернету. Пир — не
+    // петлевой и без единого заголовка посредника: `address_allows_setup`
+    // отказала бы уже на первой строке (`!peer.ip().is_loopback()`), и
+    // только токен решает исход. Тест с петлевым пиром и заголовком
+    // прокси доказывал бы только половину имени — что токен отменяет
+    // именно прокси-ветку, а не «любой адрес» буквально.
     let dir = tempfile::tempdir().unwrap();
     let token = wakode_auth::SetupToken::generate();
     let state = a_state(&dir).with_setup_token(Some(token.clone()));
@@ -1937,7 +1942,35 @@ async fn a_correct_token_opens_setup_from_any_address() {
                 .uri("/api/setup")
                 .header("content-type", "application/json")
                 .header("x-wakode-setup-token", token.to_string())
-                .header("x-forwarded-for", "203.0.113.5")
+                .body(setup_body("админ"))
+                .unwrap(),
+            "203.0.113.5:41234",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn an_empty_setup_token_header_is_not_a_presentation() {
+    // Ловушка для плана 4: экран настройки отправляет заголовок
+    // безусловно и оставляет его пустым, когда `token_required == false`
+    // (петлевая машина владельца, токен вводить незачем). Пустое значение
+    // обязано провалиться в адресную ветку, а не отказать как неверный
+    // токен, — иначе форма ломала бы настройку там, где токен не нужен
+    // вовсе. Пир петлевой и без заголовков посредника, поэтому `201`
+    // здесь может дать только адресная ветка.
+    let dir = tempfile::tempdir().unwrap();
+    let state = a_state(&dir).with_setup_token(Some(wakode_auth::SetupToken::generate()));
+
+    let response = router(state)
+        .oneshot(with_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/api/setup")
+                .header("content-type", "application/json")
+                .header("x-wakode-setup-token", "")
                 .body(setup_body("админ"))
                 .unwrap(),
             "127.0.0.1:41234",
@@ -1945,7 +1978,11 @@ async fn a_correct_token_opens_setup_from_any_address() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "пустой заголовок токена отказал вместо прохода по адресу"
+    );
 }
 
 #[tokio::test]
@@ -2019,6 +2056,13 @@ async fn two_setup_token_headers_are_refused() {
     // не заметив второго заголовка. Поставь мусор первым — и такая
     // реализация тоже отказала бы, только не по той причине, которую
     // тест называет в имени.
+    //
+    // Пир — петлевой, без единого заголовка посредника: адресная ветка
+    // сама по себе пропустила бы запрос. `403` здесь может дать только
+    // дедупликация — иначе тест не отличил бы «отказ из-за дубликатов»
+    // от «отказ по адресу», и мутация, стирающая факт предъявления при
+    // дубликатах (`presented_token` возвращает `None` вместо явного
+    // отказа), проходила бы зелёной.
     let dir = tempfile::tempdir().unwrap();
     let token = wakode_auth::SetupToken::generate();
     let state = a_state(&dir).with_setup_token(Some(token.clone()));
@@ -2033,7 +2077,7 @@ async fn two_setup_token_headers_are_refused() {
                 .header("x-wakode-setup-token", "мусор")
                 .body(setup_body("админ"))
                 .unwrap(),
-            "203.0.113.5:41234",
+            "127.0.0.1:41234",
         ))
         .await
         .unwrap();
