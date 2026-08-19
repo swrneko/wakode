@@ -14,6 +14,10 @@ Output lands in `fixtures/wakatime/` (gitignored — the raw capture contains re
 
 `--with-writes` posts two heartbeats against `/tmp/wakode-fixture-probe.txt`, one of them deliberately invalid. It exists because the bulk response shape — how WakaTime reports a single failed element without failing the request — is the part the spec could only infer from `wakatime-cli` source. It does add a blip to the account's own statistics; skip it if that matters.
 
+## If the handshake dies
+
+`curl: (35) TLS connect error … unexpected eof while reading` looks like blocking or a bad key and is neither. `wakatime.com` publishes both A and AAAA records; on a network with a broken IPv6 route, curl honestly prefers AAAA and dies mid-handshake, before authentication is ever attempted. The script probes for this and falls back to IPv4 on its own, announcing it. To check by hand: `curl -4 -sS -o /dev/null -w '%{http_code}\n' https://wakatime.com/api/v1` — a `404` means the path is reachable and the stack is fine (that path is not an endpoint).
+
 Pick a `DAY` (default: yesterday) with ordinary activity. `DAY=2026-08-14 tools/capture-wakatime-fixtures.sh` overrides it.
 
 ## What each file settles
