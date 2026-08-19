@@ -1,0 +1,65 @@
+[Unit]
+Description=wakode — selfhosted time tracker
+Documentation=https://github.com/swrneko/wakode
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=wakode
+Group=wakode
+ExecStart=/usr/local/bin/wakode --config /etc/wakode/wakode.toml serve
+
+# Мастер-ключ приезжает переменной окружения из файла, а не из строки
+# ExecStart: аргументы командной строки видны в `ps` любому процессу того
+# же пользователя, переменные окружения — нет. Файл держать в 0600 и
+# владельцем root, читает его systemd, а не сам сервис.
+EnvironmentFile=/etc/wakode/wakode.env
+
+# Останов. Число здесь — не оформление: wakode сам ограничивает
+# дочитывание начатых запросов десятью секундами (`signal::GRACE`), и этот
+# предел обязан срабатывать раньше systemd'шного. Иначе прилетит SIGKILL,
+# а он не оставляет шанса остановить писателя и отпустить базу — то есть
+# теряет ровно то, ради чего завершение по сигналу заведено.
+#
+# Соотношение держится тестом `the_unit_gives_the_process_more_time_than_it_takes`
+# в crates/wakode/src/signal.rs: он читает этот файл и сравнивает числа.
+# Меняешь одно — тест потребует поменять и другое.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+Restart=on-failure
+RestartSec=5
+
+# Журнал уходит в stderr — туда, где его подберёт journald. stdout занят
+# данными подкоманд, и смешивать их нельзя.
+StandardOutput=journal
+StandardError=journal
+
+# База и всё, что сервис пишет.
+StateDirectory=wakode
+WorkingDirectory=/var/lib/wakode
+
+# Ограничения. Сервис ходит только в сеть и в свою папку с базой.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

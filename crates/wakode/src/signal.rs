@@ -140,4 +140,43 @@ mod tests {
         let drained = wait_for_drain(served, std::future::pending(), Duration::from_millis(20)).await;
         assert!(drained, "предел потёк до сигнала");
     }
+
+    /// Юнит systemd обязан давать процессу больше времени, чем тот берёт.
+    ///
+    /// Докстринг `GRACE` утверждает это с самого начала, но до сих пор это
+    /// было обещание в комментарии: юнит-файла в репозитории не было, и
+    /// сравнивать было не с чем. Теперь есть, и утверждение проверяется.
+    ///
+    /// Что ловит: правку любого из двух чисел без правки второго. Поднять
+    /// `GRACE` выше `TimeoutStopSec` значит вернуть SIGKILL посреди
+    /// дренажа — то есть потерю писателя, ради которой всё это и заведено.
+    #[test]
+    fn the_unit_gives_the_process_more_time_than_it_takes() {
+        let unit = include_str!("../../../deploy/wakode.service");
+
+        let stop_timeout = unit
+            .lines()
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix("TimeoutStopSec="))
+            .expect("в юните нет TimeoutStopSec — предел останова отдан умолчанию systemd");
+        let stop_timeout = Duration::from_secs(
+            stop_timeout
+                .parse()
+                .expect("TimeoutStopSec записан не целым числом секунд"),
+        );
+
+        assert!(
+            stop_timeout > GRACE,
+            "юнит даёт на останов {stop_timeout:?}, а процесс берёт {GRACE:?}: \
+             SIGKILL прилетит посреди дренажа и унесёт писателя"
+        );
+
+        // Не просто «больше», а с запасом: останов — это дренаж HTTP
+        // плюс остановка писателя, и второе `GRACE` не покрывает вовсе.
+        assert!(
+            stop_timeout >= GRACE * 2,
+            "запас между {stop_timeout:?} и {GRACE:?} меньше двукратного: \
+             на остановку писателя после дренажа времени почти не остаётся"
+        );
+    }
 }
