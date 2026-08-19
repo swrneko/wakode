@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use anyhow::Context as _;
 use clap::Parser;
 use wakode_api::{AppSettings, AppState};
+use wakode_store::UserRepo;
 
 use crate::cli::{Cli, Command, KeyCommand, MasterKeyCommand, UserCommand};
 use crate::config::Config;
@@ -212,11 +213,33 @@ async fn serve(started: &startup::Startup) -> anyhow::Result<()> {
     // идёт искать причину в брандмауэре.
     tracing::info!(listen = %started.config.server.listen, "сервер поднят");
 
+    // Токен заводится, только пока настройка не выполнена: после первого
+    // пользователя эндпоинт закрыт навсегда, и печатать секрет в журнал
+    // на каждый перезапуск было бы раздачей секрета без назначения.
+    //
+    // `?` здесь безопасен: `serve` вызывается из `dispatch`, чей результат
+    // уходит в `outcome`, а `outcome` возвращается уже после останова
+    // писателя. Мимо `shutdown` управление не уходит.
+    let setup_token = if started.store.user_count().await? == 0 {
+        let token = wakode_auth::SetupToken::generate();
+        // Единственное место в проекте, где секрет пишется в журнал
+        // намеренно. Обоснование — в докстринге `SetupToken`.
+        tracing::info!(
+            token = %token,
+            header = wakode_api::setup::SETUP_TOKEN_HEADER,
+            "администратора ещё нет: первичная настройка открыта по этому токену"
+        );
+        Some(token)
+    } else {
+        None
+    };
+
     let state = AppState::new(
         started.store.clone(),
         started.master_key.clone(),
         app_settings(&started.config),
-    );
+    )
+    .with_setup_token(setup_token);
 
     // Сигнал нужен обеим сторонам: сервер по нему перестаёт принимать
     // соединения, а предел ожидания по нему же начинает течь. Ждать одну

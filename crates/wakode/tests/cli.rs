@@ -1159,3 +1159,83 @@ fn a_duplicate_login_is_refused_in_plain_words() {
         "сырой текст SQLite уехал владельцу: {stderr}"
     );
 }
+
+#[test]
+fn the_setup_token_from_the_log_opens_setup_through_a_proxy() {
+    // Сквозная проводка: токен из журнала — тот самый, который принимает
+    // сервер, и он снимает ровно тот отказ, который иначе получает
+    // запрос с прокси-заголовком. Мутация «в состояние уходит None»
+    // роняет этот тест и не роняет ни одного теста в wakode-api.
+    let serving = a_serving_child(&["serve"]);
+
+    let token = wait_for_setup_token(&serving);
+
+    // Сначала — что отказ вообще есть. Без этой половины 201 ниже
+    // ничего не доказывал бы: он получился бы и без токена.
+    let refused = raw_setup(serving.addr, Some("203.0.113.5"), None);
+    assert!(
+        refused.starts_with("HTTP/1.1 403"),
+        "запрос через посредника без токена обязан быть отвергнут: {refused}"
+    );
+
+    let created = raw_setup(serving.addr, Some("203.0.113.5"), Some(&token));
+    assert!(
+        created.starts_with("HTTP/1.1 201"),
+        "токен из журнала не открыл настройку: {created}\nжурнал:\n{}",
+        serving.log()
+    );
+}
+
+/// Дождаться строки с токеном в журнале и вернуть его значение.
+fn wait_for_setup_token(serving: &Serving) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let log = serving.log();
+        if let Some(token) = log
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("token="))
+        {
+            return token.to_owned();
+        }
+        if Instant::now() >= deadline {
+            panic!("токен настройки не появился в журнале:\n{log}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Сырой `POST /api/setup` через настоящий сокет.
+fn raw_setup(
+    addr: std::net::SocketAddr,
+    forwarded_for: Option<&str>,
+    token: Option<&str>,
+) -> String {
+    // Не `br#"..."#`: сырой байтовый литерал в Rust обязан быть ASCII, а
+    // пароль — намеренно кириллический (проверяет ту же границу, что и
+    // `the_password_threshold_counts_characters_not_bytes` в `wakode-api`).
+    let body = r#"{"login":"admin","password":"достаточно длинный","timezone":"Europe/Moscow"}"#
+        .as_bytes();
+
+    let mut request = format!(
+        "POST /api/setup HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    if let Some(value) = forwarded_for {
+        request.push_str(&format!("X-Forwarded-For: {value}\r\n"));
+    }
+    if let Some(value) = token {
+        request.push_str(&format!("X-Wakode-Setup-Token: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    stream.write_all(body).unwrap();
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response
+}
