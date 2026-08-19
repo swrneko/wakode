@@ -18,6 +18,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
@@ -34,6 +35,20 @@ use tracing::Level;
 /// запроса, а строки о завершении не будет вовсе.
 pub fn with_layers(router: Router) -> Router {
     router
+        // Слоем, а не по маршрутам: ответы этого API поголовно зависят от
+        // того, кто спрашивает, — от ключа, сессии или адреса пира, — и
+        // маршрут, забывший заголовок, отдал бы чужой ответ в общий кеш.
+        // Забыть слой нельзя: он навешивается на всё сразу.
+        //
+        // `if_not_present`, а не `overriding`: маршрут, которому
+        // кешируемость положена, ставит свой `Cache-Control` и остаётся с
+        // ним. Это точка расширения для плана 4 — встроенная SPA раздаёт
+        // статику с хешами в именах, и делать её нехранимой значило бы
+        // заставлять браузер выкачивать бандл на каждое открытие.
+        .layer(SetResponseHeaderLayer::if_not_present(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        ))
         .layer(CatchPanicLayer::custom(handle_panic))
         .layer(
             TraceLayer::new_for_http()

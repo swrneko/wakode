@@ -2177,3 +2177,72 @@ async fn without_a_token_the_address_still_decides() {
     let body = json_body(response).await;
     assert!(body["error"].as_str().unwrap().contains("локального адреса"));
 }
+
+/// Ответ статуса не должен попасть в общий кеш.
+///
+/// `token_required` считается по адресу пира и по заголовкам посредника,
+/// то есть ответ разный для разных клиентов. Кеш перед инстансом отдал бы
+/// ответ одного клиента другому: экран настройки спрятал бы поле токена
+/// там, где сервер его требует, и форма получила бы `403` без объяснения.
+///
+/// Почему именно `no-store`, а не `Vary`: `Vary` перечисляет **заголовки**
+/// запроса, а решающий вход здесь — адрес TCP-пира, которого в запросе
+/// нет вовсе. Ключ кеша, учитывающий его, построить нечем, поэтому
+/// единственный честный ответ — не хранить.
+#[tokio::test]
+async fn the_setup_status_is_never_cached() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let response = router(a_state(&dir))
+        .oneshot(with_peer(
+            Request::builder()
+                .uri("/api/setup/status")
+                .body(Body::empty())
+                .unwrap(),
+            "127.0.0.1:41234",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .map(|value| value.to_str().unwrap()),
+        Some("no-store"),
+        "ответ статуса отдан кешируемым"
+    );
+}
+
+/// Маршрут вправе объявить себя кешируемым, и слой ему не мешает.
+///
+/// Зеркало предыдущего, и не для симметрии: без него подмена
+/// `if_not_present` на `overriding` не роняет ничего. Цена такой подмены
+/// придёт в плане 4 — встроенная SPA раздаёт статику с хешами в именах,
+/// и `no-store` поверх неё заставил бы браузер выкачивать бандл на каждое
+/// открытие страницы, причём молча.
+#[tokio::test]
+async fn a_route_that_declares_itself_cacheable_keeps_its_own_header() {
+    async fn a_cacheable_asset() -> impl axum::response::IntoResponse {
+        ([("cache-control", "public, max-age=31536000, immutable")], "бандл")
+    }
+
+    let app = wakode_api::with_layers(
+        axum::Router::new().route("/статика", axum::routing::get(a_cacheable_asset)),
+    );
+
+    let response = app
+        .oneshot(Request::builder().uri("/статика").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .map(|value| value.to_str().unwrap()),
+        Some("public, max-age=31536000, immutable"),
+        "слой затёр собственный заголовок маршрута"
+    );
+}
