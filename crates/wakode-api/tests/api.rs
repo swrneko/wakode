@@ -1986,6 +1986,44 @@ async fn an_empty_setup_token_header_is_not_a_presentation() {
 }
 
 #[tokio::test]
+async fn an_unreadable_setup_token_header_is_a_presentation_not_an_absence() {
+    // Регрессия фикс-раунда 1: `to_str().unwrap_or_default()` на не-UTF-8
+    // значении даёт пустую строку — ту же, что у настоящего
+    // непредъявления. Пустив её в общую проверку на пустоту, получаем
+    // нечитаемый заголовок, неотличимый от отсутствующего: запрос
+    // проваливается в адресную ветку, а не отказывает как мусорный токен.
+    //
+    // Пир — петлевой и без заголовков посредника: `201` здесь может дать
+    // только ошибочный провал в адресную ветку, `403` — только то, что
+    // нечитаемое значение по-прежнему считается предъявлением.
+    let dir = tempfile::tempdir().unwrap();
+    let state = a_state(&dir).with_setup_token(Some(wakode_auth::SetupToken::generate()));
+
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/setup")
+        .header("content-type", "application/json");
+    request = request.header(
+        "x-wakode-setup-token",
+        axum::http::HeaderValue::from_bytes(&[0xff, 0xfe, 0x80]).unwrap(),
+    );
+
+    let response = router(state)
+        .oneshot(with_peer(
+            request.body(setup_body("админ")).unwrap(),
+            "127.0.0.1:41234",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "нечитаемый заголовок токена молча провалился в адресную ветку и завёл администратора"
+    );
+}
+
+#[tokio::test]
 async fn a_wrong_token_is_refused_even_from_a_loopback_address() {
     // Предъявление токена — утверждение «я знаю секрет», и ложное
     // утверждение получает свой отказ. Провалиться в адресную ветку и
