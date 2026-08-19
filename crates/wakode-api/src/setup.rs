@@ -29,15 +29,14 @@ pub struct SetupStatus {
     pub needed: bool,
     /// Потребуется ли **этому** клиенту токен настройки.
     ///
-    /// Считается той же функцией, по которой `POST /api/setup` откажет,
-    /// — иначе экран настройки решал бы по своей копии правил, а копии
+    /// Истинно ровно тогда, когда выполнены оба условия разом: адрес сам
+    /// по себе настройку не пропускает (`address_allows_setup` вернула
+    /// отказ), и инстанс токен вообще выдавал. Второе условие — не
+    /// педантизм: инстанс без выпущенного токена не может его требовать,
+    /// и `true` здесь означал бы поле, которое не примет ни одно
+    /// значение. `POST /api/setup` отказывает по той же логике — иначе
+    /// экран настройки решал бы по своей копии правил, а копии
     /// разъезжаются.
-    ///
-    /// Оговорка на сегодня: самого токена ещё нет, `POST /api/setup` его
-    /// не принимает. До задачи 3 `true` читается как «с этого адреса
-    /// настройка не пройдёт вовсе», и экрану предъявить нечего. Имя поля
-    /// смотрит вперёд намеренно: менять его вместе с появлением токена
-    /// значило бы ломать уже написанный экран.
     pub token_required: bool,
 }
 
@@ -58,8 +57,8 @@ pub async fn status(
 ) -> Result<Json<SetupStatus>, ApiError> {
     Ok(Json(SetupStatus {
         needed: state.store.user_count().await? == 0,
-        token_required: address_allows_setup(state.setup_from_any_address, &peer, &headers)
-            .is_err(),
+        token_required: state.setup_token.is_some()
+            && address_allows_setup(state.setup_from_any_address, &peer, &headers).is_err(),
     }))
 }
 
@@ -147,6 +146,37 @@ fn address_allows_setup(
     Ok(())
 }
 
+/// Заголовок, которым предъявляют токен первичной настройки.
+///
+/// Заголовок, а не поле тела: тело разбирается **после** проверки
+/// доступа (задача 12 плана 3a, тест `the_address_is_checked_before_the_database`),
+/// и токен в теле заставил бы разбирать тело до решения о доступе — то
+/// есть рассказывать чужому про формат JSON раньше, чем ему отказали.
+pub const SETUP_TOKEN_HEADER: &str = "x-wakode-setup-token";
+
+const SETUP_TOKEN_WRONG: &str = "токен первичной настройки не подходит; \
+     возьмите его из журнала сервера — он печатается при старте, пока \
+     администратора нет, и меняется при каждом перезапуске";
+
+/// Предъявленный токен, если он вообще предъявлен.
+///
+/// Нечитаемое значение — это всё равно предъявление: вернуть здесь `None`
+/// значило бы, что мусорный заголовок стирает сам факт попытки и запрос
+/// уходит в адресную ветку. Отдаём заведомо не подходящую строку, чтобы
+/// решение принимал `matches`, а не разбор.
+///
+/// Два заголовка — тоже отказ. Урок парковки задачи 11: при дубликатах
+/// «какое значение считается предъявленным» — вопрос, на который у
+/// клиента и сервера легко оказываются разные ответы.
+fn presented_token(headers: &HeaderMap) -> Option<String> {
+    let mut values = headers.get_all(SETUP_TOKEN_HEADER).iter();
+    let first = values.next()?;
+    if values.next().is_some() {
+        return Some(String::new());
+    }
+    Some(first.to_str().unwrap_or_default().to_owned())
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetupRequest {
@@ -173,11 +203,31 @@ pub async fn setup(
     // чужому незачем слышать про формат JSON.
     request: Result<Json<SetupRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<SetupResponse>), ApiError> {
-    if let Err(err) = address_allows_setup(state.setup_from_any_address, &peer, &headers) {
-        if let ApiError::Forbidden(reason) = &err {
-            tracing::warn!(reason, "первичная настройка отклонена");
+    match presented_token(&headers) {
+        Some(presented) => {
+            let opens = state
+                .setup_token
+                .as_ref()
+                .is_some_and(|expected| expected.matches(&presented));
+            if !opens {
+                // Значение не пишется — ни в журнал, ни в ответ. В
+                // журнале оно было бы подсказкой подбирающему о том, что
+                // до сервера дошло; в ответе — эхом клиенту самому себе.
+                tracing::warn!("предъявлен неверный токен первичной настройки");
+                return Err(ApiError::Forbidden(SETUP_TOKEN_WRONG));
+            }
+            // Токен подошёл — адрес больше ничего не решает. В этом и
+            // весь смысл: владельцу за прокси иначе пришлось бы открыть
+            // настройку всем через `setup_from_any_address`.
         }
-        return Err(err);
+        None => {
+            if let Err(err) = address_allows_setup(state.setup_from_any_address, &peer, &headers) {
+                if let ApiError::Forbidden(reason) = &err {
+                    tracing::warn!(reason, "первичная настройка отклонена");
+                }
+                return Err(err);
+            }
+        }
     }
 
     // Закрыт навсегда после первого пользователя — независимо от того,

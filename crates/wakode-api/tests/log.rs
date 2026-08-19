@@ -494,3 +494,79 @@ async fn a_refused_setup_is_journalled_with_its_reason() {
         "в журнале не названа причина отказа:\n{log}"
     );
 }
+
+/// Неверный токен виден в журнале причиной, но не своим значением.
+///
+/// Тест живёт здесь же, а не в `api.rs`: строка проверяется по подстроке
+/// в собранном журнале, а `tracing` кеширует интерес к каждому callsite
+/// на весь процесс — соседи из `api.rs` дёргают тот же обработчик без
+/// подписчика и отравляют кеш.
+#[tokio::test]
+async fn a_wrong_setup_token_is_journalled_without_its_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let presented = "SGVsbG8sIHRoaXMgaXMgbm90IHRoZSB0b2tlbg";
+    let state =
+        a_state(&dir).with_setup_token(Some(wakode_auth::SetupToken::generate()));
+
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/setup")
+        .header("content-type", "application/json")
+        .header("x-wakode-setup-token", presented)
+        .body(Body::from(
+            r#"{"login":"admin","password":"достаточно длинный","timezone":"Europe/Moscow"}"#,
+        ))
+        .unwrap();
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        "127.0.0.1:41234".parse::<std::net::SocketAddr>().unwrap(),
+    ));
+
+    let (response, log) =
+        response_and_log_at(tracing::Level::WARN, router(state), request).await;
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        log.contains("предъявлен неверный токен первичной настройки"),
+        "отказ по токену не попал в журнал:\n{log}"
+    );
+    assert!(
+        !log.contains(presented),
+        "предъявленный токен утёк в журнал:\n{log}"
+    );
+}
+
+/// Успешная настройка по токену не пишет адресный отказ.
+///
+/// Урок задачи 3: `warn!` про «первичная настройка отклонена» стоит внутри
+/// ветки `None` разбора предъявленного токена. Вынеси его наружу — и
+/// успешная настройка по прокси-адресу заодно сообщила бы о несуществующем
+/// отказе.
+#[tokio::test]
+async fn a_successful_token_setup_does_not_log_an_address_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let token = wakode_auth::SetupToken::generate();
+    let state = a_state(&dir).with_setup_token(Some(token.clone()));
+
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/setup")
+        .header("content-type", "application/json")
+        .header("x-wakode-setup-token", token.to_string())
+        .header("x-forwarded-for", "203.0.113.5")
+        .body(Body::from(
+            r#"{"login":"admin","password":"достаточно длинный","timezone":"Europe/Moscow"}"#,
+        ))
+        .unwrap();
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        "127.0.0.1:41234".parse::<std::net::SocketAddr>().unwrap(),
+    ));
+
+    let (response, log) =
+        response_and_log_at(tracing::Level::WARN, router(state), request).await;
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert!(
+        !log.contains("первичная настройка отклонена"),
+        "успешная настройка по токену записана как отказ:\n{log}"
+    );
+}
