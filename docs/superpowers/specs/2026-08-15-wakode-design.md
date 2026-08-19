@@ -61,17 +61,21 @@ Wakapi (Go) уже решает базовую задачу. wakode отлича
 
 **Одиночная отметка.** 201/202 с телом `{"data": {"id", "entity", "type", "time"}}`.
 
-**`all_time_since_today`.** `{"data": {"total_seconds", "text", "decimal", "digital", "daily_average", "is_up_to_date", "percent_calculated", "timeout", "range": {"start", "end", "start_date", "end_date", "start_text", "end_text", "timezone"}}}`.
+**`all_time_since_today`.** Сверено со снимком: верхний уровень — `data` **и `message`**; последнего в прежней редакции не было, а он приходит всегда (в снимке: «Calculating stats for this user. Check back later.»). `data`: `total_seconds`, `text`, `decimal`, `digital`, `daily_average`, `is_up_to_date`, `timeout`, `range`. Поля `percent_calculated`, обещанного прежней редакцией, в ответе **нет**. `range`: `start`, `end`, `start_date`, `end_date`, `start_text`, `end_text`, `timezone`.
 
 **`summaries`.** Верхний уровень: `data[]`, `start`, `end`, `cumulative_total`, `daily_average`.
 - `cumulative_total`: `decimal`, `digital`, `seconds`, `text`.
 - `daily_average`: `days_including_holidays`, `days_minus_holidays`, `holidays`, `seconds`, `seconds_including_other_language`, `text`, `text_including_other_language`.
-- элемент `data[]`: `grand_total`, `range`, и массивы `categories`, `projects`, `languages`, `editors`, `operating_systems`, `machines`, `dependencies`, `branches`, `entities`.
+- элемент `data[]`: `grand_total`, `range`, и массивы `categories`, `projects`, `languages`, `editors`, `operating_systems`, `machines`, `dependencies`. Массивов `branches` и `entities` в ответе **нет** — прежняя редакция называла их по документации, снимок их не содержит; они приходят только при запросе с явным `project`.
+- пустые дни в диапазоне присутствуют и имеют те же ключи: массивы пустые, `grand_total.text` — `"0 secs"`. Проверено снимком за 30 дней: 30 элементов `data[]`, из них 12 пустых. Требование спеки к `summaries` подтверждено чужим поведением, а не выведено.
+- `start`/`end` верхнего уровня — границы в UTC, соответствующие полуночи **часового пояса аккаунта** (в снимке: `2026-07-19T21:00:00Z` для пояса Europe/Moscow).
 - элемент массива: `name`, `total_seconds`, `seconds`, `hours`, `minutes`, `percent`, `digital`, `text`.
 - `grand_total`: `total_seconds`, `hours`, `minutes`, `digital`, `text`.
 - `range`: `date`, `start`, `end`, `text`, `timezone`.
 
-**`statusbar/today`.** Официальной документации нет. Форма: `{"cached_at": ..., "data": <элемент data[] из summaries>}`. Подлежит уточнению по живому ответу перед реализацией.
+**`statusbar/today`.** Официальной документации нет; форма снята с живого ответа. Верхний уровень — `{"data": <элемент data[] из summaries>, "has_team_features": <bool>}`. Поля `cached_at`, которое предполагала прежняя редакция, в ответе **нет**, зато есть `has_team_features`, которого она не предполагала.
+
+**Оговорка про `ai_*`.** Снимок 2026 года несёт в `grand_total` и в элементах массивов десятки полей `ai_…` (`ai_sessions`, `ai_input_tokens`, `ai_model_costs`, …), которых нет ни в документации, ни в прежней редакции этого раздела. Волна 0 их не воспроизводит: плагины редакторов их не читают, а выдумывать значения хуже, чем не отдавать поле. Решение пересматривается, если найдётся потребитель.
 
 ### Поля heartbeat
 
@@ -261,8 +265,8 @@ TDD вертикальными срезами: один тест → одна р
 
 ## 11. Открытые вопросы
 
-1. **Добавка последней отметке сессии** — величина неизвестна, калибруется по живому аккаунту WakaTime до реализации движка. Блокирует точное совпадение цифр, не блокирует работу.
-2. **Точная форма `statusbar/today`** — официальной документации нет, снимается с живого ответа.
+1. ~~**Добавка последней отметке сессии**~~ — **закрыт калибровкой.** Добавки не существует: последняя отметка сессии не даёт ничего. Модель WakaTime восстановлена точно и воспроизводит контрольный день до последнего знака — 62 интервала из 62, сумма 21839.3 с, совпадение с `durations`, с `grand_total` и с посуточными итогами по каждому проекту. Существенное следствие: зазоры меряются в **глобальном** порядке отметок и лишь потом приписываются проекту более ранней из пары; группировка по проекту заранее, как было заложено в движке, завышала итог на 13% на том же дне. Подробности и метод — `.claude/docs/decisions/no-tail-padding.md`.
+2. ~~**Точная форма `statusbar/today`**~~ — **закрыт снимком**, см. раздел «Проверенные формы ответов».
 3. **Полнота data dump на бесплатном тарифе** — вопрос волны 1.
 
 ## Источники
