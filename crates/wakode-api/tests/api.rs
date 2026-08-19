@@ -1961,28 +1961,40 @@ async fn an_empty_setup_token_header_is_not_a_presentation() {
     // токен, — иначе форма ломала бы настройку там, где токен не нужен
     // вовсе. Пир петлевой и без заголовков посредника, поэтому `201`
     // здесь может дать только адресная ветка.
-    let dir = tempfile::tempdir().unwrap();
-    let state = a_state(&dir).with_setup_token(Some(wakode_auth::SetupToken::generate()));
+    //
+    // Пробельные значения проверяются наравне с пустым: без них `.trim()`
+    // в `presented_token` не держался ничем — мутация `let trimmed =
+    // value;` проходила по всему workspace зелёной, а заголовок из одних
+    // пробелов отказывал бы на машине владельца ровно так же, как пустой.
+    // Форма, шлющая `" "`, — не выдумка: пробел легко приезжает вместе с
+    // вставкой из буфера.
+    //
+    // Состояние заводится своё на каждое значение: первый же успешный
+    // запрос создаёт администратора и закрывает эндпоинт навсегда.
+    for empty in ["", " ", "   ", "\t "] {
+        let dir = tempfile::tempdir().unwrap();
+        let state = a_state(&dir).with_setup_token(Some(wakode_auth::SetupToken::generate()));
 
-    let response = router(state)
-        .oneshot(with_peer(
-            Request::builder()
-                .method("POST")
-                .uri("/api/setup")
-                .header("content-type", "application/json")
-                .header("x-wakode-setup-token", "")
-                .body(setup_body("админ"))
-                .unwrap(),
-            "127.0.0.1:41234",
-        ))
-        .await
-        .unwrap();
+        let response = router(state)
+            .oneshot(with_peer(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/setup")
+                    .header("content-type", "application/json")
+                    .header("x-wakode-setup-token", empty)
+                    .body(setup_body("админ"))
+                    .unwrap(),
+                "127.0.0.1:41234",
+            ))
+            .await
+            .unwrap();
 
-    assert_eq!(
-        response.status(),
-        StatusCode::CREATED,
-        "пустой заголовок токена отказал вместо прохода по адресу"
-    );
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "заголовок токена {empty:?} отказал вместо прохода по адресу"
+        );
+    }
 }
 
 #[tokio::test]

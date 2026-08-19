@@ -515,6 +515,15 @@ impl Serving {
 /// только до EOF, то есть до его смерти, а тестам задачи 3 журнал нужен,
 /// пока сервер работает.
 fn a_serving_child(tail: &[&str]) -> Serving {
+    a_serving_child_after(tail, |_| {})
+}
+
+/// То же, но с шагом над готовым конфигом до запуска сервера.
+///
+/// Нужно там, где проверяется поведение, зависящее от **состояния базы на
+/// старте**: завести пользователя после того, как сервер поднялся, уже
+/// поздно — решения, принимаемые один раз при старте, приняты.
+fn a_serving_child_after(tail: &[&str], before: impl FnOnce(&std::path::Path)) -> Serving {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("wakode.toml");
 
@@ -533,6 +542,10 @@ fn a_serving_child(tail: &[&str]) -> Serving {
         ),
     )
     .unwrap();
+
+    // До запуска сервера, а не после: база к этому моменту ещё не занята
+    // им, и подготовка идёт обычным путём — через сам бинарь.
+    before(&config);
 
     let log = dir.path().join("server.log");
     let sink = std::fs::File::create(&log).unwrap();
@@ -1238,4 +1251,38 @@ fn raw_setup(
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();
     response
+}
+
+/// Настроенный инстанс токен не выпускает и в журнал не пишет.
+///
+/// Зеркало `the_setup_token_from_the_log_opens_setup_through_a_proxy`, и
+/// заведено не для симметрии. Финальное ревью ветки показало мутацией,
+/// что условие `user_count().await? == 0` в `main.rs::serve` не держалось
+/// ничем: замена на `>= 0` проходила по всему workspace зелёной. Цена
+/// такой мутации у владельца — свежий 32-байтовый секрет в journald на
+/// каждый перезапуск боевого инстанса, где настройка давно закрыта, и
+/// `token_required: true` в ответе удалённому клиенту.
+///
+/// Утверждение отрицательное, поэтому рядом стоит положительное: без
+/// него сломанный захват журнала (пустой файл) выглядел бы как успех.
+#[test]
+fn a_configured_instance_never_prints_a_setup_token() {
+    let serving = a_serving_child_after(&["serve"], |config| {
+        let created = create_user(config, "swrneko", "достаточно длинный пароль");
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+    });
+
+    let log = serving.log();
+    assert!(
+        log.contains("сервер поднят"),
+        "журнал сервера не прочитан — отрицательная проверка ниже была бы пустой:\n{log}"
+    );
+    assert!(
+        !log.contains("token="),
+        "инстанс с администратором напечатал токен первичной настройки:\n{log}"
+    );
 }
