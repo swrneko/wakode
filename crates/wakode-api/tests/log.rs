@@ -447,3 +447,46 @@ async fn an_unusual_panic_payload_is_survived_and_named() {
     let json = json_body(response).await;
     assert!(json.get("error").is_some(), "тело не JSON с error: {json}");
 }
+
+/// Отказ первичной настройки виден в журнале — и виден при боевом фильтре.
+///
+/// Строка `tracing::warn!` в `setup` — единственный след того, что
+/// кто-то пытался завести администратора и не смог. Без этого теста её
+/// удаление проходило зелёным по всему workspace: проверено мутацией.
+/// Уровень взят `WARN`, а не `TRACE`, потому что боевой фильтр бинаря —
+/// `info`, и запись, не переживающая его, бесполезна ровно тогда, когда
+/// нужна.
+#[tokio::test]
+async fn a_refused_setup_is_journalled_with_its_reason() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Пир петлевой, заголовок посредника есть — та самая установка, ради
+    // которой отказ и заведён: nginx на том же хосте, клиент снаружи.
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/setup")
+        .header("content-type", "application/json")
+        .header("x-forwarded-for", "203.0.113.5")
+        .body(Body::from(
+            r#"{"login":"admin","password":"достаточно длинный","timezone":"Europe/Moscow"}"#,
+        ))
+        .unwrap();
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        "127.0.0.1:41234".parse::<std::net::SocketAddr>().unwrap(),
+    ));
+
+    let (response, log) =
+        response_and_log_at(tracing::Level::WARN, router(a_state(&dir)), request).await;
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        log.contains("первичная настройка отклонена"),
+        "отказ настройки не попал в журнал:\n{log}"
+    );
+    // Не просто «отклонена», а почему: одного сообщения без причины
+    // владельцу мало — отказов два, и лечатся они по-разному.
+    assert!(
+        log.contains("обратный прокси"),
+        "в журнале не названа причина отказа:\n{log}"
+    );
+}

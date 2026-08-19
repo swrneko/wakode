@@ -1307,16 +1307,113 @@ async fn the_created_admin_gets_the_timeout_from_the_settings() {
 /// Ответ `/api/setup/status` как JSON.
 async fn setup_status(state: AppState) -> serde_json::Value {
     let response = router(state)
-        .oneshot(
+        .oneshot(with_peer(
             Request::builder()
                 .uri("/api/setup/status")
                 .body(Body::empty())
                 .unwrap(),
-        )
+            "127.0.0.1:54321",
+        ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     json_body(response).await
+}
+
+#[tokio::test]
+async fn the_status_asks_for_a_token_when_the_address_alone_would_be_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = router(a_state(&dir));
+
+    let response = app
+        .oneshot(with_peer(
+            Request::builder()
+                .uri("/api/setup/status")
+                .body(Body::empty())
+                .unwrap(),
+            "203.0.113.5:41234",
+        ))
+        .await
+        .unwrap();
+
+    let status = json_body(response).await;
+    assert_eq!(status["needed"], true);
+    assert_eq!(
+        status["token_required"], true,
+        "чужому адресу настройка без токена не откроется, и статус обязан это сказать"
+    );
+}
+
+#[tokio::test]
+async fn a_loopback_client_without_proxy_headers_needs_no_token() {
+    // Зеркало предыдущего. Без него «всегда true» прошло бы: экран
+    // настройки на машине владельца спрашивал бы токен, которого он не
+    // должен предъявлять.
+    let dir = tempfile::tempdir().unwrap();
+    let app = router(a_state(&dir));
+
+    let response = app
+        .oneshot(with_peer(
+            Request::builder()
+                .uri("/api/setup/status")
+                .body(Body::empty())
+                .unwrap(),
+            "127.0.0.1:41234",
+        ))
+        .await
+        .unwrap();
+
+    let status = json_body(response).await;
+    assert_eq!(status["token_required"], false);
+}
+
+#[tokio::test]
+async fn a_proxy_header_makes_the_status_ask_for_a_token() {
+    // Тот самый случай, ради которого всё это: пир петлевой, потому что
+    // прокси стоит на том же хосте, а клиент — кто угодно.
+    let dir = tempfile::tempdir().unwrap();
+    let app = router(a_state(&dir));
+
+    let response = app
+        .oneshot(with_peer(
+            Request::builder()
+                .uri("/api/setup/status")
+                .header("x-forwarded-for", "203.0.113.5")
+                .body(Body::empty())
+                .unwrap(),
+            "127.0.0.1:41234",
+        ))
+        .await
+        .unwrap();
+
+    let status = json_body(response).await;
+    assert_eq!(status["token_required"], true);
+}
+
+#[tokio::test]
+async fn an_instance_open_to_any_address_never_asks_for_a_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(
+        a_store(&dir),
+        None,
+        AppSettings { setup_from_any_address: true, ..a_settings() },
+    );
+    let app = router(state);
+
+    let response = app
+        .oneshot(with_peer(
+            Request::builder()
+                .uri("/api/setup/status")
+                .header("x-forwarded-for", "203.0.113.5")
+                .body(Body::empty())
+                .unwrap(),
+            "203.0.113.5:41234",
+        ))
+        .await
+        .unwrap();
+
+    let status = json_body(response).await;
+    assert_eq!(status["token_required"], false);
 }
 
 #[tokio::test]
