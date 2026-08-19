@@ -43,6 +43,7 @@ cargo run -p wakode -- --config wakode.toml backup --to <путь>
 │   ├── wakode-auth/            криптография: чистые функции над байтами
 │   ├── wakode-api/             HTTP-слой
 │   └── wakode/                 бинарь: CLI, конфиг, старт, сигналы
+├── deploy/                     юнит systemd и примеры конфигурации
 ├── docs/superpowers/
 │   ├── plans/                  планы реализации по итерациям
 │   └── specs/                  спецификации (§-нумерация, на них ссылается код)
