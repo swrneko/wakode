@@ -10,12 +10,14 @@ pub mod error;
 pub mod master_key;
 pub mod password;
 pub mod session;
+pub mod setup_token;
 
 pub use api_key::{ApiKeyValue, EncryptedKey};
 pub use error::{AuthError, AuthResult};
 pub use master_key::MasterKey;
 pub use password::{hash_password, verify_password, MIN_PASSWORD_CHARS};
 pub use session::SessionToken;
+pub use setup_token::{SetupToken, SETUP_TOKEN_BYTES};
 
 /// Заглушка вместо секрета в `Debug`.
 pub(crate) const REDACTED: &str = "<скрыт>";
@@ -34,8 +36,11 @@ pub(crate) const REDACTED: &str = "<скрыт>";
 //
 // **`Display` печатает секрет дословно — там, где он есть.** Он есть у
 // `ApiKeyValue` и `SessionToken`, потому что эти значения обязаны уехать
-// наружу: первое пользователь копирует в редактор, второе — в cookie.
-// `Display` вызывают, только написав `{}` осознанно.
+// наружу: первое пользователь копирует в редактор, второе — в cookie. Тем
+// же путём идёт `SetupToken` — его `Display` печатает бинарь `wakode` в
+// журнал при старте, и это единственное место в проекте, где секрет
+// пишется в лог намеренно: владельцу за обратным прокси токен взять больше
+// неоткуда. `Display` вызывают, только написав `{}` осознанно.
 //
 // `MasterKey` `Display` не имеет вовсе: наружу он не уезжает никогда, и
 // достать его можно лишь явным `to_base64()`. Отсутствие — не забывчивость.
