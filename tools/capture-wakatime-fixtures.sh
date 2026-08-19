@@ -40,6 +40,30 @@ BASE="https://wakatime.com/api/v1"
 
 mkdir -p "$OUT"
 
+# Каким стеком ходить.
+#
+# У wakatime.com есть и A, и AAAA, и на сети со сломанным маршрутом IPv6
+# curl честно предпочтёт AAAA и обвалится на рукопожатии TLS с
+# `unexpected eof while reading` — сообщение, по которому думаешь на
+# блокировку или на ключ, а виноват маршрут. Пробуем как есть, и только
+# если не вышло, прижимаемся к IPv4: жёсткий `--ipv4` сломал бы тех, у
+# кого наоборот нет IPv4.
+STACK=()
+if ! curl --silent --show-error --max-time 15 --output /dev/null https://wakatime.com/api/v1 2>/dev/null; then
+    if curl --ipv4 --silent --show-error --max-time 15 --output /dev/null https://wakatime.com/api/v1 2>/dev/null; then
+        STACK=(--ipv4)
+        printf 'IPv6 до wakatime.com не работает, иду по IPv4\n' >&2
+    else
+        printf 'wakatime.com не отвечает ни по IPv6, ни по IPv4 — дальше смысла нет\n' >&2
+        exit 1
+    fi
+fi
+
+# Что не снялось. Один отказавший эндпоинт не повод бросать остальные:
+# снимок нужен целиком, а разбираться с недостающим проще, когда видно,
+# что именно недостаёт.
+FAILED=()
+
 # Снять один ответ. Пишет тело и код состояния рядом: код — часть
 # контракта не меньше тела, а `curl` по умолчанию его не сохраняет.
 grab() {
@@ -47,12 +71,27 @@ grab() {
     local body="$OUT/$name.json" meta="$OUT/$name.status"
 
     local code
-    code=$(curl --silent --show-error --location \
-                --header "$AUTH" \
-                --write-out '%{http_code}' \
-                --output "$body.raw" \
-                "$url")
+    if ! code=$(curl "${STACK[@]}" --silent --show-error --location --max-time 60 \
+                     --header "$AUTH" \
+                     --write-out '%{http_code}' \
+                     --output "$body.raw" \
+                     "$url"); then
+        printf '  %-24s ОТКАЗ СЕТИ\n' "$name"
+        FAILED+=("$name")
+        rm -f "$body.raw"
+        return 0
+    fi
     printf '%s\n' "$code" > "$meta"
+
+    # 401 и 403 — не сетевой сбой, а негодный ключ. Тело такого ответа
+    # сохранять нельзя: оно непустое и в куче снимков прочиталось бы как
+    # форма ответа эндпоинта.
+    if [ "$code" = 401 ] || [ "$code" = 403 ]; then
+        printf '  %-24s %s  ключ не подошёл\n' "$name" "$code"
+        FAILED+=("$name")
+        rm -f "$body.raw" "$meta"
+        return 0
+    fi
 
     # Форматирование, а не хранение как пришло: диф между нашим ответом и
     # эталоном должен читаться построчно. Порядок ключей сохраняется —
@@ -123,6 +162,11 @@ if [ "$WITH_WRITES" = 1 ]; then
 fi
 
 # --- Что делать дальше -------------------------------------------------
+
+if [ ${#FAILED[@]} -gt 0 ]; then
+    printf '\nНе снялось: %s\n' "${FAILED[*]}"
+    printf 'Остальное сохранено — разберитесь с этими и допрогоните.\n'
+fi
 
 cat <<EOF
 
