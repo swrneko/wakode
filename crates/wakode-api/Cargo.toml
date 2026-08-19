@@ -13,7 +13,7 @@ base64.workspace = true
 chrono-tz.workspace = true
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["rt", "net"] }
-tower-http = { workspace = true, features = ["catch-panic", "trace"] }
+tower-http = { workspace = true, features = ["catch-panic", "set-header", "trace"] }
 tracing.workspace = true
 # `serde` — ради ответа настройки: идентификатор заведённого администратора
 # уезжает клиенту в JSON.
