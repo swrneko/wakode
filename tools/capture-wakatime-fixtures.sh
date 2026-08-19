@@ -98,14 +98,14 @@ if [ "$WITH_WRITES" = 1 ]; then
     printf '\nОтправляю пробные отметки — они появятся в вашей статистике.\n'
 
     NOW=$(date +%s)
-    curl --silent --show-error --header "$AUTH" \
+    curl "${STACK[@]}" --silent --show-error --max-time 60 --header "$AUTH" \
          --header 'Content-Type: application/json' \
          --data "{\"entity\":\"/tmp/wakode-fixture-probe.txt\",\"type\":\"file\",\"time\":$NOW}" \
          --write-out '%{http_code}\n' \
          --output "$OUT/heartbeat-single.json" \
          "$BASE/users/current/heartbeats" > "$OUT/heartbeat-single.status"
 
-    curl --silent --show-error --header "$AUTH" \
+    curl "${STACK[@]}" --silent --show-error --max-time 60 --header "$AUTH" \
          --header 'Content-Type: application/json' \
          --data "[{\"entity\":\"/tmp/wakode-fixture-probe.txt\",\"type\":\"file\",\"time\":$((NOW + 1))},{\"entity\":\"\",\"type\":\"file\",\"time\":$((NOW + 2))}]" \
          --write-out '%{http_code}\n' \
