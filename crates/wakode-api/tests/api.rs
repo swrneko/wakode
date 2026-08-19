@@ -254,7 +254,9 @@ async fn state_debug_prints_neither_the_master_key_nor_the_dictionary() {
         .await
         .unwrap();
 
-    let state = AppState::new(store, Some(master.clone()), a_settings());
+    let token = wakode_auth::SetupToken::generate();
+    let state = AppState::new(store, Some(master.clone()), a_settings())
+        .with_setup_token(Some(token.clone()));
     let dump = format!("{state:?}");
 
     // Словарь непустой — иначе проверки ниже ничего не значат.
@@ -280,6 +282,17 @@ async fn state_debug_prints_neither_the_master_key_nor_the_dictionary() {
     assert!(
         !dump.contains("MasterKey"),
         "поле master_key выведено через собственный Debug вместо .is_some(): {dump}"
+    );
+
+    // То же самое для выданного токена настройки: его напечатанная форма
+    // не должна попасть в дамп состояния ни при каких обстоятельствах.
+    assert!(
+        !dump.contains(&token.to_string()),
+        "токен настройки утёк: {dump}"
+    );
+    assert!(
+        !dump.contains("SetupToken"),
+        "поле setup_token выведено через собственный Debug вместо .is_some(): {dump}"
     );
 }
 
@@ -354,16 +367,13 @@ async fn serve_actually_answers_on_a_real_socket() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let server = tokio::spawn(wakode_api::serve(listener, a_state(&dir)));
+    let server = tokio::spawn(wakode_api::serve(
+        listener,
+        a_state(&dir),
+        std::future::pending::<()>(),
+    ));
 
-    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    stream
-        .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .await
-        .unwrap();
-
-    let mut response = String::new();
-    stream.read_to_string(&mut response).await.unwrap();
+    let response = raw_get(addr, "/healthz").await;
 
     assert!(
         response.starts_with("HTTP/1.1 200 OK"),
@@ -372,6 +382,58 @@ async fn serve_actually_answers_on_a_real_socket() {
     assert!(response.ends_with("ok"), "нет тела ответа: {response}");
 
     server.abort();
+}
+
+/// Сырой `GET` через настоящий сокет, без клиента HTTP.
+///
+/// Вынесено из `serve_actually_answers_on_a_real_socket`: второму тесту с
+/// настоящим сокетом нужен тот же примитив.
+async fn raw_get(addr: std::net::SocketAddr, path: &str) -> String {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    response
+}
+
+#[tokio::test]
+async fn serve_returns_when_asked_to_stop_and_releases_the_port() {
+    // Без этого теста завершение по сигналу держится обещанием: `serve`,
+    // потерявшая `with_graceful_shutdown`, снаружи выглядит точно так же —
+    // сервер работает, — а SIGTERM в бинаре просто убивал бы процесс мимо
+    // остановки писателя.
+    let dir = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(wakode_api::serve(listener, a_state(&dir), async move {
+        let _ = stopped.await;
+    }));
+
+    // Сначала — что сервер вообще поднялся: иначе «вернулась сразу»
+    // прошло бы этот тест зелёным.
+    assert!(
+        raw_get(addr, "/healthz").await.starts_with("HTTP/1.1 200 OK"),
+        "сервер не ответил до сигнала"
+    );
+
+    stop.send(()).unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .expect("serve не вернулась через пять секунд после сигнала")
+        .expect("задача с serve упала");
+
+    // Порт отпущен — доказательство, что слушатель уничтожен, а не просто
+    // функция вернулась, оставив приём соединений жить.
+    tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("порт всё ещё занят: слушатель пережил останов");
 }
 
 #[tokio::test]
@@ -1258,16 +1320,150 @@ async fn the_created_admin_gets_the_timeout_from_the_settings() {
 /// Ответ `/api/setup/status` как JSON.
 async fn setup_status(state: AppState) -> serde_json::Value {
     let response = router(state)
-        .oneshot(
+        .oneshot(with_peer(
             Request::builder()
                 .uri("/api/setup/status")
                 .body(Body::empty())
                 .unwrap(),
-        )
+            "127.0.0.1:54321",
+        ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     json_body(response).await
+}
+
+#[tokio::test]
+async fn the_status_asks_for_a_token_when_the_address_alone_would_be_refused() {
+    // Токен выдан — иначе поле обязано молчать, см.
+    // `an_instance_with_no_issued_token_never_asks_for_one`: требовать то,
+    // чего сервер не выдавал, значило бы предъявить экрану поле, которое
+    // не примет ни одно значение.
+    let dir = tempfile::tempdir().unwrap();
+    let state = a_state(&dir).with_setup_token(Some(wakode_auth::SetupToken::generate()));
+    let app = router(state);
+
+    let response = app
+        .oneshot(with_peer(
+            Request::builder()
+                .uri("/api/setup/status")
+                .body(Body::empty())
+                .unwrap(),
+            "203.0.113.5:41234",
+        ))
+        .await
+        .unwrap();
+
+    let status = json_body(response).await;
+    assert_eq!(status["needed"], true);
+    assert_eq!(
+        status["token_required"], true,
+        "чужому адресу настройка без токена не откроется, и статус обязан это сказать"
+    );
+}
+
+#[tokio::test]
+async fn a_loopback_client_without_proxy_headers_needs_no_token() {
+    // Зеркало предыдущего. Без него «всегда true» прошло бы: экран
+    // настройки на машине владельца спрашивал бы токен, которого он не
+    // должен предъявлять. Токен при этом выдан — доказывает, что решает
+    // именно адрес, а не отсутствие токена на инстансе.
+    let dir = tempfile::tempdir().unwrap();
+    let state = a_state(&dir).with_setup_token(Some(wakode_auth::SetupToken::generate()));
+    let app = router(state);
+
+    let response = app
+        .oneshot(with_peer(
+            Request::builder()
+                .uri("/api/setup/status")
+                .body(Body::empty())
+                .unwrap(),
+            "127.0.0.1:41234",
+        ))
+        .await
+        .unwrap();
+
+    let status = json_body(response).await;
+    assert_eq!(status["token_required"], false);
+}
+
+#[tokio::test]
+async fn a_proxy_header_makes_the_status_ask_for_a_token() {
+    // Тот самый случай, ради которого всё это: пир петлевой, потому что
+    // прокси стоит на том же хосте, а клиент — кто угодно.
+    let dir = tempfile::tempdir().unwrap();
+    let state = a_state(&dir).with_setup_token(Some(wakode_auth::SetupToken::generate()));
+    let app = router(state);
+
+    let response = app
+        .oneshot(with_peer(
+            Request::builder()
+                .uri("/api/setup/status")
+                .header("x-forwarded-for", "203.0.113.5")
+                .body(Body::empty())
+                .unwrap(),
+            "127.0.0.1:41234",
+        ))
+        .await
+        .unwrap();
+
+    let status = json_body(response).await;
+    assert_eq!(status["token_required"], true);
+}
+
+#[tokio::test]
+async fn an_instance_open_to_any_address_never_asks_for_a_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(
+        a_store(&dir),
+        None,
+        AppSettings { setup_from_any_address: true, ..a_settings() },
+    )
+    .with_setup_token(Some(wakode_auth::SetupToken::generate()));
+    let app = router(state);
+
+    let response = app
+        .oneshot(with_peer(
+            Request::builder()
+                .uri("/api/setup/status")
+                .header("x-forwarded-for", "203.0.113.5")
+                .body(Body::empty())
+                .unwrap(),
+            "203.0.113.5:41234",
+        ))
+        .await
+        .unwrap();
+
+    let status = json_body(response).await;
+    assert_eq!(status["token_required"], false);
+}
+
+#[tokio::test]
+async fn an_instance_with_no_issued_token_never_asks_for_one() {
+    // Инстанс без выпущенного токена не может его требовать: администратор
+    // уже заведён (или токен ещё не выдан), и предъявить экрану нечего —
+    // поле токена лишь ввело бы владельца в заблуждение, будто где-то есть
+    // значение, которое сервер примет.
+    let dir = tempfile::tempdir().unwrap();
+    let app = router(a_state(&dir)); // без with_setup_token
+
+    let response = app
+        .oneshot(with_peer(
+            Request::builder()
+                .uri("/api/setup/status")
+                .header("x-forwarded-for", "203.0.113.5")
+                .body(Body::empty())
+                .unwrap(),
+            "203.0.113.5:41234",
+        ))
+        .await
+        .unwrap();
+
+    let status = json_body(response).await;
+    assert_eq!(
+        status["token_required"], false,
+        "токена нет, и требовать его статус не должен: {status}"
+    );
 }
 
 #[tokio::test]
@@ -1657,7 +1853,11 @@ async fn setup_over_a_real_socket_sees_the_client_address() {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(wakode_api::serve(listener, state));
+    let server = tokio::spawn(wakode_api::serve(
+        listener,
+        state,
+        std::future::pending::<()>(),
+    ));
 
     let body = r#"{"login":"swrneko","password":"достаточно длинный","timezone":"Europe/Moscow"}"#;
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -1720,4 +1920,260 @@ async fn setup_closes_even_when_registration_is_open() {
 
     let second = setup_from(state, "127.0.0.1:54322", setup_body("второй")).await;
     assert_eq!(second.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_correct_token_opens_setup_from_any_address() {
+    // Ради этого всё и делается: владелец за обратным прокси заводит
+    // администратора, не открывая настройку всему интернету. Пир — не
+    // петлевой и без единого заголовка посредника: `address_allows_setup`
+    // отказала бы уже на первой строке (`!peer.ip().is_loopback()`), и
+    // только токен решает исход. Тест с петлевым пиром и заголовком
+    // прокси доказывал бы только половину имени — что токен отменяет
+    // именно прокси-ветку, а не «любой адрес» буквально.
+    let dir = tempfile::tempdir().unwrap();
+    let token = wakode_auth::SetupToken::generate();
+    let state = a_state(&dir).with_setup_token(Some(token.clone()));
+
+    let response = router(state)
+        .oneshot(with_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/api/setup")
+                .header("content-type", "application/json")
+                .header("x-wakode-setup-token", token.to_string())
+                .body(setup_body("админ"))
+                .unwrap(),
+            "203.0.113.5:41234",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn an_empty_setup_token_header_is_not_a_presentation() {
+    // Ловушка для плана 4: экран настройки отправляет заголовок
+    // безусловно и оставляет его пустым, когда `token_required == false`
+    // (петлевая машина владельца, токен вводить незачем). Пустое значение
+    // обязано провалиться в адресную ветку, а не отказать как неверный
+    // токен, — иначе форма ломала бы настройку там, где токен не нужен
+    // вовсе. Пир петлевой и без заголовков посредника, поэтому `201`
+    // здесь может дать только адресная ветка.
+    //
+    // Пробельные значения проверяются наравне с пустым: без них `.trim()`
+    // в `presented_token` не держался ничем — мутация `let trimmed =
+    // value;` проходила по всему workspace зелёной, а заголовок из одних
+    // пробелов отказывал бы на машине владельца ровно так же, как пустой.
+    // Форма, шлющая `" "`, — не выдумка: пробел легко приезжает вместе с
+    // вставкой из буфера.
+    //
+    // Состояние заводится своё на каждое значение: первый же успешный
+    // запрос создаёт администратора и закрывает эндпоинт навсегда.
+    for empty in ["", " ", "   ", "\t "] {
+        let dir = tempfile::tempdir().unwrap();
+        let state = a_state(&dir).with_setup_token(Some(wakode_auth::SetupToken::generate()));
+
+        let response = router(state)
+            .oneshot(with_peer(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/setup")
+                    .header("content-type", "application/json")
+                    .header("x-wakode-setup-token", empty)
+                    .body(setup_body("админ"))
+                    .unwrap(),
+                "127.0.0.1:41234",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "заголовок токена {empty:?} отказал вместо прохода по адресу"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unreadable_setup_token_header_is_a_presentation_not_an_absence() {
+    // Регрессия фикс-раунда 1: `to_str().unwrap_or_default()` на не-UTF-8
+    // значении даёт пустую строку — ту же, что у настоящего
+    // непредъявления. Пустив её в общую проверку на пустоту, получаем
+    // нечитаемый заголовок, неотличимый от отсутствующего: запрос
+    // проваливается в адресную ветку, а не отказывает как мусорный токен.
+    //
+    // Пир — петлевой и без заголовков посредника: `201` здесь может дать
+    // только ошибочный провал в адресную ветку, `403` — только то, что
+    // нечитаемое значение по-прежнему считается предъявлением.
+    let dir = tempfile::tempdir().unwrap();
+    let state = a_state(&dir).with_setup_token(Some(wakode_auth::SetupToken::generate()));
+
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/setup")
+        .header("content-type", "application/json");
+    request = request.header(
+        "x-wakode-setup-token",
+        axum::http::HeaderValue::from_bytes(&[0xff, 0xfe, 0x80]).unwrap(),
+    );
+
+    let response = router(state)
+        .oneshot(with_peer(
+            request.body(setup_body("админ")).unwrap(),
+            "127.0.0.1:41234",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "нечитаемый заголовок токена молча провалился в адресную ветку и завёл администратора"
+    );
+}
+
+#[tokio::test]
+async fn a_wrong_token_is_refused_even_from_a_loopback_address() {
+    // Предъявление токена — утверждение «я знаю секрет», и ложное
+    // утверждение получает свой отказ. Провалиться в адресную ветку и
+    // пройти по петлевому адресу оно не должно: владелец, вставивший
+    // токен с опечаткой, иначе не узнал бы об опечатке вовсе, а на
+    // следующей машине услышал бы про адрес, держа токен в руках.
+    let dir = tempfile::tempdir().unwrap();
+    let state = a_state(&dir).with_setup_token(Some(wakode_auth::SetupToken::generate()));
+
+    let response = router(state)
+        .oneshot(with_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/api/setup")
+                .header("content-type", "application/json")
+                .header("x-wakode-setup-token", "SGVsbG8sIHRoaXMgaXMgbm90IHRoZSB0b2tlbg")
+                .body(setup_body("админ"))
+                .unwrap(),
+            "127.0.0.1:41234",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = json_body(response).await;
+    let text = body["error"].as_str().unwrap();
+    assert!(text.contains("токен"), "отказ не назвал причину: {text}");
+}
+
+#[tokio::test]
+async fn a_token_presented_to_an_instance_that_issued_none_is_refused() {
+    // Инстанс с уже заведённым администратором токена не выдаёт, и
+    // «токена нет» обязано означать отказ, а не «сравнивать не с чем,
+    // значит проходи».
+    let dir = tempfile::tempdir().unwrap();
+    let state = a_state(&dir); // без with_setup_token
+
+    let response = router(state)
+        .oneshot(with_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/api/setup")
+                .header("content-type", "application/json")
+                .header(
+                    "x-wakode-setup-token",
+                    wakode_auth::SetupToken::generate().to_string(),
+                )
+                .body(setup_body("админ"))
+                .unwrap(),
+            "203.0.113.5:41234",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn two_setup_token_headers_are_refused() {
+    // Урок парковки задачи 11: `CookieJar::get` при дубликатах отдаёт
+    // последнюю пару, и «какое из двух значений считается предъявленным»
+    // — источник тихих расхождений. Здесь ответ дан явно: два токена —
+    // это не предъявление, а попытка угадать, какой из них мы возьмём.
+    //
+    // Верный токен стоит **первым**, а мусор — вторым, и это не
+    // случайность: `HeaderMap::get` при дубликатах отдаёт первое
+    // значение, и реализация на нём молча приняла бы верный токен, даже
+    // не заметив второго заголовка. Поставь мусор первым — и такая
+    // реализация тоже отказала бы, только не по той причине, которую
+    // тест называет в имени.
+    //
+    // Пир — петлевой, без единого заголовка посредника: адресная ветка
+    // сама по себе пропустила бы запрос. `403` здесь может дать только
+    // дедупликация — иначе тест не отличил бы «отказ из-за дубликатов»
+    // от «отказ по адресу», и мутация, стирающая факт предъявления при
+    // дубликатах (`presented_token` возвращает `None` вместо явного
+    // отказа), проходила бы зелёной.
+    let dir = tempfile::tempdir().unwrap();
+    let token = wakode_auth::SetupToken::generate();
+    let state = a_state(&dir).with_setup_token(Some(token.clone()));
+
+    let response = router(state)
+        .oneshot(with_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/api/setup")
+                .header("content-type", "application/json")
+                .header("x-wakode-setup-token", token.to_string())
+                .header("x-wakode-setup-token", "мусор")
+                .body(setup_body("админ"))
+                .unwrap(),
+            "127.0.0.1:41234",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn the_refusal_never_echoes_the_presented_token() {
+    // Тело отказа уезжает клиенту и попадает в чужие скриншоты. Эхо
+    // предъявленного значения — тот же класс дефекта, что подстановка
+    // пароля в сообщение о таймзоне, найденная в задаче 12.
+    let dir = tempfile::tempdir().unwrap();
+    let state = a_state(&dir).with_setup_token(Some(wakode_auth::SetupToken::generate()));
+    let presented = "SGVsbG8sIHRoaXMgaXMgbm90IHRoZSB0b2tlbg";
+
+    let response = router(state)
+        .oneshot(with_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/api/setup")
+                .header("content-type", "application/json")
+                .header("x-wakode-setup-token", presented)
+                .body(setup_body("админ"))
+                .unwrap(),
+            "127.0.0.1:41234",
+        ))
+        .await
+        .unwrap();
+
+    let dump = format!("{:?}", json_body(response).await);
+    assert!(
+        !dump.contains(presented),
+        "предъявленный токен вернулся клиенту: {dump}"
+    );
+}
+
+#[tokio::test]
+async fn without_a_token_the_address_still_decides() {
+    // Зеркало всей ветки: токен не должен был отменить прежнюю защиту.
+    let dir = tempfile::tempdir().unwrap();
+    let state = a_state(&dir).with_setup_token(Some(wakode_auth::SetupToken::generate()));
+
+    let response = setup_from(state, "203.0.113.5:41234", setup_body("админ")).await;
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = json_body(response).await;
+    assert!(body["error"].as_str().unwrap().contains("локального адреса"));
 }

@@ -447,3 +447,137 @@ async fn an_unusual_panic_payload_is_survived_and_named() {
     let json = json_body(response).await;
     assert!(json.get("error").is_some(), "тело не JSON с error: {json}");
 }
+
+/// Отказ первичной настройки виден в журнале — и виден при боевом фильтре.
+///
+/// Сам факт отказа виден и без этой строки: `TraceLayer` пишет
+/// завершение каждого запроса, и `403` на `POST /api/setup` в журнале
+/// будет (держится `a_finished_request_is_journalled_at_info`).
+/// Уникальна здесь **причина**: отказов два, лечатся они по-разному, и
+/// без причины владелец из журнала не поймёт, что ему чинить. Без этого
+/// теста удаление строки проходило зелёным по всему workspace —
+/// проверено мутацией.
+/// Уровень взят `WARN`, а не `TRACE`, потому что боевой фильтр бинаря —
+/// `info`, и запись, не переживающая его, бесполезна ровно тогда, когда
+/// нужна.
+#[tokio::test]
+async fn a_refused_setup_is_journalled_with_its_reason() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Пир петлевой, заголовок посредника есть — та самая установка, ради
+    // которой отказ и заведён: nginx на том же хосте, клиент снаружи.
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/setup")
+        .header("content-type", "application/json")
+        .header("x-forwarded-for", "203.0.113.5")
+        .body(Body::from(
+            r#"{"login":"admin","password":"достаточно длинный","timezone":"Europe/Moscow"}"#,
+        ))
+        .unwrap();
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        "127.0.0.1:41234".parse::<std::net::SocketAddr>().unwrap(),
+    ));
+
+    let (response, log) =
+        response_and_log_at(tracing::Level::WARN, router(a_state(&dir)), request).await;
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        log.contains("первичная настройка отклонена"),
+        "отказ настройки не попал в журнал:\n{log}"
+    );
+    // Не просто «отклонена», а почему: одного сообщения без причины
+    // владельцу мало — отказов два, и лечатся они по-разному.
+    assert!(
+        log.contains("обратный прокси"),
+        "в журнале не названа причина отказа:\n{log}"
+    );
+}
+
+/// Неверный токен виден в журнале причиной, но не своим значением.
+///
+/// Тест живёт здесь же, а не в `api.rs`: строка проверяется по подстроке
+/// в собранном журнале, а `tracing` кеширует интерес к каждому callsite
+/// на весь процесс — соседи из `api.rs` дёргают тот же обработчик без
+/// подписчика и отравляют кеш.
+#[tokio::test]
+async fn a_wrong_setup_token_is_journalled_without_its_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let presented = "SGVsbG8sIHRoaXMgaXMgbm90IHRoZSB0b2tlbg";
+    let state =
+        a_state(&dir).with_setup_token(Some(wakode_auth::SetupToken::generate()));
+
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/setup")
+        .header("content-type", "application/json")
+        .header("x-wakode-setup-token", presented)
+        .body(Body::from(
+            r#"{"login":"admin","password":"достаточно длинный","timezone":"Europe/Moscow"}"#,
+        ))
+        .unwrap();
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        "127.0.0.1:41234".parse::<std::net::SocketAddr>().unwrap(),
+    ));
+
+    let (response, log) =
+        response_and_log_at(tracing::Level::WARN, router(state), request).await;
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        log.contains("предъявлен неверный токен первичной настройки"),
+        "отказ по токену не попал в журнал:\n{log}"
+    );
+    assert!(
+        !log.contains(presented),
+        "предъявленный токен утёк в журнал:\n{log}"
+    );
+}
+
+/// Успешная настройка по токену не пишет адресный отказ.
+///
+/// Урок задачи 3: `warn!` про «первичная настройка отклонена» стоит внутри
+/// ветки `None` разбора предъявленного токена. Вынеси его наружу — и
+/// успешная настройка по прокси-адресу заодно сообщила бы о несуществующем
+/// отказе.
+///
+/// Предел этого теста: утверждение только отрицательное, а собранный на
+/// `WARN` журнал в этом сценарии (успех, без единой предупреждающей
+/// записи) скорее всего пуст целиком. Мутацию, ради которой тест написан
+/// — вынос `warn!` из ветки — он ловит: строка появляется в непустом
+/// логе. Но сломанный захват журнала (например, `SINK` не подставлен)
+/// дал бы тот же пустой `log` и тест бы этого не заметил. От такого
+/// класса поломок защищают тесты-соседи с положительным утверждением
+/// (`a_refused_setup_is_journalled_with_its_reason`,
+/// `a_wrong_setup_token_is_journalled_without_its_value`), которые делят
+/// с этим тестом ту же инфраструктуру захвата.
+#[tokio::test]
+async fn a_successful_token_setup_does_not_log_an_address_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let token = wakode_auth::SetupToken::generate();
+    let state = a_state(&dir).with_setup_token(Some(token.clone()));
+
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/setup")
+        .header("content-type", "application/json")
+        .header("x-wakode-setup-token", token.to_string())
+        .header("x-forwarded-for", "203.0.113.5")
+        .body(Body::from(
+            r#"{"login":"admin","password":"достаточно длинный","timezone":"Europe/Moscow"}"#,
+        ))
+        .unwrap();
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        "127.0.0.1:41234".parse::<std::net::SocketAddr>().unwrap(),
+    ));
+
+    let (response, log) =
+        response_and_log_at(tracing::Level::WARN, router(state), request).await;
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert!(
+        !log.contains("первичная настройка отклонена"),
+        "успешная настройка по токену записана как отказ:\n{log}"
+    );
+}

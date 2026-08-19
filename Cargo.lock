@@ -1612,6 +1612,7 @@ dependencies = [
  "anyhow",
  "chrono-tz",
  "clap",
+ "libc",
  "serde",
  "tempfile",
  "thiserror",
@@ -1659,6 +1660,7 @@ dependencies = [
  "hmac",
  "rand 0.8.7",
  "sha2",
+ "subtle",
  "thiserror",
  "uuid",
 ]

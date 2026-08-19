@@ -32,6 +32,10 @@ hmac = "0.12"
 sha2 = "0.10"
 rand = "0.8"
 base64 = "0.23"
+# Сравнение токена настройки за постоянное время. Единственный секрет
+# проекта, который лежит открытым в журнале и вводится руками, — то есть
+# единственный, который осмысленно подбирать.
+subtle = "2.6"
 tokio = "1.53.1"
 uuid = "1.24.1"
 xxhash-rust = "0.8.18"
@@ -44,6 +48,9 @@ tower = "0.5"
 tower-http = "0.7"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+# Только в тестах и только ради `kill`: послать сигнал собственному
+# ребёнку из std нечем, а тащить ради одного вызова `nix` — несоразмерно.
+libc = "0.2"
 wakode-core = { version = "0.1.0", path = "crates/wakode-core" }
 wakode-api = { version = "0.1.0", path = "crates/wakode-api" }
 wakode-auth = { version = "0.1.0", path = "crates/wakode-auth" }

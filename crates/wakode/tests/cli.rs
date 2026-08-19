@@ -468,7 +468,7 @@ fn serve_comes_up_and_answers() {
     // Всё остальное здесь запускает подкоманды, которые завершаются, — и
     // `serve`, потерявшая `bind` или вызов `wakode_api::serve`, выглядела
     // бы снаружи ровно так же: процесс, который «стартовал».
-    serve_answers(&["serve"]);
+    a_serving_child(&["serve"]);
 }
 
 #[test]
@@ -478,18 +478,57 @@ fn no_subcommand_means_serve() {
     // заменённый на любую другую ветку, проходил весь набор зелёным.
     // Именно в этой форме бинарь и запускают из systemd —
     // `ExecStart=/usr/bin/wakode --config /etc/wakode.toml`.
-    serve_answers(&[]);
+    a_serving_child(&[]);
+}
+
+/// Поднятый дочерний `wakode serve`: процесс, адрес и журнал.
+///
+/// `dir` держится живым намеренно: в нём лежат конфиг, база и файл
+/// журнала, и уничтожение папки раньше времени вырвало бы их из-под
+/// работающего сервера.
+struct Serving {
+    // `child` объявлен раньше `dir` не для красоты: поля дропаются в
+    // порядке объявления, и `Killed` обязан убить процесс раньше, чем
+    // `TempDir` снесёт папку с конфигом, базой и журналом, которые этот
+    // процесс держит открытыми. Порядок наоборот сносил бы папку из-под
+    // ещё живого сервера — ровно то, чего docstring выше обещает не
+    // делать.
+    child: Killed,
+    // Значение не читается ни одним тестом этой задачи: поле держат живым
+    // ради побочного эффекта `Drop`, а не ради значения.
+    #[expect(dead_code, reason = "TempDir держит папку живой через Drop; читать значение незачем")]
+    dir: tempfile::TempDir,
+    addr: std::net::SocketAddr,
+    log: std::path::PathBuf,
+}
+
+impl Serving {
+    /// Всё, что сервер написал в stderr к этому моменту.
+    fn log(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
 }
 
 /// Поднять бинарь с заданным хвостом аргументов и дождаться `/healthz`.
-fn serve_answers(tail: &[&str]) {
+///
+/// Журнал уходит в файл, а не в трубу: труба живого процесса читается
+/// только до EOF, то есть до его смерти, а тестам задачи 3 журнал нужен,
+/// пока сервер работает.
+fn a_serving_child(tail: &[&str]) -> Serving {
+    a_serving_child_after(tail, |_| {})
+}
+
+/// То же, но с шагом над готовым конфигом до запуска сервера.
+///
+/// Нужно там, где проверяется поведение, зависящее от **состояния базы на
+/// старте**: завести пользователя после того, как сервер поднялся, уже
+/// поздно — решения, принимаемые один раз при старте, приняты.
+fn a_serving_child_after(tail: &[&str], before: impl FnOnce(&std::path::Path)) -> Serving {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("wakode.toml");
 
     // Порт занимается и отпускается: узнать свободный номер заранее иначе
     // нечем, а передать готовый слушатель дочернему процессу нельзя.
-    // Окно между отпусканием и `bind` в ребёнке существует; ошибка в нём
-    // будет видна как отказ старта в stderr, который тест печатает.
     let addr = {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap()
@@ -504,47 +543,211 @@ fn serve_answers(tail: &[&str]) {
     )
     .unwrap();
 
+    // До запуска сервера, а не после: база к этому моменту ещё не занята
+    // им, и подготовка идёт обычным путём — через сам бинарь.
+    before(&config);
+
+    let log = dir.path().join("server.log");
+    let sink = std::fs::File::create(&log).unwrap();
+
     let mut args = vec!["--config".to_owned(), config.to_str().unwrap().to_owned()];
     args.extend(tail.iter().map(|arg| (*arg).to_owned()));
 
-    let mut child = Killed(
+    let child = Killed(
         wakode()
             .args(&args)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::from(sink))
             .spawn()
             .unwrap(),
     );
 
+    let mut serving = Serving { dir, child, addr, log };
+
     let deadline = Instant::now() + Duration::from_secs(20);
-    // Присваивается на каждом витке до проверки срока, поэтому начального
-    // значения не имеет: любое было бы мёртвым.
     let mut last: String;
-    let answered = loop {
-        if let Some(status) = child.0.try_wait().unwrap() {
-            panic!("процесс `serve` завершился, не начав слушать: {status}");
+    loop {
+        if let Some(status) = serving.child.0.try_wait().unwrap() {
+            panic!(
+                "процесс `serve` завершился, не начав слушать: {status}\nstderr:\n{}",
+                serving.log()
+            );
         }
         match healthz(addr) {
-            Ok(response) if response.starts_with("HTTP/1.1 200 OK") => break response,
+            Ok(response) if response.starts_with("HTTP/1.1 200 OK") => {
+                assert!(response.ends_with("ok"), "нет тела ответа: {response}");
+                return serving;
+            }
             Ok(response) => last = format!("сервер ответил не тем: {response}"),
             Err(err) => last = format!("соединение не установилось: {err}"),
         }
         if Instant::now() >= deadline {
-            // Процесс убивается до чтения stderr: пока он жив, поток не
-            // дойдёт до EOF, и `read_to_string` повис бы вместо того,
-            // чтобы показать, на что жаловался сервер.
-            let _ = child.0.kill();
-            let _ = child.0.wait();
-            let mut log = String::new();
-            if let Some(stderr) = child.0.stderr.as_mut() {
-                let _ = stderr.read_to_string(&mut log);
-            }
-            panic!("{last}\nstderr сервера:\n{log}");
+            panic!("{last}\nstderr сервера:\n{}", serving.log());
         }
         std::thread::sleep(Duration::from_millis(50));
-    };
+    }
+}
 
-    assert!(answered.ends_with("ok"), "нет тела ответа: {answered}");
+#[cfg(unix)]
+#[test]
+fn sigterm_stops_the_server_cleanly_and_stops_the_writer() {
+    // Три утверждения об одном: процесс уходит сам (а не висит с
+    // проглоченным сигналом), уходит успехом (systemd иначе считает
+    // штатную остановку отказом и пишет `Failed with result exit-code`),
+    // и по дороге останавливает писателя.
+    //
+    // Последнее — единственный наблюдаемый признак инварианта «shutdown
+    // зовётся всегда», который до этого плана не держался ничем: до
+    // появления обработчика сигнала SIGTERM убивал процесс на месте.
+    a_signal_stops_the_server_cleanly(libc::SIGTERM, "SIGTERM");
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_stops_the_server_cleanly_too() {
+    // `wait_for_signal` слушает SIGTERM и SIGINT одним `select!`, и до
+    // этого теста ветка SIGINT не была нужна ни одному тесту набора: её
+    // можно было выкинуть целиком (Ctrl-C перестал бы останавливать
+    // сервер штатно) — набор остался бы зелёным.
+    a_signal_stops_the_server_cleanly(libc::SIGINT, "SIGINT");
+}
+
+/// Отправить ребёнку сигнал и проверить штатную остановку по нему же.
+///
+/// Общий код для SIGTERM и SIGINT: у обоих одно и то же наблюдаемое
+/// поведение, и дублировать тело теста ради разницы в одном идентификаторе
+/// значило бы держать два места, которые обязаны меняться синхронно.
+///
+/// `signal="{name}"` проверяется **точным** значением поля, а не
+/// подстрокой «сигнал завершения»: без этого перепутанные местами имена
+/// SIGTERM и SIGINT внутри `wait_for_signal` не роняли бы ничего — сама
+/// строка «сигнал завершения» осталась бы на месте, поменялось бы только
+/// значение поля.
+#[cfg(unix)]
+fn a_signal_stops_the_server_cleanly(signal: libc::c_int, name: &str) {
+    let mut serving = a_serving_child(&["serve"]);
+    let pid = serving.child.0.id();
+
+    // Безопасность: `pid` взят у живого ребёнка, которого мы сами
+    // породили, и до `wait` его номер не переиспользуется.
+    assert_eq!(
+        unsafe { libc::kill(pid as libc::pid_t, signal) },
+        0,
+        "kill не отправился"
+    );
+
+    let status = wait_for_exit(&mut serving.child.0, Duration::from_secs(20))
+        .unwrap_or_else(|| panic!("процесс не завершился по {name} за двадцать секунд"));
+
+    assert!(
+        status.success(),
+        "{name} — штатная остановка, а не отказ: {status}\n{}",
+        serving.log()
+    );
+
+    let log = serving.log();
+    assert!(
+        log.contains(&format!("signal=\"{name}\"")),
+        "в журнале нет точного имени пришедшего сигнала ({name}):\n{log}"
+    );
+    assert!(
+        log.contains("писатель остановлен"),
+        "останов писателя не отработал по пути сигнала:\n{log}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_during_an_unfinished_request_still_exits_and_says_so() {
+    // Три остальных теста на SIGTERM бьют по серверу без единого
+    // незакрытого запроса: сигнал и завершение `served` там происходят
+    // почти одновременно, и разрыв между «сигнал получен» и «сервер
+    // дочитал начатое» ничем не проверяется. Здесь запрос держится
+    // нарочно недочитанным: `Content-Length` объявляет тело длиннее, чем
+    // отправлено, и соединение не закрывается — обработчик "/api/setup"
+    // застревает на чтении тела.
+    //
+    // Это ловит два класса регрессии разом: канал `signalled` в
+    // `main.rs::serve`, если его выкинуть, оставляет `wait_for_drain` без
+    // способа понять, что сигнал вообще пришёл, — первый `select!` ждёт
+    // только `served`, а тот не завершится, пока не дочитан именно этот
+    // запрос, то есть никогда. Процесс не отвечал бы на SIGTERM вовсе и
+    // висел бы до SIGKILL от systemd, убивая писателя на месте — то есть
+    // ровно то, ради чего предел заведён. Соседняя мутация — перепутать
+    // `if drained` и `if !drained` — вместо этого дала бы неверную строку
+    // в журнале при верном факте останова.
+    let mut serving = a_serving_child(&["serve"]);
+    let pid = serving.child.0.id();
+
+    let mut stream = std::net::TcpStream::connect(serving.addr).unwrap();
+    stream
+        .write_all(
+            "POST /api/setup HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+             Content-Length: 1000\r\n\r\n{\"login\":\"недописанный"
+                .as_bytes(),
+        )
+        .unwrap();
+
+    // Без паузы SIGTERM обгоняет `accept()` на сервере: соединение сидит
+    // в очереди ядра, ещё не подхвачено циклом приёма, и «начатых, но не
+    // дочитанных» запросов с точки зрения axum попросту нет — сервер
+    // закрывается мгновенно, а сценарий этого теста не воспроизводится.
+    // Проверено вручную: без паузы «в срок» отчитывается за миллисекунды,
+    // с ней — ровно через `GRACE`.
+    std::thread::sleep(Duration::from_millis(300));
+
+    assert_eq!(
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) },
+        0,
+        "kill не отправился"
+    );
+
+    // `GRACE` — десять секунд; запас даёт время на старт процесса и сам
+    // останов писателя. Внутренний обработчик от клиента не зависит:
+    // соединение остаётся открытым нами специально, всё время процесса.
+    let status = wait_for_exit(&mut serving.child.0, Duration::from_secs(20)).expect(
+        "процесс не завершился в течение предела дренажа: канал сигнала не дошёл до \
+         wait_for_drain, и SIGTERM убил бы писателя на месте, как до всего этого плана",
+    );
+
+    assert!(
+        status.success(),
+        "SIGTERM с незакрытым запросом — тоже штатная остановка: {status}\n{}",
+        serving.log()
+    );
+
+    let log = serving.log();
+    assert!(
+        log.contains("не все соединения закрылись в срок"),
+        "запрос не был брошен по истечении предела, хотя не мог быть дочитан:\n{log}"
+    );
+    assert!(
+        !log.contains("начатые запросы дочитаны"),
+        "журнал сообщает об успешном дочитывании при заведомо недочитанном запросе:\n{log}"
+    );
+
+    // Соединение держим у себя до конца: закрыть его раньше значило бы
+    // дать серверу дочитать (оборванным телом) раньше SIGTERM, и сценарий
+    // перестал бы быть «начатый, не дочитанный запрос».
+    drop(stream);
+}
+
+/// Дождаться завершения процесса, но не дольше срока.
+#[cfg(unix)]
+fn wait_for_exit(
+    child: &mut std::process::Child,
+    within: Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + within;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Сырой `GET /healthz` через настоящий сокет.
@@ -967,5 +1170,119 @@ fn a_duplicate_login_is_refused_in_plain_words() {
     assert!(
         !stderr.contains("UNIQUE") && !stderr.contains("2067"),
         "сырой текст SQLite уехал владельцу: {stderr}"
+    );
+}
+
+#[test]
+fn the_setup_token_from_the_log_opens_setup_through_a_proxy() {
+    // Сквозная проводка: токен из журнала — тот самый, который принимает
+    // сервер, и он снимает ровно тот отказ, который иначе получает
+    // запрос с прокси-заголовком. Мутация «в состояние уходит None»
+    // роняет этот тест и не роняет ни одного теста в wakode-api.
+    let serving = a_serving_child(&["serve"]);
+
+    let token = wait_for_setup_token(&serving);
+
+    // Сначала — что отказ вообще есть. Без этой половины 201 ниже
+    // ничего не доказывал бы: он получился бы и без токена.
+    let refused = raw_setup(serving.addr, Some("203.0.113.5"), None);
+    assert!(
+        refused.starts_with("HTTP/1.1 403"),
+        "запрос через посредника без токена обязан быть отвергнут: {refused}"
+    );
+
+    let created = raw_setup(serving.addr, Some("203.0.113.5"), Some(&token));
+    assert!(
+        created.starts_with("HTTP/1.1 201"),
+        "токен из журнала не открыл настройку: {created}\nжурнал:\n{}",
+        serving.log()
+    );
+}
+
+/// Дождаться строки с токеном в журнале и вернуть его значение.
+fn wait_for_setup_token(serving: &Serving) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let log = serving.log();
+        if let Some(token) = log
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("token="))
+        {
+            return token.to_owned();
+        }
+        if Instant::now() >= deadline {
+            panic!("токен настройки не появился в журнале:\n{log}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Сырой `POST /api/setup` через настоящий сокет.
+fn raw_setup(
+    addr: std::net::SocketAddr,
+    forwarded_for: Option<&str>,
+    token: Option<&str>,
+) -> String {
+    // Не `br#"..."#`: сырой байтовый литерал в Rust обязан быть ASCII, а
+    // пароль — намеренно кириллический (проверяет ту же границу, что и
+    // `the_password_threshold_counts_characters_not_bytes` в `wakode-api`).
+    let body = r#"{"login":"admin","password":"достаточно длинный","timezone":"Europe/Moscow"}"#
+        .as_bytes();
+
+    let mut request = format!(
+        "POST /api/setup HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    if let Some(value) = forwarded_for {
+        request.push_str(&format!("X-Forwarded-For: {value}\r\n"));
+    }
+    if let Some(value) = token {
+        request.push_str(&format!("X-Wakode-Setup-Token: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    stream.write_all(body).unwrap();
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response
+}
+
+/// Настроенный инстанс токен не выпускает и в журнал не пишет.
+///
+/// Зеркало `the_setup_token_from_the_log_opens_setup_through_a_proxy`, и
+/// заведено не для симметрии. Финальное ревью ветки показало мутацией,
+/// что условие `user_count().await? == 0` в `main.rs::serve` не держалось
+/// ничем: замена на `>= 0` проходила по всему workspace зелёной. Цена
+/// такой мутации у владельца — свежий 32-байтовый секрет в journald на
+/// каждый перезапуск боевого инстанса, где настройка давно закрыта, и
+/// `token_required: true` в ответе удалённому клиенту.
+///
+/// Утверждение отрицательное, поэтому рядом стоит положительное: без
+/// него сломанный захват журнала (пустой файл) выглядел бы как успех.
+#[test]
+fn a_configured_instance_never_prints_a_setup_token() {
+    let serving = a_serving_child_after(&["serve"], |config| {
+        let created = create_user(config, "swrneko", "достаточно длинный пароль");
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+    });
+
+    let log = serving.log();
+    assert!(
+        log.contains("сервер поднят"),
+        "журнал сервера не прочитан — отрицательная проверка ниже была бы пустой:\n{log}"
+    );
+    assert!(
+        !log.contains("token="),
+        "инстанс с администратором напечатал токен первичной настройки:\n{log}"
     );
 }

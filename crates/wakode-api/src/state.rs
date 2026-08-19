@@ -1,9 +1,9 @@
-use wakode_auth::MasterKey;
+use wakode_auth::{MasterKey, SetupToken};
 use wakode_store::SqliteStore;
 
 /// Состояние приложения.
 ///
-/// Держит пять полей конфигурации, а не весь `Config`: слою HTTP не нужны
+/// Держит шесть полей конфигурации, а не весь `Config`: слою HTTP не нужны
 /// ни адрес прослушивания, ни путь к базе, а узкое состояние — ещё и
 /// защита от того, что в конфиг со временем приедет что-то чувствительное.
 #[derive(Clone)]
@@ -14,6 +14,18 @@ pub struct AppState {
     pub session_ttl_days: i64,
     pub setup_from_any_address: bool,
     pub default_timeout_secs: i64,
+    /// Токен первичной настройки.
+    ///
+    /// Выдаётся вызывающим, только если на старте процесса пользователей
+    /// не было; после появления администратора в этом же процессе значение
+    /// само не очищается — эндпоинт закрывает не оно, а проверка
+    /// `user_count() > 0` в `setup`. Само значение живёт до перезапуска.
+    ///
+    /// `None` — закрытая сторона: инстанс без токена настройку по токену
+    /// не пускает вовсе. Поэтому поле и не входит в `AppSettings`:
+    /// умолчание должно получаться само, а не задаваться каждым
+    /// вызывающим.
+    pub setup_token: Option<SetupToken>,
 }
 
 /// Настройки, которые HTTP-слой берёт из конфига.
@@ -53,7 +65,20 @@ impl AppState {
             session_ttl_days: settings.session_ttl_days,
             setup_from_any_address: settings.setup_from_any_address,
             default_timeout_secs: settings.default_timeout_secs,
+            setup_token: None,
         }
+    }
+
+    /// Выдать состоянию токен первичной настройки.
+    ///
+    /// Отдельным методом, а не четвёртым аргументом `new`: токен есть
+    /// ровно у одного вызывающего из дюжины — у `serve` в бинаре, — и
+    /// умолчание `None` закрытое. Четвёртый аргумент заставил бы одиннадцать
+    /// вызовов писать `None` и ничего бы этим не доказал.
+    #[must_use]
+    pub fn with_setup_token(mut self, token: Option<SetupToken>) -> Self {
+        self.setup_token = token;
+        self
     }
 }
 
@@ -66,6 +91,7 @@ impl std::fmt::Debug for AppState {
             .field("session_ttl_days", &self.session_ttl_days)
             .field("setup_from_any_address", &self.setup_from_any_address)
             .field("default_timeout_secs", &self.default_timeout_secs)
+            .field("setup_token", &self.setup_token.is_some())
             .finish()
     }
 }
