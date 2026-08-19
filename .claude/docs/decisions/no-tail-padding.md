@@ -28,13 +28,15 @@ One day, 502 heartbeats, 62 duration entries, four projects.
 
 Reproduce with `fixtures/wakatime/heartbeats-day.json` and `durations-day.json` from `tools/capture-wakatime-fixtures.sh`.
 
-## What was wrong before
+## What this means for the engine
 
-The engine's model was: group heartbeats **per project**, glue them into intervals, then add `tail_padding` to each. Three things are wrong with it, and only the third was suspected.
+`build_intervals` (`crates/wakode-core/src/intervals.rs:41`) already implements exactly this model, and did before the measurement. It sorts a user's heartbeats together — **not** grouped by project — glues them chronologically, and gives each interval the attributes of the earlier heartbeat of the pair (`intervals.rs:36-37, 58-63`, held by `interval_inherits_attributes_of_the_earlier_heartbeat`). A gap longer than `timeout` ends the session and is charged to nobody.
 
-- **Grouping per project first is wrong.** Gaps are measured globally and only then attributed. Switching between two projects within the timeout produces no gap at all — the time belongs to whichever project was open first. Per-project grouping instead measures the gap to that project's *own* next heartbeat, which is longer, and double-counts overlapping stretches. On the measured day this inflated the total by 2926 s (13%) — in the direction of reporting more work than happened.
-- **The last heartbeat of a session must contribute zero.** Not a small addition: zero.
-- **There is no padding to calibrate.** The knob stays in the config because someone may want their own numbers, but its documented default is now a measured fact, not a placeholder.
+So the calibration did not find a bug. It confirmed a design that until now rested on inference from `wakatime-cli` source, and it settled the one free parameter:
+
+**`tail_padding` must stay zero.** At zero the tail interval is not created at all — the guard `end > hb.time` (`intervals.rs:62`) drops it — which is precisely the measured behaviour. Any non-zero value makes wakode report more than WakaTime for the same heartbeats, by exactly `padding × sessions`.
+
+An earlier draft of this document claimed the engine grouped per project first and therefore overcounted by 13%. That was wrong: the 13% came from a per-project grouping in the throwaway analysis script, not from `build_intervals`. Recorded here rather than deleted because the wrong number was committed and may be quoted back.
 
 ## Caveat
 
