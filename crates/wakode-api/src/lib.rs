@@ -120,6 +120,10 @@ pub fn router(state: AppState) -> Router {
                 "/api/v1/users/current/heartbeats.bulk",
                 axum::routing::post(compat::post_heartbeats_bulk),
             )
+            .route(
+                "/api/v1/users/current/summaries",
+                get(compat::summaries),
+            )
             .fallback(|| async { ApiError::NotFound })
             .method_not_allowed_fallback(|| async { ApiError::MethodNotAllowed })
             .with_state(state),

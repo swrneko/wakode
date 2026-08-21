@@ -22,8 +22,33 @@ const NOT_OURS: &[&str] = &[
     // читают, а выдумывать значения хуже, чем не отдавать поле.
     // Решение записано в спеке, раздел «Проверенные формы ответов».
     "ai_",
+    // Вторая половина той же аналитики: `human_*` стоят в `summaries`
+    // рядом с `ai_additions` и означают то же измерение, поделённое
+    // надвое — сколько строк написал человек, а сколько ассистент. Мы не
+    // считаем ни одной из половин: правки строк доезжают в отметке
+    // (`line_additions`), но ни в атрибуты интервала, ни в суммы по дням
+    // не входят, — и отдавать одну половину нулём, не считая второй,
+    // значило бы соврать числом вместо молчания.
+    //
+    // **Именами, а не префиксом `"human_"`.** Префикс гасил бы заодно
+    // `human_readable_website` из `current.json` — поле профиля, к
+    // ИИ-аналитике отношения не имеющее и нами отдаваемое
+    // (`compat/user.rs`). Помощник молча перестал бы его проверять, то
+    // есть список исключений начал бы прощать по случайности — ровно то,
+    // против чего он и заведён.
+    "human_additions",
+    "human_deletions",
+    "human_line_changes",
 ];
 
+/// Совпадение по префиксу, а не по равенству: `"ai_"` гасит семейство
+/// целиком, потому что аналитика ИИ-кода растёт от версии к версии и
+/// перечислять её поимённо пришлось бы заново после каждого снимка.
+///
+/// Соседние `human_*` перечислены именами — см. комментарий выше. Правило,
+/// по которому выбирают: префикс годится, когда всё семейство заведомо
+/// наше исключение; имя обязательно, когда рядом живёт однокоренное поле,
+/// которое мы отдаём.
 fn skipped(key: &str) -> bool {
     NOT_OURS.iter().any(|prefix| key.starts_with(prefix))
 }
@@ -296,14 +321,20 @@ fn a_null_on_either_side_says_nothing_about_the_type() {
 
 #[test]
 fn the_helper_forgives_only_the_fields_we_declared() {
-    // Зеркало: `ai_*` прощается, соседнее незнакомое поле — нет. Без
-    // этой половины список исключений мог бы прощать всё подряд.
-    let theirs = serde_json::json!({"ai_sessions": 3, "sessions": 3});
+    // Зеркало: `ai_*` и `human_*` прощаются, соседнее незнакомое поле —
+    // нет. Без этой половины список исключений мог бы прощать всё подряд.
+    let theirs = serde_json::json!({
+        "ai_sessions": 3,
+        "human_additions": 7,
+        "sessions": 3,
+        "additions": 7,
+    });
     let ours = serde_json::json!({});
     let mut problems = Vec::new();
     compare(&ours, &theirs, "", &mut problems);
-    assert_eq!(problems.len(), 1, "{problems:?}");
-    assert!(problems[0].contains(".sessions"), "{problems:?}");
+    assert_eq!(problems.len(), 2, "{problems:?}");
+    assert!(problems.iter().any(|p| p.contains(".sessions")), "{problems:?}");
+    assert!(problems.iter().any(|p| p.contains(".additions")), "{problems:?}");
 }
 
 #[tokio::test]
@@ -345,6 +376,140 @@ async fn an_accepted_heartbeat_has_the_shape_wakatime_has() {
 
     assert_eq!(response.status(), axum::http::StatusCode::CREATED);
     assert_shape_matches(&json_body(response).await, &fixture("heartbeat-single"));
+}
+
+/// Отметка со всеми атрибутами, какие мы умеем читать.
+///
+/// Атрибуты заполняются все до одного не для красоты: массив ответа,
+/// оставшийся пустым, помощник прощает по документированной ветке, и форма
+/// его элементов не проверялась бы тогда ничем.
+fn a_full_heartbeat(time: f64) -> String {
+    format!(
+        r#"{{"entity":"/дом/вакода/сводки.rs","type":"file","time":{time},
+            "category":"coding","project":"вакода","branch":"master",
+            "language":"Rust","editor":"nvim","operating_system":"Linux",
+            "machine":"ноутбук"}}"#
+    )
+}
+
+/// Записать отметки и убедиться, что они приняты: сводка по непринятым
+/// отметкам была бы пустой, и все проверки ниже вырождаются молча.
+async fn record(state: &AppState, key: &ApiKeyValue, times: &[f64]) {
+    for &time in times {
+        let response = post(
+            state.clone(),
+            key,
+            "/api/v1/users/current/heartbeats",
+            &a_full_heartbeat(time),
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::CREATED, "{time}");
+    }
+}
+
+/// Непустые ли массивы дня — иначе сверять их форму бессмысленно.
+fn assert_the_day_has_something_in_every_array(day: &Value) {
+    for key in [
+        "projects",
+        "languages",
+        "editors",
+        "operating_systems",
+        "categories",
+        "machines",
+    ] {
+        assert!(
+            !day[key].as_array().unwrap_or_else(|| panic!("{key} не массив: {day}")).is_empty(),
+            "{key} пуст: форму его элемента сверка не проверит вовсе"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_summary_of_one_day_has_the_shape_wakatime_has() {
+    // Эталон снят за 18 августа 2026 года по московскому времени, и день
+    // здесь тот же: 09:00Z — это полдень в Москве, середина суток, куда
+    // ни один перевод часов не дотянется.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+    record(&state, &key, &[1_787_043_600.0, 1_787_043_660.0]).await;
+
+    let response = get_with_a_key(
+        state,
+        &key,
+        "/api/v1/users/current/summaries?start=2026-08-18&end=2026-08-18",
+    )
+    .await;
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let ours = json_body(response).await;
+
+    assert_eq!(ours["data"].as_array().unwrap().len(), 1, "{ours}");
+    assert_the_day_has_something_in_every_array(&ours["data"][0]);
+
+    assert_shape_matches(&ours, &fixture("summaries-one-day"));
+}
+
+#[tokio::test]
+async fn a_week_of_summaries_has_the_shape_wakatime_has() {
+    // `summaries-week` нужен отдельно от одного дня: `cumulative_total` и
+    // `daily_average` там считаны по семи дням, и разойдись мы с ними
+    // ключом или типом — на одном дне это не проявится, потому что все
+    // числа совпадут с итогом единственного дня.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+    record(&state, &key, &[1_787_043_600.0, 1_787_043_660.0]).await;
+
+    let response = get_with_a_key(
+        state,
+        &key,
+        "/api/v1/users/current/summaries?start=2026-08-12&end=2026-08-18",
+    )
+    .await;
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let ours = json_body(response).await;
+
+    assert_eq!(ours["data"].as_array().unwrap().len(), 7, "{ours}");
+    assert_shape_matches(&ours, &fixture("summaries-week"));
+
+    // Помощник сверяет у массива только первый элемент, а первым здесь
+    // стоит пустой день: без второго вызова форма непустого дня недели не
+    // проверялась бы ничем.
+    let worked = &ours["data"][6];
+    assert_the_day_has_something_in_every_array(worked);
+    assert_shape_matches(worked, &fixture("summaries-week")["data"][0]);
+}
+
+#[tokio::test]
+async fn an_empty_day_has_every_key_a_day_with_work_has() {
+    // `data[0]` эталона `summaries-month` — день без работы (2026-07-20),
+    // и все семь его массивов пусты. Именно поэтому месяц не годится на
+    // сверку формы элементов и годится ровно на это: у пустого дня те же
+    // девять ключей и те же типы скаляров, что у рабочего.
+    let theirs = fixture("summaries-month");
+    let their_empty_day = &theirs["data"][0];
+    assert_eq!(theirs["data"].as_array().unwrap().len(), 30, "эталон не месяц");
+    assert_eq!(
+        their_empty_day["grand_total"]["total_seconds"], 0.0,
+        "первый день эталона не пуст, и тест проверяет не то, что обещает"
+    );
+    assert_eq!(their_empty_day["range"]["date"], "2026-07-20");
+
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    let response = get_with_a_key(
+        state,
+        &key,
+        "/api/v1/users/current/summaries?start=2026-07-20&end=2026-07-20",
+    )
+    .await;
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let ours = json_body(response).await;
+
+    assert_eq!(ours["data"][0]["grand_total"]["total_seconds"], 0.0, "{ours}");
+    assert_shape_matches(&ours["data"][0], their_empty_day);
 }
 
 #[tokio::test]

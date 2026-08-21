@@ -3158,3 +3158,457 @@ async fn a_wrong_method_on_the_bulk_path_is_a_json_error_too() {
     let json = json_body(response).await;
     assert!(json.get("error").is_some(), "нет поля error: {json}");
 }
+
+// ---------------------------------------------------------------------------
+// Сводки: `GET /api/v1/users/current/summaries` (задача 5)
+// ---------------------------------------------------------------------------
+
+/// Полдень 18 августа 2026 года по московскому времени — тот же день, что
+/// у эталонов в `tests/fixtures/wakatime`. Середина суток выбрана
+/// намеренно: до любого перевода часов отсюда далеко в обе стороны.
+const NOON: f64 = 1_787_043_600.0;
+
+/// Тело отметки: сущность, проект и категория задаются, остальное — как
+/// придётся. Категория строкой, а не значением `Category`: незнакомую
+/// строку иначе не отправить, а один из тестов ниже отправляет именно её.
+fn a_heartbeat_at(time: f64, project: &str, category: &str) -> String {
+    format!(
+        r#"{{"entity":"/дом/{project}/файл.rs","type":"file","time":{time},
+            "category":"{category}","project":"{project}","language":"Rust"}}"#
+    )
+}
+
+/// Записать отметки и убедиться, что каждая принята: сводка по непринятым
+/// отметкам пуста, и проверка ниже прошла бы мимо.
+async fn record_heartbeats_at(
+    state: &AppState,
+    key: &ApiKeyValue,
+    project: &str,
+    times: &[f64],
+) {
+    for &time in times {
+        let response =
+            post_heartbeat_response(state.clone(), key, &a_heartbeat_at(time, project, "coding"))
+                .await;
+        assert_eq!(response.status(), StatusCode::CREATED, "отметка {time} не принята");
+    }
+}
+
+async fn summaries_response(state: AppState, key: &ApiKeyValue, query: &str) -> Response {
+    router(state)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/users/current/summaries?{query}"))
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Basic {}", STANDARD.encode(key.to_string())),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// Тело успешной сводки.
+async fn a_summary(state: AppState, key: &ApiKeyValue, query: &str) -> serde_json::Value {
+    let response = summaries_response(state, key, query).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    json_body(response).await
+}
+
+/// Пользователь с заданным тайм-аутом и предъявляемый ключ к нему.
+async fn a_user_with_a_timeout(
+    store: &SqliteStore,
+    master: &MasterKey,
+    login: &str,
+    timeout_secs: i64,
+) -> ApiKeyValue {
+    let user = store
+        .create_user(NewUser {
+            login: login.to_owned(),
+            email: None,
+            password_hash: "непрозрачно".to_owned(),
+            display_name: None,
+            timezone: "Europe/Moscow".parse().unwrap(),
+            timeout_secs,
+            is_admin: false,
+        })
+        .await
+        .unwrap();
+
+    let value = ApiKeyValue::generate();
+    store
+        .create_key(NewApiKey {
+            user_id: user.id,
+            name: "ноутбук".to_owned(),
+            key_encrypted: value.encrypt(master).unwrap().as_bytes().to_vec(),
+            key_lookup: value.lookup(master),
+        })
+        .await
+        .unwrap();
+
+    value
+}
+
+#[tokio::test]
+async fn every_day_of_the_range_is_present_even_when_empty() {
+    // Проверено чужим поведением: 30-дневный диапазон эталона даёт 30
+    // элементов, из них 12 пустых. `split_by_local_day` пустых дней не
+    // порождает — их обязан добавить эндпоинт, и без этого теста он о них
+    // забудет.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+    record_heartbeats_at(&state, &key, "вакода", &[NOON, NOON + 60.0]).await;
+
+    let body = a_summary(state, &key, "start=2026-08-12&end=2026-08-18").await;
+
+    let days = body["data"].as_array().unwrap();
+    assert_eq!(days.len(), 7, "{body}");
+    // Дни идут подряд и по возрастанию, без пропусков.
+    let dates: Vec<&str> = days
+        .iter()
+        .map(|day| day["range"]["date"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        dates,
+        [
+            "2026-08-12", "2026-08-13", "2026-08-14", "2026-08-15", "2026-08-16", "2026-08-17",
+            "2026-08-18"
+        ]
+    );
+
+    let empty = &days[3];
+    assert_eq!(empty["grand_total"]["total_seconds"], 0.0, "{empty}");
+    assert_eq!(empty["grand_total"]["text"], "0 secs", "{empty}");
+    assert_eq!(empty["grand_total"]["digital"], "0:00", "{empty}");
+    assert!(empty["projects"].as_array().unwrap().is_empty(), "{empty}");
+    assert!(empty["languages"].as_array().unwrap().is_empty(), "{empty}");
+
+    // Рабочий день в том же ответе непуст — иначе проверки выше держались
+    // бы на том, что не сосчиталось вообще ничего.
+    assert_eq!(days[6]["grand_total"]["total_seconds"], 60.0, "{body}");
+
+    // Шесть праздников из семи дней: считает их тот же обход, что
+    // добавляет пустые дни. Среднее делится на **рабочие** дни, а не на
+    // все семь: 60 секунд за один рабочий день — это 60, а не 8.
+    assert_eq!(body["daily_average"]["seconds_including_other_language"], 60, "{body}");
+    assert_eq!(body["daily_average"]["holidays"], 6, "{body}");
+    assert_eq!(body["daily_average"]["days_minus_holidays"], 1, "{body}");
+    assert_eq!(body["daily_average"]["days_including_holidays"], 7, "{body}");
+}
+
+#[tokio::test]
+async fn work_that_crosses_local_midnight_is_split_between_the_two_days() {
+    // Отметки за 23:55 и 00:05 по часовому поясу пользователя. Спрашивать
+    // приходится **каждый день по отдельности**: в двухдневном запросе
+    // обе отметки попали бы в окно даже при выборке ровно по границам
+    // суток, и реализация, забывшая `heartbeat_window`, осталась бы
+    // зелёной. По одному дню она недосчитает всё.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+    // 2026-08-18T20:55:00Z и 2026-08-18T21:05:00Z — 23:55 и 00:05 в Москве.
+    record_heartbeats_at(&state, &key, "вакода", &[1_787_086_500.0, 1_787_087_100.0]).await;
+
+    let eighteenth = a_summary(state.clone(), &key, "start=2026-08-18&end=2026-08-18").await;
+    assert_eq!(
+        eighteenth["data"][0]["grand_total"]["total_seconds"], 300.0,
+        "первый день не получил свои пять минут до полуночи: {eighteenth}"
+    );
+
+    let nineteenth = a_summary(state.clone(), &key, "start=2026-08-19&end=2026-08-19").await;
+    assert_eq!(
+        nineteenth["data"][0]["grand_total"]["total_seconds"], 300.0,
+        "второй день не получил свои пять минут после полуночи: {nineteenth}"
+    );
+
+    // И сумма по дням равна времени интервала целиком — ни секунды не
+    // потеряно и ни одна не посчитана дважды.
+    let both = a_summary(state, &key, "start=2026-08-18&end=2026-08-19").await;
+    assert_eq!(both["cumulative_total"]["seconds"], 600.0, "{both}");
+}
+
+#[tokio::test]
+async fn the_timeout_that_breaks_a_session_is_the_users_own_and_not_the_app_setting() {
+    // `a_settings()` объявляет `default_timeout_secs = 777`, у
+    // пользователя записано 300. Отметки расставлены так, что ответ по
+    // ним разный: разрыв в 600 секунд рвёт сессию при пользовательских
+    // 300 и не рвёт при настроечных 777.
+    let dir = tempfile::tempdir().unwrap();
+    let master = MasterKey::generate();
+    let store = a_store(&dir);
+    let key = a_user_with_a_timeout(&store, &master, "swrneko", 300).await;
+    let state = AppState::new(store, Some(master), a_settings());
+
+    record_heartbeats_at(&state, &key, "вакода", &[NOON, NOON + 200.0, NOON + 800.0]).await;
+
+    let body = a_summary(state, &key, "start=2026-08-18&end=2026-08-18").await;
+
+    // 200 секунд первой пары засчитаны, 600 секунд разрыва — никому.
+    // Настройка приложения дала бы 800.
+    assert_eq!(
+        body["data"][0]["grand_total"]["total_seconds"], 200.0,
+        "таймаут взят не у пользователя: {body}"
+    );
+}
+
+#[tokio::test]
+async fn nothing_is_added_to_the_last_heartbeat_of_a_session() {
+    // Точная сумма по известным отметкам, а не «больше нуля»: хвостовая
+    // добавка — ноль, и это измеренное значение
+    // (`.claude/docs/decisions/no-tail-padding.md`), а не осторожность.
+    // Сессий здесь две, потому что ненулевая добавка прибавляет по разу к
+    // каждой: на одной сессии перепутать её с расширением интервала было
+    // бы легче.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+    record_heartbeats_at(
+        &state,
+        &key,
+        "вакода",
+        // Первая сессия: 12:00, 12:01, 12:02 — ровно 120 секунд.
+        // Разрыв в 1880 секунд длиннее таймаута 900 и не стоит ничего.
+        // Вторая сессия: две отметки в минуте друг от друга — 60 секунд.
+        &[NOON, NOON + 60.0, NOON + 120.0, NOON + 2000.0, NOON + 2060.0],
+    )
+    .await;
+
+    let body = a_summary(state, &key, "start=2026-08-18&end=2026-08-18").await;
+    let day = &body["data"][0];
+
+    assert_eq!(day["grand_total"]["total_seconds"], 180.0, "{body}");
+    assert_eq!(day["grand_total"]["text"], "3 mins", "{body}");
+    assert_eq!(day["grand_total"]["digital"], "0:03", "{body}");
+    // Разбивка сходится с итогом до последней секунды: время не может
+    // появиться в проекте и не появиться в сумме.
+    assert_eq!(day["projects"][0]["total_seconds"], 180.0, "{body}");
+    assert_eq!(day["projects"][0]["percent"], 100.0, "{body}");
+    assert_eq!(body["cumulative_total"]["seconds"], 180.0, "{body}");
+}
+
+#[tokio::test]
+async fn another_users_heartbeats_stay_out_of_the_summary() {
+    // Запрос без фильтра по `user_id` прошёл бы все проверки выше: там
+    // пользователь в базе один. Здесь их двое, и работали они в одну и ту
+    // же минуту.
+    let dir = tempfile::tempdir().unwrap();
+    let master = MasterKey::generate();
+    let store = a_store(&dir);
+    let mine = a_user_with_a_timeout(&store, &master, "swrneko", 900).await;
+    let hers = a_user_with_a_timeout(&store, &master, "соседка", 900).await;
+    let state = AppState::new(store, Some(master), a_settings());
+
+    record_heartbeats_at(&state, &mine, "мой", &[NOON, NOON + 60.0]).await;
+    record_heartbeats_at(&state, &hers, "чужой", &[NOON, NOON + 600.0]).await;
+
+    let body = a_summary(state, &mine, "start=2026-08-18&end=2026-08-18").await;
+    let day = &body["data"][0];
+
+    assert_eq!(day["grand_total"]["total_seconds"], 60.0, "чужое время в сводке: {body}");
+    let projects = day["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 1, "{body}");
+    assert_eq!(projects[0]["name"], "мой", "{body}");
+}
+
+#[tokio::test]
+async fn a_category_we_do_not_know_is_not_named_unknown_to_the_client() {
+    // Незнакомая категория прощается разбором и ложится в базу как
+    // `Category::Unknown` — это держит тест задачи 3. Наружу же строка
+    // `"unknown"` уехать не имеет права: в протоколе WakaTime такого
+    // значения нет, и докстринг `Category::Unknown` адресует обязанность
+    // отобразить её в `null` слою совместимости. Сводка — первое место,
+    // где категории вообще уезжают клиенту.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+    for time in [NOON, NOON + 60.0] {
+        let response = post_heartbeat_response(
+            state.clone(),
+            &key,
+            &a_heartbeat_at(time, "вакода", "квантование"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    // Соседний день с категорией, которую мы знаем: без него проверка
+    // «имени нет» держалась бы на том, что категорий не отдано вовсе.
+    for time in [NOON - 86_400.0, NOON - 86_340.0] {
+        let response = post_heartbeat_response(
+            state.clone(),
+            &key,
+            &a_heartbeat_at(time, "вакода", "coding"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    let body = a_summary(state, &key, "start=2026-08-17&end=2026-08-18").await;
+    let known = &body["data"][0];
+    let unknown = &body["data"][1];
+
+    // Знакомая категория называется так, как её называет сводка WakaTime,
+    // — с заглавных, а не проволочным именем приёма отметки. Обе строки
+    // измерены (26 и 5 вхождений на три эталона), нижнего регистра в
+    // `categories[]` не встречается ни разу.
+    let known_categories = known["categories"].as_array().unwrap();
+    assert_eq!(known_categories.len(), 1, "{body}");
+    assert_eq!(known_categories[0]["name"], "Coding", "{body}");
+    assert_eq!(known_categories[0]["total_seconds"], 60.0, "{body}");
+
+    // Элемент незнакомой на месте, и время в нём — иначе «нет строки
+    // unknown» выполнялось бы просто потому, что категорий не отдано.
+    let categories = unknown["categories"].as_array().unwrap();
+    assert_eq!(categories.len(), 1, "{body}");
+    assert_eq!(categories[0]["total_seconds"], 60.0, "{body}");
+    assert_eq!(categories[0]["name"], serde_json::Value::Null, "{body}");
+    // И нигде больше в ответе тоже — ни строкой, ни в нижнем регистре.
+    assert!(
+        !body.to_string().contains("unknown"),
+        "строка unknown уехала клиенту: {body}"
+    );
+    assert!(
+        !body.to_string().contains("\"coding\""),
+        "проволочное имя приёма уехало клиенту как имя категории: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_range_we_cannot_use_is_refused_with_a_code_the_plugin_drops() {
+    // `400`, а не `500`: пятисотку совместимый клиент считает временной
+    // поломкой сервера и повторяет запрос вечно, а негодная дата от
+    // повтора годной не станет.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    for query in [
+        "",                                        // ни одной границы
+        "start=2026-08-18",                        // только начало
+        "end=2026-08-18",                          // только конец
+        "start=вчера&end=2026-08-18",              // дату не прочитать
+        "start=2026-08-18&end=2026-08-11",         // начало позже конца
+        "start=1026-08-18&end=2026-08-18",         // тысяча лет
+    ] {
+        let response = summaries_response(state.clone(), &key, query).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "запрос {query:?}");
+        let json = json_body(response).await;
+        assert!(json.get("error").is_some(), "запрос {query:?}: нет поля error: {json}");
+    }
+
+    // Зеркало: годный диапазон той же длины, что и отвергнутый, проходит.
+    let response = summaries_response(state, &key, "start=2025-08-18&end=2026-08-18").await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_summary_needs_a_key_and_a_wrong_method_is_a_json_error_too() {
+    // Вторая половина — про порядок строк в `router`: маршрут, добавленный
+    // **ниже** `method_not_allowed_fallback`, остался бы с пустым `405`
+    // axum'а, мимо обещания «тело всегда JSON». Инвариант из
+    // `.claude/rules/ARCHITECTURE.md`, и ломали его не раз.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    let anonymous = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/users/current/summaries?start=2026-08-18&end=2026-08-18")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let posted = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/users/current/summaries")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Basic {}", STANDARD.encode(key.to_string())),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(posted.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let json = json_body(posted).await;
+    assert!(json.get("error").is_some(), "нет поля error: {json}");
+}
+
+#[tokio::test]
+async fn a_timeout_that_is_not_a_duration_is_an_error_and_not_a_made_up_number() {
+    // `timeout_secs` приезжает из конфига непроверенным и доезжает до
+    // базы: `config.rs` не смотрит ни на знак, ни на величину. Считать по
+    // нулю нечего, а подставить умолчание значило бы отчитаться о времени,
+    // которого владелец не настраивал.
+    let dir = tempfile::tempdir().unwrap();
+    let master = MasterKey::generate();
+    let store = a_store(&dir);
+    let key = a_user_with_a_timeout(&store, &master, "swrneko", 0).await;
+    let state = AppState::new(store, Some(master), a_settings());
+
+    let response = summaries_response(state, &key, "start=2026-08-18&end=2026-08-18").await;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let json = json_body(response).await;
+    assert!(json.get("error").is_some(), "нет поля error: {json}");
+}
+
+#[tokio::test]
+async fn the_daily_average_divides_by_the_days_that_had_work() {
+    // У эталона за месяц 30 дней, 12 праздников и 18 рабочих, а
+    // 236484.833 / 18 = 13138.05 при напечатанных 13138 — то есть делится
+    // накопленный итог на дни **за вычетом** праздников и усекается.
+    // Здесь два рабочих дня из семи и 180 секунд итога.
+    //
+    // Вторая половина — про пару `seconds` и
+    // `seconds_including_other_language`: у WakaTime разница между ними
+    // это время языка `"Other"`, у нас — время, у которого языка нет
+    // вовсе. Без отметок без языка поля совпали бы, и утверждение
+    // докстринга `DailyAverage` не проверялось бы ничем.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    // 17 августа: минута на языке, который мы знаем.
+    record_heartbeats_at(&state, &key, "вакода", &[NOON - 86_400.0, NOON - 86_340.0]).await;
+    // 18 августа: две минуты без языка вовсе.
+    for time in [NOON, NOON + 120.0] {
+        let response = post_heartbeat_response(
+            state.clone(),
+            &key,
+            &format!(
+                r#"{{"entity":"/дом/вакода/README","type":"file","time":{time},"project":"вакода"}}"#
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    let body = a_summary(state, &key, "start=2026-08-12&end=2026-08-18").await;
+    let average = &body["daily_average"];
+
+    assert_eq!(body["cumulative_total"]["seconds"], 180.0, "{body}");
+    assert_eq!(average["days_including_holidays"], 7, "{body}");
+    assert_eq!(average["holidays"], 5, "{body}");
+    assert_eq!(average["days_minus_holidays"], 2, "{body}");
+    // 180 / 2 — по рабочим дням, а не по семи (это дало бы 25).
+    assert_eq!(average["seconds_including_other_language"], 90, "{body}");
+    assert_eq!(average["text_including_other_language"], "1 min", "{body}");
+    // 120 секунд без языка отложены в сторону: (180 - 120) / 2.
+    assert_eq!(average["seconds"], 30, "{body}");
+    assert_eq!(average["text"], "30 secs", "{body}");
+
+    // То же время в массиве `languages` названо `"Other"` — тем же
+    // именем, каким его называет чужой сервер. Без этой проверки расчёт
+    // среднего опирался бы на равенство «наш None = их Other», а массив
+    // то же множество называл бы иначе.
+    let languages = body["data"][6]["languages"].as_array().unwrap();
+    assert_eq!(languages.len(), 1, "{body}");
+    assert_eq!(languages[0]["name"], "Other", "{body}");
+    assert_eq!(languages[0]["total_seconds"], 120.0, "{body}");
+    // И ни одного `null` среди имён: в эталонах их ноль на три фикстуры.
+    assert_eq!(body["data"][5]["languages"][0]["name"], "Rust", "{body}");
+}

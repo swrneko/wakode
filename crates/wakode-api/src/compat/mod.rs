@@ -5,9 +5,12 @@
 //! помощником из `tests/shape.rs`.
 
 pub mod heartbeats;
+pub mod shapes;
+pub mod summaries;
 pub mod user;
 
 pub use heartbeats::{post_heartbeat, post_heartbeats_bulk};
+pub use summaries::summaries;
 pub use user::current;
 
 /// Момент времени в том виде, в каком его отдаёт WakaTime.
