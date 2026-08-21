@@ -110,6 +110,70 @@ fn the_helper_notices_a_wrong_type() {
 }
 
 #[test]
+fn the_helper_passes_when_the_shapes_agree() {
+    // Прямая проверка публичной точки входа: соседние тесты бьют по
+    // приватной `compare`, и без этой пары `assert_shape_matches` можно
+    // было бы выпотрошить, не покраснев ни одним тестом.
+    let theirs = serde_json::json!({"data": {"id": "их", "seconds": 1.5}});
+    let ours = serde_json::json!({"data": {"id": "наш", "seconds": 7}});
+    assert_shape_matches(&ours, &theirs);
+}
+
+#[test]
+#[should_panic(expected = "форма разошлась с эталоном")]
+fn the_helper_panics_when_the_shapes_disagree() {
+    let theirs = serde_json::json!({"data": {"id": "x", "text": "y"}});
+    let ours = serde_json::json!({"data": {"id": "x"}});
+    assert_shape_matches(&ours, &theirs);
+}
+
+#[test]
+fn fixtures_come_from_disk_and_keep_the_duplicate_id_constant() {
+    // Читает настоящий файл: сломанный путь в `fixture` уронит этот тест.
+    //
+    // Сверяется при этом не что попало, а значение, которое обезличивание
+    // однажды уже съело. `00000000-0000-4000-a000-000000000000` — ответ
+    // WakaTime на отметку-дубликат, и нибблы версии 4 в нём не случайны:
+    // это не `Uuid::nil()`, и задача 4 обязана сверяться с этой строкой,
+    // а не с нулевым UUID. Решение — в
+    // `.claude/docs/decisions/duplicate-heartbeats-are-a-success.md`.
+    let bulk = fixture("heartbeat-bulk");
+    let duplicate = &bulk["responses"][0][0];
+    assert_eq!(duplicate["id"], "00000000-0000-4000-a000-000000000000", "{bulk}");
+    assert_eq!(duplicate["skip"], "Too many duplicate heartbeats.", "{bulk}");
+}
+
+#[test]
+fn the_helper_notices_a_field_we_invented() {
+    let theirs = serde_json::json!({"grand_total": 1});
+    let ours = serde_json::json!({"grand_total": 1, "wakode_extra": 2});
+    let mut problems = Vec::new();
+    compare(&ours, &theirs, "", &mut problems);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].contains("лишнее поле .wakode_extra"), "{problems:?}");
+}
+
+#[test]
+fn an_empty_array_of_ours_is_not_a_mismatch_but_a_wrong_element_is() {
+    // Обе половины заявления из комментария над веткой `Value::Array`.
+    let theirs = serde_json::json!({"data": [{"digital": "0:00"}]});
+    let mut problems = Vec::new();
+    compare(&serde_json::json!({"data": []}), &theirs, "", &mut problems);
+    assert!(problems.is_empty(), "{problems:?}");
+    compare(&serde_json::json!({"data": [{"digital": 0}]}), &theirs, "", &mut problems);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].contains(".data[].digital"), "{problems:?}");
+}
+
+#[test]
+fn a_null_on_either_side_says_nothing_about_the_type() {
+    let mut problems = Vec::new();
+    compare(&serde_json::json!({"city": null}), &serde_json::json!({"city": "Москва"}), "", &mut problems);
+    compare(&serde_json::json!({"city": "Москва"}), &serde_json::json!({"city": null}), "", &mut problems);
+    assert!(problems.is_empty(), "{problems:?}");
+}
+
+#[test]
 fn the_helper_forgives_only_the_fields_we_declared() {
     // Зеркало: `ai_*` прощается, соседнее незнакомое поле — нет. Без
     // этой половины список исключений мог бы прощать всё подряд.
