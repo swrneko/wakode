@@ -581,3 +581,128 @@ async fn a_successful_token_setup_does_not_log_an_address_refusal() {
         "успешная настройка по токену записана как отказ:\n{log}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Журнал сводок (задача 5)
+// ---------------------------------------------------------------------------
+
+/// Состояние с мастер-ключом, пользователем и выданным ему ключом.
+///
+/// Свой помощник, а не общий с `api.rs`: `tests/` не делит модули между
+/// целями, и это тот же порядок, что уже заведён в `shape.rs`.
+async fn a_state_with_a_key(
+    dir: &tempfile::TempDir,
+    timeout_secs: i64,
+) -> (AppState, wakode_auth::ApiKeyValue) {
+    use wakode_store::{KeyRepo, NewApiKey, NewUser, UserRepo};
+
+    let master = wakode_auth::MasterKey::generate();
+    let store = a_store(dir);
+
+    let user = store
+        .create_user(NewUser {
+            login: "swrneko".to_owned(),
+            email: None,
+            password_hash: "непрозрачно".to_owned(),
+            display_name: None,
+            timezone: "Europe/Moscow".parse().unwrap(),
+            timeout_secs,
+            is_admin: false,
+        })
+        .await
+        .unwrap();
+
+    let value = wakode_auth::ApiKeyValue::generate();
+    store
+        .create_key(NewApiKey {
+            user_id: user.id,
+            name: "ноутбук".to_owned(),
+            key_encrypted: value.encrypt(&master).unwrap().as_bytes().to_vec(),
+            key_lookup: value.lookup(&master),
+        })
+        .await
+        .unwrap();
+
+    let state = AppState::new(
+        store,
+        Some(master),
+        AppSettings {
+            registration: false,
+            session_ttl_days: 30,
+            setup_from_any_address: false,
+            default_timeout_secs: 900,
+        },
+    );
+    (state, value)
+}
+
+#[tokio::test]
+async fn a_timeout_that_is_not_a_duration_is_journalled_with_its_value() {
+    // Пятисотка сама по себе владельцу ничего не говорит: текст ошибки
+    // клиенту не уезжает (`error.rs`), и без записи в журнале починить
+    // учётную запись с нулевым тайм-аутом нечем — искать пришлось бы по
+    // коду. Уровень `ERROR`: запись обязана пережить боевой фильтр `info`.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir, 0).await;
+
+    let request = Request::builder()
+        .uri("/api/v1/users/current/summaries?start=2026-08-18&end=2026-08-18")
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Basic {}", STANDARD.encode(key.to_string())),
+        )
+        .body(Body::empty())
+        .unwrap();
+
+    let (response, log) =
+        response_and_log_at(tracing::Level::ERROR, router(state), request).await;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        log.contains("негодный таймаут пользователя"),
+        "негодный таймаут не попал в журнал:\n{log}"
+    );
+    // И само значение: «негодный» без числа не отличает ноль от
+    // отрицательного, а лечатся они одинаково только на словах.
+    assert!(
+        log.contains("timeout_secs=0"),
+        "в журнале нет значения тайм-аута:\n{log}"
+    );
+}
+
+#[tokio::test]
+async fn a_query_string_we_cannot_parse_is_journalled_without_the_key_it_carried() {
+    // Две половины одного обещания. Первая: причина отказа уходит
+    // владельцу в журнал, а не только код `400` клиенту — тексты `axum`
+    // английские, и клиенту они не отдаются.
+    //
+    // Вторая: ключ ездит в этой же query-строке (`?api_key=…` — законный
+    // способ аутентификации, см. `auth`), и печатать её целиком нельзя.
+    // Инвариант `.claude/rules/ARCHITECTURE.md` — «секрет не ездит в
+    // журнале» — держится тем, что `QueryRejection` называет поле, а не
+    // значение; проверяется это здесь, а не рассуждением.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir, 900).await;
+    let value = key.to_string();
+
+    // `start` дважды — `serde_urlencoded` отвергает повтор поля.
+    let request = Request::builder()
+        .uri(format!(
+            "/api/v1/users/current/summaries?api_key={value}&start=2026-08-18&start=2026-08-19"
+        ))
+        .body(Body::empty())
+        .unwrap();
+
+    let (response, log) =
+        response_and_log_at(tracing::Level::WARN, router(state), request).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        log.contains("query-строка сводки не разобралась"),
+        "отказ разбора query не попал в журнал:\n{log}"
+    );
+    assert!(
+        !log.contains(&value),
+        "значение ключа утекло в журнал:\n{log}"
+    );
+}

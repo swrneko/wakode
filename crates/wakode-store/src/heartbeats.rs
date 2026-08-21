@@ -40,9 +40,20 @@ pub struct IncomingHeartbeat {
 }
 
 /// Что случилось с отдельной отметкой батча.
+///
+/// Идентификатор носит **вариант**, а не отчёт рядом с ним: строки у
+/// повтора нет, а значит, нет и её идентификатора, и пара
+/// `(Outcome, Uuid)` позволила бы приписать повтору идентификатор
+/// несуществующей строки. Здесь это непредставимо.
+///
+/// Наружу этот идентификатор уезжает ответом WakaTime-совместимого
+/// эндпоинта. Чем отвечать на повтор — решает HTTP-слой: у него на это
+/// есть снятая с живого константа, у хранилища её быть не должно.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    Inserted,
+    /// Строка записана; идентификатор — её.
+    Inserted(Uuid),
+    /// Строку отбил уникальный индекс: в базе ничего не появилось.
     Duplicate,
 }
 
@@ -54,7 +65,7 @@ pub struct InsertReport {
 
 impl InsertReport {
     pub fn inserted(&self) -> usize {
-        self.outcomes.iter().filter(|o| **o == Outcome::Inserted).count()
+        self.outcomes.iter().filter(|o| matches!(o, Outcome::Inserted(_))).count()
     }
 
     pub fn duplicates(&self) -> usize {
@@ -148,8 +159,13 @@ pub fn insert_heartbeats(
             };
             let hash = dedup_hash(user, hb.time, &attrs, hb.is_write);
 
+            // Идентификатор заводится здесь, потому что здесь же он уезжает
+            // в колонку `id`: посчитанный вторым местом по тому же правилу,
+            // он разошёлся бы с записанным молча.
+            let id = Uuid::now_v7();
+
             let affected = stmt.execute(rusqlite::params![
-                uuid_to_blob(Uuid::now_v7()),
+                uuid_to_blob(id),
                 uuid_to_blob(user),
                 hb.time.get(),
                 now.get(),
@@ -185,7 +201,7 @@ pub fn insert_heartbeats(
             // потерю отметки в тихий `Duplicate`, и наружу это не всплывёт
             // никак.
             outcomes.push(if affected == 1 {
-                Outcome::Inserted
+                Outcome::Inserted(id)
             } else {
                 Outcome::Duplicate
             });
@@ -198,7 +214,7 @@ pub fn insert_heartbeats(
     let inserted_times = batch
         .iter()
         .zip(&outcomes)
-        .filter(|(_, outcome)| **outcome == Outcome::Inserted)
+        .filter(|(_, outcome)| matches!(outcome, Outcome::Inserted(_)))
         .map(|(hb, _)| hb.time);
     let days = affected_days(inserted_times, tz);
     mark_dirty(&tx, user, &days, now)?;
@@ -420,6 +436,39 @@ mod tests {
         assert_eq!(ai_line_changes, Some(7), "ai_line_changes");
         assert_eq!(human_line_changes, Some(8), "human_line_changes");
         assert_eq!(ai_meta.as_deref(), Some("мета"), "ai_meta");
+    }
+
+    /// Идентификатор из отчёта — это идентификатор записанной строки.
+    ///
+    /// Читается сырым `SELECT`: `load_heartbeats` колонку `id` не берёт, и
+    /// другого читателя у неё нет. Отчёт со свежим, но чужим `Uuid` внешне
+    /// неотличим от верного — HTTP-слой отдаст его клиенту, клиент сохранит,
+    /// и не найдёт по нему ничего никогда. Ровно поэтому идентификатор и
+    /// заведён в `wakode-store`, а не пересчитан в `wakode-api`.
+    #[test]
+    fn the_reported_id_is_the_id_of_the_row_that_was_written() {
+        let mut conn = open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        let user = insert_user(&conn, &a_user()).unwrap();
+        let interner = Interner::load(&conn).unwrap();
+
+        let report = insert_heartbeats(
+            &mut conn,
+            &interner,
+            user.id,
+            &[full_heartbeat()],
+            user.timezone,
+        )
+        .unwrap();
+
+        let Outcome::Inserted(reported) = report.outcomes[0] else {
+            panic!("отметка обязана была вставиться: {:?}", report.outcomes)
+        };
+
+        let stored: Vec<u8> = conn
+            .query_row("SELECT id FROM heartbeats", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored, uuid_to_blob(reported), "отчёт назвал не ту строку");
     }
 
     /// Повторная доставка не переписывает метку уже помеченного дня.

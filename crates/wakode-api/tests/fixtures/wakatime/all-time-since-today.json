@@ -1,0 +1,21 @@
+{
+  "data": {
+    "is_up_to_date": true,
+    "range": {
+      "start": "2026-07-31T21:00:00Z",
+      "start_date": "2026-08-01",
+      "start_text": "Sat Aug 1st 2026",
+      "end": "2026-08-19T20:59:59Z",
+      "end_date": "2026-08-19",
+      "end_text": "Today",
+      "timezone": "Europe/Moscow"
+    },
+    "timeout": 15,
+    "total_seconds": 195020.185999,
+    "text": "54 hrs 10 mins",
+    "decimal": "54.17",
+    "digital": "54:10",
+    "daily_average": 12189.0
+  },
+  "message": "Calculating stats for this user. Check back later."
+}

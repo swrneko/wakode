@@ -6,6 +6,7 @@ dist/
 *.db-shm
 .env
 .superpowers/
+__pycache__/
 
 # Локальные настройки Claude Code, не для репозитория
 .claude/settings.local.json

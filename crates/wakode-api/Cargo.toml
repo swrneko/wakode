@@ -10,8 +10,19 @@ axum-extra = { workspace = true, features = ["cookie"] }
 # Разбор схемы `Basic` в рабочем коде без base64 не обходится. Это не
 # криптография: вся она живёт в `wakode-auth`.
 base64.workspace = true
+# Печать времени в форме, которой ждёт WakaTime. Без фичи `clock`
+# намеренно, как и в `wakode-core`: она тянет `iana-time-zone`, а тот
+# читает `/etc/localtime`. Времена сюда приезжают из хранилища; «сейчас»
+# для эндпоинтов «сегодня» берётся у `std::time::SystemTime`, а не у
+# chrono, — ровно чтобы фича `clock` осталась выключенной.
+chrono.workspace = true
 chrono-tz.workspace = true
 serde = { workspace = true, features = ["derive"] }
+# Не только для тестов: батч отметок разбирается поэлементно, а для этого
+# элемент нужно сперва отложить в `Value` — один негодный элемент обязан
+# получить свой отказ, не отменив соседних. Своего дерева в графе это не
+# добавляет: `axum` тянет `serde_json` и так.
+serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "net"] }
 tower-http = { workspace = true, features = ["catch-panic", "set-header", "trace"] }
 tracing.workspace = true
@@ -24,7 +35,6 @@ wakode-store.workspace = true
 
 [dev-dependencies]
 http-body-util = "0.1"
-serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }
 tower = { workspace = true, features = ["util"] }
