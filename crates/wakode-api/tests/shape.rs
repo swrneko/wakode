@@ -512,6 +512,81 @@ async fn an_empty_day_has_every_key_a_day_with_work_has() {
     assert_shape_matches(&ours["data"][0], their_empty_day);
 }
 
+/// Секунды от эпохи прямо сейчас — тем же способом, каким их узнаёт
+/// эндпоинт статусбара.
+///
+/// «Сегодня» у него берётся от системных часов, и подсунуть ему другое
+/// «сейчас» нечем: часов в состоянии приложения нет. Значит, отметки для
+/// него приходится ставить настоящим временем, а не литералом с эталона.
+fn now_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("часы позже эпохи")
+        .as_secs_f64()
+}
+
+#[tokio::test]
+async fn the_statusbar_of_today_has_the_shape_wakatime_has() {
+    // **Эталон снят в пустой день, и сверка с ним слабее, чем выглядит.**
+    // `range.date`, `grand_total.decimal` и `grand_total.text` там пустые
+    // строки, а все семь массивов пусты — это след момента съёмки, а не
+    // форма протокола. Последствие называется прямо: ветка массивов в
+    // помощнике сверяет первый элемент, только если он есть у **обеих**
+    // сторон, поэтому форма элементов `projects[]`, `languages[]` и
+    // остальных пяти массивов этим вызовом не проверяется вовсе.
+    // Проверяются им скаляры верхнего уровня — `data` и
+    // `has_team_features`, — и они измерены.
+    //
+    // Форму элементов проверяет второй вызов, и он не выдумка. Ключи
+    // `data` статусбара и ключи `data[]` сводок совпадают дословно —
+    // девять у обоих, `categories dependencies editors grand_total
+    // languages machines operating_systems projects range`, — то есть это
+    // один и тот же тип, снятый дважды. `summaries-one-day.json` снят в
+    // непустой день и даёт ту форму, которой у статусбарного эталона нет.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+    // Отметки настоящим временем: «сегодня» эндпоинт узнаёт у системных
+    // часов. Пара `сейчас - 60` и `сейчас` даёт непустой день в любой
+    // момент суток — даже сразу после локальной полуночи, когда ранняя
+    // отметка попадает во вчера: сегодняшний кусок интервала начинается с
+    // полуночи и всё равно непуст.
+    let now = now_secs();
+    record(&state, &key, &[now - 60.0, now]).await;
+
+    let response = get_with_a_key(state, &key, "/api/v1/users/current/statusbar/today").await;
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let ours = json_body(response).await;
+
+    assert_shape_matches(&ours, &fixture("statusbar-today"));
+
+    assert_the_day_has_something_in_every_array(&ours["data"]);
+    assert_shape_matches(&ours["data"], &fixture("summaries-one-day")["data"][0]);
+}
+
+#[tokio::test]
+async fn the_all_time_total_has_the_shape_wakatime_has() {
+    // В отличие от статусбарного, этот эталон снят на непустом аккаунте и
+    // массивов не содержит вовсе: одиннадцать скаляров в двух уровнях
+    // объектов. Оговорка про первый элемент массива здесь не работает — ей
+    // не на чем сработать, — так что сверка покрывает форму целиком.
+    //
+    // Отметки всё равно нужны настоящие: диапазон считается от **первой**
+    // отметки пользователя, и на пустом пользователе половина полей
+    // выродилась бы в ноль и сегодняшнюю дату. Отдельный тест на такого
+    // пользователя есть в `api.rs`.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+    let now = now_secs();
+    record(&state, &key, &[now - 60.0, now]).await;
+
+    let response =
+        get_with_a_key(state, &key, "/api/v1/users/current/all_time_since_today").await;
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_shape_matches(&json_body(response).await, &fixture("all-time-since-today"));
+}
+
 #[tokio::test]
 async fn a_bulk_response_has_the_shape_wakatime_has() {
     // Эталон снят с живого и разнороден: `responses[0]` — повтор,

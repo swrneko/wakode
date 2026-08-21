@@ -3194,6 +3194,39 @@ async fn record_heartbeats_at(
     }
 }
 
+#[tokio::test]
+async fn the_daily_average_rounds_the_half_up_instead_of_dropping_it() {
+    // Правило округления в сводках не измеряется их собственными
+    // эталонами: у всех шести проб (`seconds` и
+    // `seconds_including_other_language` на трёх фикстурах) дробная часть
+    // меньше половины, так что усечение и округление дают там одни и те
+    // же числа. Различает их единственная проба во всём наборе — у
+    // `all_time_since_today`, — и потому оба эндпоинта зовут одну функцию
+    // `average_per_worked_day`.
+    //
+    // Этот тест сторожит **сводочную** половину той связи. Без него
+    // подмена вызова на собственное усечение проходила весь набор
+    // зелёной: обе ветки печатают целое число секунд, и сверка формы
+    // разницы не видит.
+    //
+    // Два рабочих дня, 61 и 60 секунд: 121 / 2 = 60.5. Округление даёт
+    // 61, усечение — 60.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    record_heartbeats_at(&state, &key, "вакода", &[NOON - 86_400.0, NOON - 86_339.0]).await;
+    record_heartbeats_at(&state, &key, "вакода", &[NOON, NOON + 60.0]).await;
+
+    let body = a_summary(state, &key, "start=2026-08-17&end=2026-08-18").await;
+
+    assert_eq!(body["cumulative_total"]["seconds"], 121.0, "{body}");
+    assert_eq!(body["daily_average"]["days_minus_holidays"], 2, "{body}");
+    assert_eq!(
+        body["daily_average"]["seconds_including_other_language"], 61,
+        "половина секунды отброшена, а не округлена: {body}"
+    );
+}
+
 async fn summaries_response(state: AppState, key: &ApiKeyValue, query: &str) -> Response {
     router(state)
         .oneshot(
@@ -3561,7 +3594,10 @@ async fn a_timeout_that_is_not_a_duration_is_an_error_and_not_a_made_up_number()
 async fn the_daily_average_divides_by_the_days_that_had_work() {
     // У эталона за месяц 30 дней, 12 праздников и 18 рабочих, а
     // 236484.833 / 18 = 13138.05 при напечатанных 13138 — то есть делится
-    // накопленный итог на дни **за вычетом** праздников и усекается.
+    // накопленный итог на дни **за вычетом** праздников. Про округление
+    // эта проба не говорит ничего: дробная часть меньше половины, и
+    // усечение дало бы то же число. Правило округления сторожит соседний
+    // `the_daily_average_rounds_the_half_up_instead_of_dropping_it`.
     // Здесь два рабочих дня из семи и 180 секунд итога.
     //
     // Вторая половина — про пару `seconds` и
@@ -3611,4 +3647,518 @@ async fn the_daily_average_divides_by_the_days_that_had_work() {
     assert_eq!(languages[0]["total_seconds"], 120.0, "{body}");
     // И ни одного `null` среди имён: в эталонах их ноль на три фикстуры.
     assert_eq!(body["data"][5]["languages"][0]["name"], "Rust", "{body}");
+}
+
+// ---------------------------------------------------------------------------
+// Статусбар: `GET /api/v1/users/current/statusbar/today` (задача 6)
+// ---------------------------------------------------------------------------
+
+/// «Сейчас» тем же способом, каким его берёт эндпоинт.
+///
+/// `chrono` подключён без фичи `clock` — она тянет `iana-time-zone`, а тот
+/// читает `/etc/localtime`, — так что `Utc::now()` недоступен ни коду, ни
+/// тесту, и обоим приходится идти в `std`.
+fn utc_now() -> chrono::DateTime<chrono::Utc> {
+    let micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("часы позже эпохи")
+        .as_micros() as i64;
+    chrono::DateTime::from_timestamp_micros(micros).expect("момент внутри календаря")
+}
+
+/// Секунды от эпохи прямо сейчас — время для отметок «сегодня».
+fn now_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("часы позже эпохи")
+        .as_secs_f64()
+}
+
+/// Пользователь в заданном поясе и предъявляемый ключ к нему.
+async fn a_user_in_zone(
+    store: &SqliteStore,
+    master: &MasterKey,
+    login: &str,
+    timezone: &str,
+) -> ApiKeyValue {
+    let user = store
+        .create_user(NewUser {
+            login: login.to_owned(),
+            email: None,
+            password_hash: "непрозрачно".to_owned(),
+            display_name: None,
+            timezone: timezone.parse().expect("пояс существует"),
+            timeout_secs: 900,
+            is_admin: false,
+        })
+        .await
+        .unwrap();
+
+    let value = ApiKeyValue::generate();
+    store
+        .create_key(NewApiKey {
+            user_id: user.id,
+            name: "ноутбук".to_owned(),
+            key_encrypted: value.encrypt(master).unwrap().as_bytes().to_vec(),
+            key_lookup: value.lookup(master),
+        })
+        .await
+        .unwrap();
+
+    value
+}
+
+async fn statusbar_response(state: AppState, key: &ApiKeyValue) -> Response {
+    router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/users/current/statusbar/today")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Basic {}", STANDARD.encode(key.to_string())),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// Тело успешного статусбара.
+async fn a_statusbar(state: AppState, key: &ApiKeyValue) -> serde_json::Value {
+    let response = statusbar_response(state, key).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    json_body(response).await
+}
+
+#[tokio::test]
+async fn today_is_the_users_today_not_the_servers() {
+    // Мутация, ради которой тест написан: «сегодня» от `Utc::now()`
+    // вместо пояса пользователя. Владелец увидел бы чужой день в строке
+    // состояния редактора — там, где число стоит перед глазами весь день.
+    //
+    // **Пояса не из плана, и это осознанная замена.** План предлагал
+    // `Australia/Sydney`: он расходится с UTC по дате десять-одиннадцать
+    // часов в сутки, а остальные тринадцать-четырнадцать даёт ту же дату —
+    // и тест был бы зелёным при UTC-реализации бо́льшую часть суток.
+    // Тест, зелёный по расписанию, хуже отсутствующего.
+    //
+    // Здесь взяты края обитаемой шкалы: `Pacific/Kiritimati` — UTC+14,
+    // `Etc/GMT+12` — UTC−12 (у зон `Etc/GMT±` знак обратный привычному).
+    // Между ними 26 часов, то есть больше суток, поэтому их локальные
+    // даты не совпадают **никогда**. Ни то, ни другое не знает перевода
+    // часов, так что расхождения `local_date_of` и `local_day_of` тут
+    // тоже нет.
+    //
+    // И вторая половина: у UTC-реализации восточная дата совпала бы с
+    // UTC-датой только с 00:00 до 10:00 UTC, а западная — только с 12:00
+    // до 24:00 UTC. Окна не пересекаются, так что хотя бы одна из двух
+    // сверок с ожидаемой датой краснеет в любой час суток — и это помимо
+    // `assert_ne!`, который краснеет всегда.
+    let dir = tempfile::tempdir().unwrap();
+    let master = MasterKey::generate();
+    let store = a_store(&dir);
+    let east = a_user_in_zone(&store, &master, "восточная", "Pacific/Kiritimati").await;
+    let west = a_user_in_zone(&store, &master, "западная", "Etc/GMT+12").await;
+    let state = AppState::new(store, Some(master), a_settings());
+
+    let before = utc_now();
+    let east_body = a_statusbar(state.clone(), &east).await;
+    let west_body = a_statusbar(state, &west).await;
+    let after = utc_now();
+
+    // Полночь может проехать посреди прогона, поэтому годных ответов два:
+    // дата до запросов и дата после. Сверка остаётся точной, а от гонки
+    // на границе суток не зависит.
+    let allowed = |name: &str| -> Vec<String> {
+        let tz: chrono_tz::Tz = name.parse().expect("пояс существует");
+        vec![
+            before.with_timezone(&tz).date_naive().to_string(),
+            after.with_timezone(&tz).date_naive().to_string(),
+        ]
+    };
+
+    let east_date = east_body["data"]["range"]["date"].as_str().unwrap().to_owned();
+    let west_date = west_body["data"]["range"]["date"].as_str().unwrap().to_owned();
+
+    assert!(
+        allowed("Pacific/Kiritimati").contains(&east_date),
+        "восточный пользователь получил не свой день: {east_date}, ждали одну из {:?}",
+        allowed("Pacific/Kiritimati")
+    );
+    assert!(
+        allowed("Etc/GMT+12").contains(&west_date),
+        "западный пользователь получил не свой день: {west_date}, ждали одну из {:?}",
+        allowed("Etc/GMT+12")
+    );
+    // 26 часов между поясами: одну и ту же дату они не показывают никогда.
+    assert_ne!(
+        east_date, west_date,
+        "оба пояса получили один день — «сегодня» взято не у пользователя"
+    );
+
+    // И пояс в ответе — тоже пользовательский, а не серверный.
+    assert_eq!(east_body["data"]["range"]["timezone"], "Pacific/Kiritimati");
+    assert_eq!(west_body["data"]["range"]["timezone"], "Etc/GMT+12");
+}
+
+#[tokio::test]
+async fn the_statusbar_of_a_user_without_heartbeats_says_zero_instead_of_failing() {
+    // Свежий инстанс: пользователь заведён, отметок нет ни одной, и
+    // плагин спрашивает статусбар с первой же секунды. Пятисотка здесь
+    // ломала бы первый запуск.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    let body = a_statusbar(state, &key).await;
+    let day = &body["data"];
+
+    assert_eq!(day["grand_total"]["total_seconds"], 0.0, "{body}");
+    assert_eq!(day["grand_total"]["text"], "0 secs", "{body}");
+    assert_eq!(day["grand_total"]["digital"], "0:00", "{body}");
+    assert!(day["projects"].as_array().unwrap().is_empty(), "{body}");
+    assert!(day["languages"].as_array().unwrap().is_empty(), "{body}");
+
+    // Командных возможностей у wakode нет вовсе — это факт, а не заглушка.
+    assert_eq!(body["has_team_features"], false, "{body}");
+
+    // Границы дня на месте: пустые строки эталона — след пустого дня в
+    // момент съёмки, а не форма протокола, и повторять их незачем.
+    assert!(
+        !day["range"]["date"].as_str().unwrap().is_empty(),
+        "дата дня пуста: {body}"
+    );
+    assert!(day["range"]["start"].is_string(), "{body}");
+    assert!(day["range"]["end"].is_string(), "{body}");
+    // Сегодняшний день чужой сервер подписывает словом, а не датой
+    // словами. Измерено дважды: `range.text` статусбарного эталона и
+    // `range.end_text` эталона за всё время.
+    assert_eq!(day["range"]["text"], "Today", "{body}");
+}
+
+#[tokio::test]
+async fn another_users_heartbeats_stay_out_of_the_statusbar() {
+    // Запрос без фильтра по `user_id` прошёл бы все проверки выше:
+    // пользователь там один. Здесь их двое, и работали они в одну минуту.
+    let dir = tempfile::tempdir().unwrap();
+    let master = MasterKey::generate();
+    let store = a_store(&dir);
+    let mine = a_user_with_a_timeout(&store, &master, "swrneko", 900).await;
+    let hers = a_user_with_a_timeout(&store, &master, "соседка", 900).await;
+    let state = AppState::new(store, Some(master), a_settings());
+
+    let now = now_secs();
+    record_heartbeats_at(&state, &mine, "мой", &[now - 60.0, now]).await;
+    record_heartbeats_at(&state, &hers, "чужой", &[now - 600.0, now]).await;
+
+    let body = a_statusbar(state, &mine).await;
+    let day = &body["data"];
+
+    let projects = day["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 1, "{body}");
+    assert_eq!(projects[0]["name"], "мой", "{body}");
+    assert!(
+        !body.to_string().contains("чужой"),
+        "чужой проект в статусбаре: {body}"
+    );
+
+    // Минута, а не десять. Точным числом это не проверить: «сегодня»
+    // берётся у настоящих часов, и сразу после локальной полуночи
+    // сегодняшний кусок интервала короче минуты. Но чужие десять минут
+    // мимо этой границы не пролезут ни при каком времени запуска.
+    let mine_seconds = day["grand_total"]["total_seconds"].as_f64().unwrap();
+    assert!(mine_seconds > 0.0, "своё время потеряно: {body}");
+    assert!(mine_seconds <= 60.0, "чужое время в статусбаре: {body}");
+}
+
+#[tokio::test]
+async fn a_statusbar_needs_a_key_and_a_wrong_method_is_a_json_error_too() {
+    // Вторая половина — про порядок строк в `router`: маршрут, добавленный
+    // **ниже** `method_not_allowed_fallback`, остался бы с пустым `405`
+    // axum'а, мимо обещания «тело всегда JSON». Инвариант из
+    // `.claude/rules/ARCHITECTURE.md`, и ломали его не раз.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    let anonymous = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/users/current/statusbar/today")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let posted = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/users/current/statusbar/today")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Basic {}", STANDARD.encode(key.to_string())),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(posted.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let json = json_body(posted).await;
+    assert!(json.get("error").is_some(), "нет поля error: {json}");
+}
+
+// ---------------------------------------------------------------------------
+// Итог за всё время: `GET /api/v1/users/current/all_time_since_today` (задача 7)
+// ---------------------------------------------------------------------------
+
+async fn all_time_response(state: AppState, key: &ApiKeyValue) -> Response {
+    router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/users/current/all_time_since_today")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Basic {}", STANDARD.encode(key.to_string())),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// Тело успешного итога за всё время.
+async fn an_all_time(state: AppState, key: &ApiKeyValue) -> serde_json::Value {
+    let response = all_time_response(state, key).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    json_body(response).await
+}
+
+/// Локальная дата момента, заданного секундами от эпохи.
+fn local_date(secs: f64, tz: &str) -> String {
+    let tz: chrono_tz::Tz = tz.parse().expect("пояс существует");
+    chrono::DateTime::from_timestamp(secs as i64, 0)
+        .expect("момент внутри календаря")
+        .with_timezone(&tz)
+        .date_naive()
+        .to_string()
+}
+
+/// Сегодняшние даты в поясе — до и после запроса.
+///
+/// Годных ответов два, потому что полночь может проехать посреди прогона.
+/// Точность сверки от этого не страдает, а гонки на границе суток нет.
+fn todays_dates(before: chrono::DateTime<chrono::Utc>, tz: &str) -> Vec<String> {
+    let tz: chrono_tz::Tz = tz.parse().expect("пояс существует");
+    vec![
+        before.with_timezone(&tz).date_naive().to_string(),
+        utc_now().with_timezone(&tz).date_naive().to_string(),
+    ]
+}
+
+#[tokio::test]
+async fn the_all_time_range_runs_from_the_first_heartbeat_to_the_end_of_today() {
+    // Две сессии: одна десять дней назад, одна прямо сейчас. Времена
+    // относительные, а не литералы с эталона: «сегодня» эндпоинт берёт у
+    // настоящих часов, и литеральный август 2026-го через год стал бы
+    // диапазоном в год с лишним.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    let now = now_secs();
+    let long_ago = now - 10.0 * 86_400.0;
+    // По минуте в каждой сессии. Обе пары переживают локальную полночь без
+    // потерь: интервал, разрезанный полуночью, попадает в оба дня, и оба
+    // дня лежат внутри диапазона — сумма ровно 120 секунд в любой час.
+    record_heartbeats_at(&state, &key, "вакода", &[long_ago - 60.0, long_ago]).await;
+    record_heartbeats_at(&state, &key, "вакода", &[now - 60.0, now]).await;
+
+    let before = utc_now();
+    let body = an_all_time(state, &key).await;
+    let data = &body["data"];
+    let range = &data["range"];
+
+    // Начало — день первой отметки, а не первый день, в который
+    // спрашивали.
+    assert_eq!(range["start_date"], local_date(long_ago - 60.0, "Europe/Moscow"), "{body}");
+    assert!(
+        todays_dates(before, "Europe/Moscow").contains(&range["end_date"].as_str().unwrap().to_owned()),
+        "конец диапазона не сегодня: {body}"
+    );
+
+    // Границы — локальные, а не UTC: в августе Москва это UTC+3 без
+    // перевода часов, так что локальная полночь — 21:00Z предыдущего дня,
+    // а конец суток — последняя целая секунда, 20:59:59Z.
+    assert!(
+        range["start"].as_str().unwrap().ends_with("T21:00:00Z"),
+        "начало не по локальной полуночи: {body}"
+    );
+    assert!(
+        range["end"].as_str().unwrap().ends_with("T20:59:59Z"),
+        "конец не по последней секунде локальных суток: {body}"
+    );
+
+    // Сегодняшний день подписан словом, день первой отметки — датой
+    // словами. Суффиксы дат проверяет `a_date_is_spelled_the_way_the_fixture_spells_it`,
+    // здесь довольно того, что подпись не перепутана местами.
+    assert_eq!(range["end_text"], "Today", "{body}");
+    let tz: chrono_tz::Tz = "Europe/Moscow".parse().unwrap();
+    let expected_prefix = chrono::DateTime::from_timestamp((long_ago - 60.0) as i64, 0)
+        .unwrap()
+        .with_timezone(&tz)
+        .format("%a %b")
+        .to_string();
+    assert!(
+        range["start_text"].as_str().unwrap().starts_with(&expected_prefix),
+        "начало подписано не своим днём: {body}"
+    );
+    assert_eq!(range["timezone"], "Europe/Moscow", "{body}");
+
+    // Две минуты — обе сессии, и ни секунды сверх: окно выборки шире суток
+    // на таймаут, и хвост завтрашнего дня в итог попасть не имеет права.
+    assert_eq!(data["total_seconds"], 120.0, "{body}");
+    assert_eq!(data["text"], "2 mins", "{body}");
+    assert_eq!(data["digital"], "0:02", "{body}");
+    assert_eq!(data["decimal"], "0.03", "{body}");
+
+    // Тайм-аут — те же минуты, что в профиле: 900 секунд это 15.
+    assert_eq!(data["timeout"], 15, "{body}");
+
+    // Отложенного пересчёта у нас нет, и сообщать о нём нечего. Дословная
+    // строка эталона («Calculating stats…») была бы неправдой о нашем
+    // поведении, а сверка формы разницы не увидит: обе просто `string`.
+    assert_eq!(data["is_up_to_date"], true, "{body}");
+    assert_eq!(body["message"], "", "{body}");
+}
+
+#[tokio::test]
+async fn the_all_time_average_divides_by_the_days_that_had_work_and_not_by_the_range() {
+    // Те же 120 секунд за два рабочих дня в диапазоне шириной в
+    // одиннадцать. Деление на ширину дало бы 11 (120 / 11), деление на
+    // рабочие дни — 60. Точное число здесь не проверить: локальная полночь
+    // между отметками пары разносит её на два дня, и рабочих дней
+    // становится три или четыре, то есть 40 или 30. Все три ответа
+    // правильного правила лежат выше любого ответа неправильного, и
+    // граница между ними — вот эта.
+    //
+    // Само округление проверяет `an_all_time_average_is_rounded_the_way_the_fixture_rounds_it`
+    // числами прямо с эталона: здесь оно не различимо.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    let now = now_secs();
+    let long_ago = now - 10.0 * 86_400.0;
+    record_heartbeats_at(&state, &key, "вакода", &[long_ago - 60.0, long_ago]).await;
+    record_heartbeats_at(&state, &key, "вакода", &[now - 60.0, now]).await;
+
+    let body = an_all_time(state, &key).await;
+
+    assert_eq!(body["data"]["total_seconds"], 120.0, "{body}");
+    let average = body["data"]["daily_average"].as_f64().unwrap();
+    assert!(
+        average >= 30.0,
+        "среднее поделено на ширину диапазона, а не на рабочие дни: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_all_time_of_a_user_without_heartbeats_is_zero_and_one_day_long() {
+    // Свежий инстанс: пользователь есть, отметок нет ни одной. Эндпоинт,
+    // падающий здесь, ломает первый же запуск — плагин спрашивает итог
+    // сразу после установки.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    let before = utc_now();
+    let body = an_all_time(state, &key).await;
+    let data = &body["data"];
+    let range = &data["range"];
+
+    assert_eq!(data["total_seconds"], 0.0, "{body}");
+    assert_eq!(data["text"], "0 secs", "{body}");
+    assert_eq!(data["digital"], "0:00", "{body}");
+    assert_eq!(data["decimal"], "0.00", "{body}");
+    // Ноль, а не деление на ноль дней и не «нет данных».
+    assert_eq!(data["daily_average"], 0.0, "{body}");
+    assert_eq!(data["is_up_to_date"], true, "{body}");
+
+    // Диапазон — одни сегодняшние сутки: начинать его нечем, кроме
+    // сегодняшнего дня.
+    let today = todays_dates(before, "Europe/Moscow");
+    assert!(today.contains(&range["start_date"].as_str().unwrap().to_owned()), "{body}");
+    assert_eq!(range["start_date"], range["end_date"], "{body}");
+    assert_eq!(range["end_text"], "Today", "{body}");
+    assert!(range["start"].is_string(), "{body}");
+    assert!(range["end"].is_string(), "{body}");
+}
+
+#[tokio::test]
+async fn another_users_heartbeats_stay_out_of_the_all_time_total() {
+    // Запрос без фильтра по `user_id` прошёл бы проверки выше:
+    // пользователь там один. Здесь их двое, и работали они в одну минуту.
+    let dir = tempfile::tempdir().unwrap();
+    let master = MasterKey::generate();
+    let store = a_store(&dir);
+    let mine = a_user_with_a_timeout(&store, &master, "swrneko", 900).await;
+    let hers = a_user_with_a_timeout(&store, &master, "соседка", 900).await;
+    let state = AppState::new(store, Some(master), a_settings());
+
+    let now = now_secs();
+    record_heartbeats_at(&state, &mine, "мой", &[now - 60.0, now]).await;
+    // Чужая работа и длиннее, и началась раньше: утечка сдвинула бы не
+    // только итог, но и начало диапазона.
+    let hers_start = now - 30.0 * 86_400.0;
+    record_heartbeats_at(&state, &hers, "чужой", &[hers_start, hers_start + 600.0]).await;
+
+    let before = utc_now();
+    let body = an_all_time(state, &mine).await;
+
+    assert_eq!(body["data"]["total_seconds"], 60.0, "чужое время в итоге: {body}");
+    assert!(
+        todays_dates(before, "Europe/Moscow")
+            .contains(&body["data"]["range"]["start_date"].as_str().unwrap().to_owned()),
+        "диапазон начат чужой отметкой: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_all_time_total_needs_a_key_and_a_wrong_method_is_a_json_error_too() {
+    // Вторая половина — про порядок строк в `router`: маршрут, добавленный
+    // **ниже** `method_not_allowed_fallback`, остался бы с пустым `405`
+    // axum'а, мимо обещания «тело всегда JSON». Инвариант из
+    // `.claude/rules/ARCHITECTURE.md`, и ломали его не раз.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    let anonymous = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/users/current/all_time_since_today")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let posted = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/users/current/all_time_since_today")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Basic {}", STANDARD.encode(key.to_string())),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(posted.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let json = json_body(posted).await;
+    assert!(json.get("error").is_some(), "нет поля error: {json}");
 }

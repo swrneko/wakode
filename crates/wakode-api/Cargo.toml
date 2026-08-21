@@ -12,7 +12,9 @@ axum-extra = { workspace = true, features = ["cookie"] }
 base64.workspace = true
 # Печать времени в форме, которой ждёт WakaTime. Без фичи `clock`
 # намеренно, как и в `wakode-core`: она тянет `iana-time-zone`, а тот
-# читает `/etc/localtime`. Часы сюда приезжают из хранилища, не из chrono.
+# читает `/etc/localtime`. Времена сюда приезжают из хранилища; «сейчас»
+# для эндпоинтов «сегодня» берётся у `std::time::SystemTime`, а не у
+# chrono, — ровно чтобы фича `clock` осталась выключенной.
 chrono.workspace = true
 chrono-tz.workspace = true
 serde = { workspace = true, features = ["derive"] }

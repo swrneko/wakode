@@ -124,6 +124,14 @@ pub fn router(state: AppState) -> Router {
                 "/api/v1/users/current/summaries",
                 get(compat::summaries),
             )
+            .route(
+                "/api/v1/users/current/statusbar/today",
+                get(compat::statusbar_today),
+            )
+            .route(
+                "/api/v1/users/current/all_time_since_today",
+                get(compat::all_time_since_today),
+            )
             .fallback(|| async { ApiError::NotFound })
             .method_not_allowed_fallback(|| async { ApiError::MethodNotAllowed })
             .with_state(state),
