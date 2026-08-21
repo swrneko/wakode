@@ -3195,6 +3195,33 @@ async fn record_heartbeats_at(
 }
 
 #[tokio::test]
+async fn the_range_of_the_whole_answer_spans_its_first_and_last_day() {
+    // Верхнеуровневые `start`/`end` не сторожило ничего: подмена обоих на
+    // `null` проходила весь набор зелёной. Сверка формы тут бессильна по
+    // построению — `null` она прощает с любой стороны, — а докстринг
+    // `Summaries::start` называет значение измеренным.
+    //
+    // Мера у эталона: `start` равен `data[0].range.start`, `end` —
+    // `range.end` последнего дня, и оба это моменты UTC, соответствующие
+    // локальной полуночи пользователя, а не полуночи UTC. Для
+    // `Europe/Moscow` начало 2026-07-20 напечатано как
+    // `2026-07-19T21:00:00Z`.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    let body = a_summary(state, &key, "start=2026-08-17&end=2026-08-18").await;
+
+    // Пользователь помощника живёт в `Europe/Moscow` (UTC+3), так что
+    // локальная полночь 17 августа — это 16 августа, 21:00 UTC.
+    assert_eq!(body["start"], "2026-08-16T21:00:00Z", "{body}");
+    assert_eq!(body["end"], "2026-08-18T20:59:59Z", "{body}");
+    // И то же самое, сказанное через края `data[]`: верх обязан совпадать
+    // с ними, а не считаться отдельно.
+    assert_eq!(body["start"], body["data"][0]["range"]["start"], "{body}");
+    assert_eq!(body["end"], body["data"][1]["range"]["end"], "{body}");
+}
+
+#[tokio::test]
 async fn the_daily_average_rounds_the_half_up_instead_of_dropping_it() {
     // Правило округления в сводках не измеряется их собственными
     // эталонами: у всех шести проб (`seconds` и
@@ -3800,6 +3827,81 @@ async fn today_is_the_users_today_not_the_servers() {
     // И пояс в ответе — тоже пользовательский, а не серверный.
     assert_eq!(east_body["data"]["range"]["timezone"], "Pacific/Kiritimati");
     assert_eq!(west_body["data"]["range"]["timezone"], "Etc/GMT+12");
+}
+
+#[tokio::test]
+async fn the_statusbar_counts_work_that_started_before_local_midnight() {
+    // Вторая копия правила «окно выборки шире суток на таймаут» живёт в
+    // `summary_of_day`, и до этого теста её не сторожило ничего: мутация
+    // `heartbeat_window` → `local_day_bounds` проходила весь набор
+    // зелёной. Соседний `work_that_crosses_local_midnight_is_split…`
+    // бьёт по `summaries`, а статусбар ходит своим путём.
+    //
+    // Цена ошибки видна владельцу сразу: строка состояния теряет кусок от
+    // локальной полуночи до первой сегодняшней отметки — то есть работа,
+    // начатая до полуночи, наутро частично исчезает.
+    //
+    // **Пояс выбирается под текущий час, а не берётся литералом.** Часов
+    // подменить нечем — `now()` в `compat/summaries.rs` ходит к системным,
+    // — поэтому тест сам находит зону `Etc/GMT±`, где сейчас второй час
+    // ночи. Такая есть всегда: зоны покрывают UTC−12..UTC+14, то есть 27
+    // сдвигов на 24 часа. Второй час, а не первый, чтобы отметки вокруг
+    // полуночи заведомо лежали в прошлом и в любую минуту прогона.
+    let now = utc_now();
+    let zone = (-12..=14)
+        .map(|offset| {
+            // У зон `Etc/GMT±` знак обратный привычному: `Etc/GMT-3` это UTC+3.
+            let name = if offset >= 0 {
+                format!("Etc/GMT-{offset}")
+            } else {
+                format!("Etc/GMT+{}", -offset)
+            };
+            (offset, name)
+        })
+        .find(|(_, name)| {
+            use chrono::Timelike as _;
+            let tz: chrono_tz::Tz = name.parse().expect("зона существует");
+            now.with_timezone(&tz).hour() == 1
+        })
+        .map(|(_, name)| name)
+        .expect("зона, где сейчас второй час ночи, существует всегда");
+
+    let tz: chrono_tz::Tz = zone.parse().unwrap();
+    let midnight = now
+        .with_timezone(&tz)
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_local_timezone(tz)
+        .unwrap()
+        .timestamp() as f64;
+
+    let dir = tempfile::tempdir().unwrap();
+    let master = MasterKey::generate();
+    let store = a_store(&dir);
+    let key = a_user_in_zone(&store, &master, "полуночница", &zone).await;
+    let state = AppState::new(store, Some(master), a_settings());
+
+    // Первая отметка — вчера, за пять минут до полуночи. Две следующие —
+    // сегодня. Промежутки короче тайм-аута, так что склеивается всё.
+    record_heartbeats_at(
+        &state,
+        &key,
+        "вакода",
+        &[midnight - 300.0, midnight + 60.0, midnight + 120.0],
+    )
+    .await;
+
+    let body = a_statusbar(state, &key).await;
+
+    // Сегодняшняя доля: 60 секунд от полуночи до второй отметки плюс 60
+    // между второй и третьей. Узкая выборка не увидела бы вчерашнюю
+    // отметку, интервал через полночь не построился бы вовсе, и осталось
+    // бы 60.
+    assert_eq!(
+        body["data"]["grand_total"]["total_seconds"], 120.0,
+        "работа до полуночи потеряна — окно выборки уже суток: {body}"
+    );
 }
 
 #[tokio::test]

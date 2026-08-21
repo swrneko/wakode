@@ -6,7 +6,7 @@
 
 | Field | WakaTime sends | Why we send `null` |
 |---|---|---|
-| `last_heartbeat_at` | timestamp | No heartbeats are stored yet — task 3 of the wave-0 plan. Debt, not a decision. |
+| `last_heartbeat_at` | timestamp | Heartbeats *are* stored now (task 3 shipped), but nothing reads "the latest one". No task in the wave-0 plan owns this. Debt, not a decision — and it did not clear when writing landed. |
 | `last_project` | string | Same. |
 | `last_language` | string | Same. |
 | `last_branch` | string | Same. |
@@ -42,7 +42,7 @@ print(len(ours_null & theirs_set), sorted(ours_null & theirs_set))
 PY
 ```
 
-Today it prints `18`. If it prints something else, this document is stale — most likely because task 3 filled in the `last_*` group, which would leave 12.
+Today it prints `18`, and it still printed `18` after the whole wave-0 plan shipped: the `last_*` group was never filled in, because no task computes it. If it ever prints `12`, someone finally wrote that query and this table should shrink to the six settings below the `last_*` block.
 
 ## Why `null` and not a plausible value
 
