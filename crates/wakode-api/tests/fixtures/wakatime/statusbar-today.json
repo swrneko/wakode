@@ -1,0 +1,27 @@
+{
+  "data": {
+    "grand_total": {
+      "decimal": "",
+      "digital": "",
+      "hours": 0,
+      "minutes": 0,
+      "text": "",
+      "total_seconds": 0
+    },
+    "categories": [],
+    "dependencies": [],
+    "editors": [],
+    "languages": [],
+    "machines": [],
+    "operating_systems": [],
+    "projects": [],
+    "range": {
+      "date": "",
+      "end": "",
+      "start": "",
+      "text": "Today",
+      "timezone": "Europe/Moscow"
+    }
+  },
+  "has_team_features": false
+}

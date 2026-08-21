@@ -26,7 +26,7 @@ One day, 502 heartbeats, 62 duration entries, four projects.
 | `summaries.grand_total.total_seconds` for the same day | 21839.3 — identical |
 | Per-project totals vs `summaries.projects[]` | identical to the last decimal |
 
-Reproduce with `fixtures/wakatime/heartbeats-day.json` and `durations-day.json` from `tools/capture-wakatime-fixtures.sh`.
+Reproduce from the repository: `crates/wakode-api/tests/fixtures/wakatime/heartbeats-day.json` (all 502) and `durations-day.json` (all 62). Both are the scrubbed capture with their arrays intact — project names are placeholders, but `time`, `duration` and project *identity* survive, which is everything the arithmetic needs. The raw capture under `fixtures/` is gitignored and not required.
 
 ## What this means for the engine
 

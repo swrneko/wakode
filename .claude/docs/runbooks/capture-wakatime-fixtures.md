@@ -46,4 +46,22 @@ Watch for: a difference that scales with heartbeat count means the addition is p
 
 ## Before committing anything
 
-Read the files. Form is what makes a fixture a fixture, not content — replacing project names, paths, and the email with placeholders costs nothing and loses nothing. Scrubbed copies go under `crates/wakode-api/tests/fixtures/`; the raw capture stays out of git.
+Read the files. Form is what makes a fixture a fixture, not content — replacing project names, paths, and the email with placeholders costs nothing and loses nothing. The raw capture stays out of git (`.gitignore` has `/fixtures/`).
+
+```bash
+python3 tools/scrub-wakatime-fixtures.py   # fixtures/wakatime → crates/wakode-api/tests/fixtures/wakatime
+```
+
+Substitution is by key name and deterministic: the same input value always yields the same placeholder, so re-running produces no diff. Two rules the script has to keep:
+
+- **Nothing is truncated.** Arrays go over whole. A hand-shortened `heartbeats-day.json` would still pass the shape tests — one element is all they read — while silently destroying the calibration evidence and leaving `summaries-month.json`'s header (`days_including_holidays: 30`) contradicting a six-element body. If the committed fixtures ever stop being exactly what this script emits, they are no longer regenerable, which is the whole point of having a script.
+- **`errors` is opaque.** Inside it, keys are the *names of rejected request fields* and values are protocol prose. Scrubbing there replaced `"This field is required."` with a placeholder — deleting the one thing the bulk-error fixture exists to record.
+
+Check what survived before committing:
+
+```bash
+jq -r '[paths(type=="string") as $p | getpath($p)] | .[]' crates/wakode-api/tests/fixtures/wakatime/*.json \
+  | grep -vE '^[a-z_]+-[0-9]+$' | sort -u
+```
+
+Everything not matching `key-N` is real. On the current capture that leaves the timezone (deliberately — it is what makes `range.start: …T21:00:00Z` for `range.date: 2026-08-18` legible as a form rather than a typo), language and category names, plan names, and real timestamps.

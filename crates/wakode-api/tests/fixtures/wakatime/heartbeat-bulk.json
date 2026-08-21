@@ -1,0 +1,21 @@
+{
+  "responses": [
+    [
+      {
+        "id": "id-13",
+        "skip": "Too many duplicate heartbeats."
+      },
+      202
+    ],
+    [
+      {
+        "errors": {
+          "entity": [
+            "This field is required."
+          ]
+        }
+      },
+      400
+    ]
+  ]
+}
