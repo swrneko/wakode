@@ -108,6 +108,7 @@ pub fn router(state: AppState) -> Router {
             .route("/healthz", get(health::healthz))
             .route("/api/setup/status", get(setup::status))
             .route("/api/setup", axum::routing::post(setup::setup))
+            .route("/api/v1/users/current", get(compat::current))
             .fallback(|| async { ApiError::NotFound })
             .method_not_allowed_fallback(|| async { ApiError::MethodNotAllowed })
             .with_state(state),

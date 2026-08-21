@@ -10,6 +10,10 @@ axum-extra = { workspace = true, features = ["cookie"] }
 # Разбор схемы `Basic` в рабочем коде без base64 не обходится. Это не
 # криптография: вся она живёт в `wakode-auth`.
 base64.workspace = true
+# Печать времени в форме, которой ждёт WakaTime. Без фичи `clock`
+# намеренно, как и в `wakode-core`: она тянет `iana-time-zone`, а тот
+# читает `/etc/localtime`. Часы сюда приезжают из хранилища, не из chrono.
+chrono.workspace = true
 chrono-tz.workspace = true
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["rt", "net"] }

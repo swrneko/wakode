@@ -2246,3 +2246,199 @@ async fn a_route_that_declares_itself_cacheable_keeps_its_own_header() {
         "слой затёр собственный заголовок маршрута"
     );
 }
+
+/// Ответ `/api/v1/users/current` с предъявленным ключом.
+async fn current_user_response(state: AppState, key: &ApiKeyValue) -> Response {
+    router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/users/current")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Basic {}", STANDARD.encode(key.to_string())),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn the_current_user_needs_a_key() {
+    // Без этого теста маршрут, забывший `KeyAuth`, отдавал бы чужой
+    // профиль кому угодно, а тест формы остался бы зелёным: форма-то
+    // правильная.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _key) = a_state_with_a_key(&dir).await;
+
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/users/current")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn the_timeout_is_reported_in_minutes_not_seconds() {
+    // Единица — часть контракта, а по форме её не видно: и минуты, и
+    // секунды это `number`. Мутация «убрать деление на 60» не роняет
+    // сверку формы вообще ничем.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    let body = json_body(current_user_response(state, &key).await).await;
+
+    // Пользователь заведён с 900 секундами (`a_user_with_a_key`), а
+    // эталон при тех же 900 секундах отдаёт `timeout: 15`.
+    assert_eq!(body["data"]["timeout"], 15, "{body}");
+}
+
+#[tokio::test]
+async fn the_current_user_is_the_owner_of_the_presented_key() {
+    // Пользователей двое, и ключ предъявляется вторым: обработчик,
+    // берущий «первого попавшегося» или отдающий прошитый профиль, сверку
+    // формы прошёл бы зелёным — форма-то правильная.
+    let dir = tempfile::tempdir().unwrap();
+    let master = MasterKey::generate();
+    let store = a_store(&dir);
+    a_user_with_a_key(&store, &master, "swrneko").await;
+
+    let neighbour = store
+        .create_user(NewUser {
+            login: "соседка".to_owned(),
+            email: Some("соседка@example.org".to_owned()),
+            password_hash: "непрозрачно".to_owned(),
+            display_name: Some("Соседка".to_owned()),
+            timezone: "Asia/Tokyo".parse().unwrap(),
+            timeout_secs: 1_800,
+            is_admin: false,
+        })
+        .await
+        .unwrap();
+
+    let value = ApiKeyValue::generate();
+    store
+        .create_key(NewApiKey {
+            user_id: neighbour.id,
+            name: "её ноутбук".to_owned(),
+            key_encrypted: value.encrypt(&master).unwrap().as_bytes().to_vec(),
+            key_lookup: value.lookup(&master),
+        })
+        .await
+        .unwrap();
+
+    let state = AppState::new(store, Some(master), a_settings());
+    let body = json_body(current_user_response(state, &value).await).await;
+
+    assert_eq!(body["data"]["id"], neighbour.id.to_string(), "{body}");
+    assert_eq!(body["data"]["username"], "соседка", "{body}");
+    assert_eq!(body["data"]["display_name"], "Соседка", "{body}");
+    assert_eq!(body["data"]["email"], "соседка@example.org", "{body}");
+    assert_eq!(body["data"]["timezone"], "Asia/Tokyo", "{body}");
+    assert_eq!(body["data"]["timeout"], 30, "{body}");
+}
+
+#[tokio::test]
+async fn a_user_without_a_display_name_is_shown_by_login() {
+    // `display_name` в базе необязателен, а плагин печатает его в
+    // статус-баре: пустая строка там хуже логина. `full_name` при этом
+    // остаётся пустым — полное имя выдумывать не из чего.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    let body = json_body(current_user_response(state, &key).await).await;
+
+    assert_eq!(body["data"]["display_name"], "swrneko", "{body}");
+    assert_eq!(body["data"]["full_name"], serde_json::Value::Null, "{body}");
+}
+
+#[tokio::test]
+async fn the_times_are_the_users_own_and_printed_the_wakatime_way() {
+    // Два заявления сразу, и ни одного из них не видно по форме: время
+    // подменённое константой — такая же `string`, и сырое число
+    // микросекунд, отданное строкой, — тоже. Поэтому здесь напечатанное
+    // разбирается обратно и сверяется с тем, что легло в базу.
+    //
+    // `created_at` и `updated_at` у свежего пользователя равны, и пути
+    // обновления в хранилище пока нет: перестановка этих двух полей
+    // местами тестом не ловится и ничего не меняет, пока они равны.
+    let dir = tempfile::tempdir().unwrap();
+    let master = MasterKey::generate();
+    let store = a_store(&dir);
+
+    let user = store
+        .create_user(NewUser {
+            login: "хронометр".to_owned(),
+            email: None,
+            password_hash: "непрозрачно".to_owned(),
+            display_name: None,
+            timezone: "Europe/Moscow".parse().unwrap(),
+            timeout_secs: 900,
+            is_admin: false,
+        })
+        .await
+        .unwrap();
+
+    let value = ApiKeyValue::generate();
+    store
+        .create_key(NewApiKey {
+            user_id: user.id,
+            name: "рабочий ноутбук".to_owned(),
+            key_encrypted: value.encrypt(&master).unwrap().as_bytes().to_vec(),
+            key_lookup: value.lookup(&master),
+        })
+        .await
+        .unwrap();
+
+    let state = AppState::new(store, Some(master), a_settings());
+    let body = json_body(current_user_response(state, &value).await).await;
+
+    for (field, expected) in [("created_at", user.created_at), ("modified_at", user.updated_at)] {
+        let printed = body["data"][field]
+            .as_str()
+            .unwrap_or_else(|| panic!("{field} отдан не строкой: {body}"));
+        let parsed = chrono::DateTime::parse_from_rfc3339(printed)
+            .unwrap_or_else(|err| panic!("{field} = {printed:?} — не RFC 3339: {err}"));
+
+        assert!(
+            printed.ends_with('Z'),
+            "{field} = {printed:?}: эталон печатает UTC как `Z`"
+        );
+        assert_eq!(
+            parsed.timestamp(),
+            expected.get() / 1_000_000,
+            "{field} = {printed:?} — не время этого пользователя"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_wrong_method_on_the_current_user_is_a_json_error_too() {
+    // Маршрут добавлен выше `method_not_allowed_fallback`; окажись он
+    // ниже — остался бы с пустым 405 axum'а мимо `ApiError`. Порядок
+    // строк в `router` держится этим тестом, а не чтением кода.
+    let dir = tempfile::tempdir().unwrap();
+    let app = router(a_state(&dir));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/users/current")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let json = json_body(response).await;
+    assert!(json.get("error").is_some(), "нет поля error: {json}");
+}

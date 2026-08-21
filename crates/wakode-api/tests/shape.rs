@@ -3,7 +3,14 @@
 //! Отдельный бинарь, а не часть `api.rs`: помощник нужен всем задачам
 //! плана, а `api.rs` уже за две тысячи строк.
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
+use http_body_util::BodyExt;
 use serde_json::Value;
+use tower::ServiceExt;
+use wakode_api::{AppSettings, AppState};
+use wakode_auth::{ApiKeyValue, MasterKey};
+use wakode_store::{KeyRepo, NewApiKey, NewUser, SqliteStore, UserRepo};
 
 /// Поля, которых мы не отдаём осознанно.
 ///
@@ -88,6 +95,86 @@ fn kind(value: &Value) -> &'static str {
         Value::Array(_) => "array",
         Value::Object(_) => "object",
     }
+}
+
+/// Настройки по умолчанию. Повторяют `api.rs`: помощники в этом крейте
+/// живут по бинарю, потому что `tests/` не делит модули между целями.
+fn a_settings() -> AppSettings {
+    AppSettings {
+        registration: false,
+        session_ttl_days: 30,
+        setup_from_any_address: false,
+        default_timeout_secs: 777,
+    }
+}
+
+fn a_store(dir: &tempfile::TempDir) -> SqliteStore {
+    SqliteStore::open(&dir.path().join("wakode.db"), 16).unwrap()
+}
+
+/// Состояние с мастер-ключом, пользователем и выданным ему ключом.
+async fn a_state_with_a_key(dir: &tempfile::TempDir) -> (AppState, ApiKeyValue) {
+    let master = MasterKey::generate();
+    let store = a_store(dir);
+
+    let user = store
+        .create_user(NewUser {
+            login: "swrneko".to_owned(),
+            email: None,
+            password_hash: "непрозрачно".to_owned(),
+            display_name: None,
+            timezone: "Europe/Moscow".parse().unwrap(),
+            timeout_secs: 900,
+            is_admin: false,
+        })
+        .await
+        .unwrap();
+
+    let value = ApiKeyValue::generate();
+    store
+        .create_key(NewApiKey {
+            user_id: user.id,
+            name: "рабочий ноутбук".to_owned(),
+            key_encrypted: value.encrypt(&master).unwrap().as_bytes().to_vec(),
+            key_lookup: value.lookup(&master),
+        })
+        .await
+        .unwrap();
+
+    (AppState::new(store, Some(master), a_settings()), value)
+}
+
+/// Ответ на `GET` по пути с предъявленным ключом.
+async fn get_with_a_key(state: AppState, key: &ApiKeyValue, uri: &str) -> axum::response::Response {
+    wakode_api::router(state)
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(uri)
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Basic {}", STANDARD.encode(key.to_string())),
+                )
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// Тело ответа как JSON, с проверкой `Content-Type`.
+async fn json_body(response: axum::response::Response) -> Value {
+    let content_type = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .map(|value| value.to_str().unwrap().to_owned())
+        .unwrap_or_default();
+    assert!(
+        content_type.starts_with("application/json"),
+        "тело отдано не как JSON: {content_type:?}"
+    );
+
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
 }
 
 #[test]
@@ -183,4 +270,15 @@ fn the_helper_forgives_only_the_fields_we_declared() {
     compare(&ours, &theirs, "", &mut problems);
     assert_eq!(problems.len(), 1, "{problems:?}");
     assert!(problems[0].contains(".sessions"), "{problems:?}");
+}
+
+#[tokio::test]
+async fn the_current_user_has_the_shape_wakatime_has() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    let response = get_with_a_key(state, &key, "/api/v1/users/current").await;
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_shape_matches(&json_body(response).await, &fixture("current"));
 }

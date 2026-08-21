@@ -81,6 +81,8 @@ Wakapi (Go) уже решает базовую задачу. wakode отлича
 
 **`statusbar/today`.** Официальной документации нет; форма снята с живого ответа. Верхний уровень — `{"data": <элемент data[] из summaries>, "has_team_features": <bool>}`. Поля `cached_at`, которое предполагала прежняя редакция, в ответе **нет**, зато есть `has_team_features`, которого она не предполагала.
 
+**Оговорка про `users/current`.** Профиль отдаётся всеми 59 полями снимка, но 18 из них — те, где WakaTime всегда шлёт значение, — у нас всегда `null`: `plan`, `weekday_start`, `color_scheme`, `date_format`, `time_format_display`, `default_dashboard_range`, `durations_slice_by`, `public_profile_time_range`, `profile_url`, `profile_url_escaped`, `photo`, `invoice_id_format` и шесть `last_*` (последние — долг задачи 3, остальные — понятия, которых у selfhosted-инстанса нет). Сверка формы это расхождение не поймает никогда: `null` она прощает по построению. Перечень, счёт и риск — `.claude/docs/decisions/null-for-settings-we-do-not-have.md`.
+
 **Оговорка про `ai_*`.** Снимок 2026 года несёт в `grand_total` и в элементах массивов десятки полей `ai_…` (`ai_sessions`, `ai_input_tokens`, `ai_model_costs`, …), которых нет ни в документации, ни в прежней редакции этого раздела. Волна 0 их не воспроизводит: плагины редакторов их не читают, а выдумывать значения хуже, чем не отдавать поле. Решение пересматривается, если найдётся потребитель.
 
 ### Поля heartbeat
