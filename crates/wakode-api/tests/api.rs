@@ -2442,3 +2442,409 @@ async fn a_wrong_method_on_the_current_user_is_a_json_error_too() {
     let json = json_body(response).await;
     assert!(json.get("error").is_some(), "нет поля error: {json}");
 }
+
+/// Ответ на `POST /api/v1/users/current/heartbeats` с предъявленным ключом.
+async fn post_heartbeat_response(state: AppState, key: &ApiKeyValue, body: &str) -> Response {
+    router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/users/current/heartbeats")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Basic {}", STANDARD.encode(key.to_string())),
+                )
+                .body(Body::from(body.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_heartbeat_is_accepted_and_gets_an_id() {
+    // Отметка **читается обратно**, и это не педантизм. Мутация «не звать
+    // `record_heartbeats` вовсе, отдавая свежий `Uuid::now_v7()`» прогнана:
+    // без чтения не падал ни один тест всего набора. Ответ правильной формы
+    // с правдоподобным идентификатором получается и без единой записи в
+    // базу, то есть трекер, который ничего не трекает, проходил бы зелёным.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    let response = post_heartbeat_response(
+        state.clone(),
+        &key,
+        r#"{"entity":"/дом/проект/файл.rs","type":"file","time":1755500000.0}"#,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = json_body(response).await;
+    assert!(
+        uuid::Uuid::parse_str(body["data"]["id"].as_str().unwrap()).is_ok(),
+        "идентификатор не UUID: {body}"
+    );
+
+    let user = state.store.user_by_login("swrneko").await.unwrap().unwrap();
+    let stored = state
+        .store
+        .heartbeats_in_range(
+            user.id,
+            Micros::from_secs(1_755_499_999),
+            Micros::from_secs(1_755_500_001),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(stored.len(), 1, "отметка не доехала до базы: {stored:?}");
+    assert_eq!(stored[0].time, Micros::from_secs(1_755_500_000));
+    assert_eq!(
+        state.store.resolve(stored[0].attrs.entity).as_deref(),
+        Some("/дом/проект/файл.rs")
+    );
+}
+
+#[tokio::test]
+async fn a_duplicate_heartbeat_is_a_success_with_the_zero_id_and_no_second_row() {
+    // Форма ответа на повтор снята с живого и записана в
+    // `.claude/docs/decisions/duplicate-heartbeats-are-a-success.md`:
+    // идентификатор из нулей **с нибблами версии 4**, то есть не
+    // `Uuid::nil()`. Свежий идентификатор здесь был бы ложью — строки в
+    // базе нет, и клиент, сохранивший его, не нашёл бы по нему ничего.
+    //
+    // Чего этот тест не утверждает: ответ на повтор у **этого** эндпоинта с
+    // живого не снимался вовсе. Измерен только батч, и оттуда взят сам
+    // идентификатор; и код `201`, и отсутствие поля `skip` рядом с ним —
+    // экстраполяция. Оба расхождения и цена каждого записаны в
+    // `.claude/docs/decisions/duplicate-heartbeats-are-a-success.md`.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+    let body = r#"{"entity":"/дом/проект/файл.rs","type":"file","time":1755500000.0}"#;
+
+    let first = post_heartbeat_response(state.clone(), &key, body).await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_id = json_body(first).await["data"]["id"].as_str().unwrap().to_owned();
+
+    let second = post_heartbeat_response(state.clone(), &key, body).await;
+    assert_eq!(second.status(), StatusCode::CREATED);
+    let second_id = json_body(second).await["data"]["id"].as_str().unwrap().to_owned();
+
+    assert_ne!(first_id, second_id, "повтор получил идентификатор вставки");
+    assert_eq!(second_id, "00000000-0000-4000-a000-000000000000");
+
+    let user = state.store.user_by_login("swrneko").await.unwrap().unwrap();
+    let stored = state
+        .store
+        .heartbeats_in_range(
+            user.id,
+            Micros::from_secs(1_755_499_999),
+            Micros::from_secs(1_755_500_001),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 1, "повтор всё-таки записался: {stored:?}");
+}
+
+#[tokio::test]
+async fn an_absurd_time_is_a_bad_request_and_not_a_heartbeat_from_the_epoch() {
+    // `1e30` — совершенно обычный `f64`, и `serde_json` разбирает его без
+    // возражений (а вот `1e400` отбивает сам, ещё до обработчика, — с ним
+    // этот тест был бы вакуумным и зеленел бы без единой нашей проверки).
+    // Дальше `Micros::from_secs_f64` — это `as i64`, то есть насыщение до
+    // `i64::MAX`. Без проверки такая отметка легла бы в базу временем, до
+    // которого календарь не доживает, и всё, что её потом читает, считало
+    // бы по ней.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    let response = post_heartbeat_response(
+        state.clone(),
+        &key,
+        r#"{"entity":"/дом/проект/файл.rs","type":"file","time":1e30}"#,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert!(body.get("error").is_some(), "нет поля error: {body}");
+
+    // И ничего не записалось — ни на краю календаря, ни в эпохе.
+    let user = state.store.user_by_login("swrneko").await.unwrap().unwrap();
+    let stored = state
+        .store
+        .heartbeats_in_range(user.id, Micros::new(i64::MIN), Micros::new(i64::MAX))
+        .await
+        .unwrap();
+    assert!(stored.is_empty(), "абсурдное время всё-таки записалось: {stored:?}");
+}
+
+#[tokio::test]
+async fn a_heartbeat_needs_a_key_and_lands_on_its_owner() {
+    // Два заявления, и второе не следует из первого: обработчик, берущий
+    // «первого попавшегося» пользователя, отдал бы тот же `201` с тем же
+    // UUID, а отметка ушла бы чужому. Ни сверка формы, ни тест приёма
+    // такого не видят.
+    let dir = tempfile::tempdir().unwrap();
+    let master = MasterKey::generate();
+    let store = a_store(&dir);
+    a_user_with_a_key(&store, &master, "swrneko").await;
+
+    let neighbour = store
+        .create_user(NewUser {
+            login: "соседка".to_owned(),
+            email: None,
+            password_hash: "непрозрачно".to_owned(),
+            display_name: None,
+            timezone: "Asia/Tokyo".parse().unwrap(),
+            timeout_secs: 1_800,
+            is_admin: false,
+        })
+        .await
+        .unwrap();
+    let value = ApiKeyValue::generate();
+    store
+        .create_key(NewApiKey {
+            user_id: neighbour.id,
+            name: "её ноутбук".to_owned(),
+            key_encrypted: value.encrypt(&master).unwrap().as_bytes().to_vec(),
+            key_lookup: value.lookup(&master),
+        })
+        .await
+        .unwrap();
+
+    let state = AppState::new(store, Some(master), a_settings());
+    let body = r#"{"entity":"/дом/проект/файл.rs","type":"file","time":1755500000.0}"#;
+
+    let anonymous = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/users/current/heartbeats")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let accepted = post_heartbeat_response(state.clone(), &value, body).await;
+    assert_eq!(accepted.status(), StatusCode::CREATED);
+
+    let owner = state.store.user_by_login("swrneko").await.unwrap().unwrap();
+    let (from, to) = (Micros::from_secs(1_755_499_999), Micros::from_secs(1_755_500_001));
+    assert_eq!(
+        state.store.heartbeats_in_range(neighbour.id, from, to).await.unwrap().len(),
+        1,
+        "отметка не досталась владелице предъявленного ключа"
+    );
+    assert!(
+        state.store.heartbeats_in_range(owner.id, from, to).await.unwrap().is_empty(),
+        "отметка досталась не тому пользователю"
+    );
+}
+
+#[tokio::test]
+async fn every_attribute_of_the_body_lands_where_the_protocol_names_it() {
+    // `to_store` перекладывает восемнадцать полей по именам, и перестановка
+    // любых двух однотипных — `branch` с `language`, `editor` с `machine` —
+    // не ловится ни типом, ни сверкой формы, ни тестом приёма. Строки
+    // подобраны попарно различными: с одинаковыми перестановка была бы
+    // невидима и здесь.
+    //
+    // Тело несёт заодно поле, которого мы не знаем: докстринг
+    // `IncomingBody` обещает, что плагин с полем из будущей версии не
+    // получит отказ, и `deny_unknown_fields`, поставленный туда однажды,
+    // обязан покраснеть здесь.
+    //
+    // Чего этот тест не проверяет: числовые поля (`lines`, `lineno`,
+    // `cursorpos`, `line_*`, `project_root_count`) и `dependencies`
+    // публичным путём не читает никто — `load_heartbeats` их не берёт.
+    // Их укладку сторожит сырой `SELECT` в модульных тестах
+    // `wakode-store/src/heartbeats.rs`, но уже после `to_store`.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    let response = post_heartbeat_response(
+        state.clone(),
+        &key,
+        r#"{
+            "entity": "/дом/проект/файл.rs",
+            "type": "app",
+            "category": "debugging",
+            "time": 1755500000.0,
+            "project": "проект",
+            "branch": "ветка",
+            "language": "язык",
+            "editor": "редактор",
+            "operating_system": "ос",
+            "machine": "машина",
+            "is_write": true,
+            "непонятное_поле_из_будущего_плагина": 42
+        }"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED, "{:?}", response);
+
+    let user = state.store.user_by_login("swrneko").await.unwrap().unwrap();
+    let stored = state
+        .store
+        .heartbeats_in_range(
+            user.id,
+            Micros::from_secs(1_755_499_999),
+            Micros::from_secs(1_755_500_001),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    let attrs = stored[0].attrs;
+
+    assert_eq!(attrs.kind, EntityKind::App);
+    assert_eq!(attrs.category, Category::Debugging);
+    for (name, sid, expected) in [
+        ("entity", Some(attrs.entity), "/дом/проект/файл.rs"),
+        ("project", attrs.project, "проект"),
+        ("branch", attrs.branch, "ветка"),
+        ("language", attrs.language, "язык"),
+        ("editor", attrs.editor, "редактор"),
+        ("operating_system", attrs.os, "ос"),
+        ("machine", attrs.machine, "машина"),
+    ] {
+        let sid = sid.unwrap_or_else(|| panic!("{name} потерялось: {attrs:?}"));
+        assert_eq!(state.store.resolve(sid).as_deref(), Some(expected), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn a_wrong_method_on_the_heartbeats_path_is_a_json_error_too() {
+    // Маршрут добавлен выше `method_not_allowed_fallback`; окажись он
+    // ниже — остался бы с пустым 405 axum'а мимо `ApiError`. Порядок строк
+    // в `router` держится этим тестом, а не чтением кода.
+    let dir = tempfile::tempdir().unwrap();
+    let app = router(a_state(&dir));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/users/current/heartbeats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let json = json_body(response).await;
+    assert!(json.get("error").is_some(), "нет поля error: {json}");
+}
+
+#[tokio::test]
+async fn a_body_we_cannot_parse_is_refused_with_a_code_the_plugin_drops() {
+    // Разница между `400` и `500` тут не косметическая, и это главное, что
+    // проверяет тест. `4xx` плагин выбрасывает; `5xx` он кладёт в офлайновую
+    // очередь и шлёт снова — то есть неразбираемое тело возвращалось бы
+    // вечно, а очередь копилась бы за счёт отметок, которые ещё можно было
+    // бы записать.
+    //
+    // Двери в эту ветку две, и вторая неочевидна: незнакомый `type`.
+    // У `EntityKind` нет запасного варианта, в отличие от `Category`
+    // (см. докстринг поля `kind` в `compat/heartbeats.rs`), так что отметка
+    // от плагина новой версии попадает сюда же — и обязана попадать с тем
+    // же кодом.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    for (why, body) in [
+        ("вовсе не JSON", "не json ни с какой стороны"),
+        ("JSON, но не объект", "[1, 2, 3]"),
+        (
+            "нет обязательного entity",
+            r#"{"type":"file","time":1755500000.0}"#,
+        ),
+        (
+            "незнакомый type от плагина новой версии",
+            r#"{"entity":"/дом/проект/файл.rs","type":"тетрадка","time":1755500000.0}"#,
+        ),
+    ] {
+        let response = post_heartbeat_response(state.clone(), &key, body).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{why}: этот код плагин будет ретраить вечно"
+        );
+        let json = json_body(response).await;
+        assert!(json.get("error").is_some(), "{why}: нет поля error: {json}");
+    }
+
+    // И ни одна из четырёх не записалась.
+    let user = state.store.user_by_login("swrneko").await.unwrap().unwrap();
+    let stored = state
+        .store
+        .heartbeats_in_range(user.id, Micros::new(i64::MIN), Micros::new(i64::MAX - 1))
+        .await
+        .unwrap();
+    assert!(stored.is_empty(), "неразобранное тело всё-таки записалось: {stored:?}");
+}
+
+#[tokio::test]
+async fn a_category_we_do_not_know_is_forgiven_where_a_type_we_do_not_know_is_not() {
+    // Ассиметрия намеренная, и держится она тестом, а не докстрингом:
+    // незнакомая категория даёт `Category::Unknown` и отметка записывается,
+    // незнакомый `type` — отказ. Обоснование — в докстринге поля `kind`.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    let response = post_heartbeat_response(
+        state.clone(),
+        &key,
+        r#"{"entity":"/дом/проект/файл.rs","type":"file","time":1755500000.0,"category":"пилотирование"}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let user = state.store.user_by_login("swrneko").await.unwrap().unwrap();
+    let stored = state
+        .store
+        .heartbeats_in_range(
+            user.id,
+            Micros::from_secs(1_755_499_999),
+            Micros::from_secs(1_755_500_001),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    assert_eq!(
+        stored[0].attrs.category,
+        Category::Unknown,
+        "незнакомая категория обязана сохраниться как «данные есть, мы их не поняли»"
+    );
+
+    // Вторая половина контраста, ради которой тест и назван так. Без неё
+    // имя обещало бы противопоставление, а тело доказывало бы одну
+    // сторону: обратную мутацию — начать прощать незнакомый `type` — этот
+    // тест переживал бы зелёным, и ловил бы её только соседний, про
+    // неразбираемое тело.
+    let response = post_heartbeat_response(
+        state.clone(),
+        &key,
+        r#"{"entity":"/дом/проект/файл.rs","type":"голограмма","time":1755500002.0}"#,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "незнакомый вид сущности обязан быть отказом, а не догадкой"
+    );
+
+    let stored = state
+        .store
+        .heartbeats_in_range(
+            user.id,
+            Micros::from_secs(1_755_500_002),
+            Micros::from_secs(1_755_500_003),
+        )
+        .await
+        .unwrap();
+    assert!(stored.is_empty(), "отвергнутая отметка всё-таки записалась: {stored:?}");
+}

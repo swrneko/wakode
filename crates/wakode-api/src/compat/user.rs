@@ -57,8 +57,10 @@ pub struct CurrentUser {
 /// его не поймает по построению, и записано оно отдельно —
 /// `.claude/docs/decisions/null-for-settings-we-do-not-have.md`.
 ///
-/// `last_*` — долг задачи 3. Отметок в базе на этом этапе ещё нет,
-/// считать «последний проект» не из чего, и `null` тут временный.
+/// `last_*` остаются `null` и после задачи 3: отметки она писать научила,
+/// а читать «последний проект» — нет. В волне 0 плана этой работы не
+/// заведено ни за одной задачей, так что `null` тут не «пока нечего
+/// считать», а незакрытый долг.
 #[derive(Serialize)]
 pub struct CurrentUserData {
     pub id: String,
@@ -77,7 +79,7 @@ pub struct CurrentUserData {
     pub created_at: Option<String>,
     pub modified_at: Option<String>,
 
-    // Отметки ещё не пишутся (задача 3), считать нечего.
+    // Отметки пишутся (задача 3), а вот читателя «последнего» у них нет.
     pub last_heartbeat_at: Option<String>,
     pub last_project: Option<String>,
     pub last_language: Option<String>,

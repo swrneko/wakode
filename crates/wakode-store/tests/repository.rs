@@ -803,6 +803,24 @@ fn deleting_a_user_takes_their_keys_and_sessions_with_them() {
     assert!(find_session_by_token_hash(&conn, &[1]).unwrap().is_none());
 }
 
+/// Судьбы батча по позициям, без идентификаторов.
+///
+/// `Outcome::Inserted` носит идентификатор записанной строки, а он свежий и
+/// заранее неизвестен — сравнить отчёт с литеральным вектором больше
+/// нельзя. Сверяют же эти тесты не идентификаторы, а **позиции**: какая
+/// отметка батча вставилась, а какая отбилась. Совпадение идентификатора со
+/// строкой доказывается отдельно, в модульном тесте `heartbeats.rs`.
+fn fates(report: &wakode_store::InsertReport) -> Vec<&'static str> {
+    report
+        .outcomes
+        .iter()
+        .map(|outcome| match outcome {
+            Outcome::Inserted(_) => "вставлена",
+            Outcome::Duplicate => "повтор",
+        })
+        .collect()
+}
+
 fn incoming(time_secs: i64, entity: &str, project: Option<&str>) -> IncomingHeartbeat {
     IncomingHeartbeat {
         time: Micros::from_secs(time_secs),
@@ -845,7 +863,7 @@ fn heartbeats_are_stored_and_counted() {
 
     assert_eq!(report.inserted(), 2);
     assert_eq!(report.duplicates(), 0);
-    assert_eq!(report.outcomes, vec![Outcome::Inserted, Outcome::Inserted]);
+    assert_eq!(fates(&report), vec!["вставлена", "вставлена"]);
 }
 
 #[test]
@@ -867,7 +885,7 @@ fn two_heartbeats_with_the_same_entity_but_different_projects_are_both_inserted(
     ];
     let report = insert_heartbeats(&mut conn, &interner, user.id, &batch, user.timezone).unwrap();
 
-    assert_eq!(report.outcomes, vec![Outcome::Inserted, Outcome::Inserted]);
+    assert_eq!(fates(&report), vec!["вставлена", "вставлена"]);
 }
 
 #[test]
@@ -888,7 +906,7 @@ fn a_repeated_heartbeat_within_the_same_batch_is_a_duplicate() {
     ];
     let report = insert_heartbeats(&mut conn, &interner, user.id, &batch, user.timezone).unwrap();
 
-    assert_eq!(report.outcomes, vec![Outcome::Inserted, Outcome::Duplicate]);
+    assert_eq!(fates(&report), vec!["вставлена", "повтор"]);
 }
 
 #[test]
@@ -909,7 +927,7 @@ fn report_says_which_position_was_the_duplicate() {
     ];
     let report = insert_heartbeats(&mut conn, &interner, user.id, &second, user.timezone).unwrap();
 
-    assert_eq!(report.outcomes, vec![Outcome::Duplicate, Outcome::Inserted]);
+    assert_eq!(fates(&report), vec!["повтор", "вставлена"]);
 }
 
 #[test]
@@ -1017,7 +1035,7 @@ fn resending_a_batch_does_not_multiply_marked_days() {
     insert_heartbeats(&mut conn, &interner, user.id, &batch, user.timezone).unwrap();
 
     let second = insert_heartbeats(&mut conn, &interner, user.id, &batch, user.timezone).unwrap();
-    assert_eq!(second.outcomes, vec![Outcome::Duplicate]);
+    assert_eq!(fates(&second), vec!["повтор"]);
 
     assert_eq!(
         dirty_days_for(&conn, user.id).unwrap(),

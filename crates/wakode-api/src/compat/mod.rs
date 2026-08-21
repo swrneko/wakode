@@ -4,8 +4,10 @@
 //! вкусу нельзя, и сверяется она с эталонами в `tests/fixtures/wakatime`
 //! помощником из `tests/shape.rs`.
 
+pub mod heartbeats;
 pub mod user;
 
+pub use heartbeats::post_heartbeat;
 pub use user::current;
 
 /// Момент времени в том виде, в каком его отдаёт WakaTime.

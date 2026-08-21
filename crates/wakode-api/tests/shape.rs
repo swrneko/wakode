@@ -282,3 +282,33 @@ async fn the_current_user_has_the_shape_wakatime_has() {
     assert_eq!(response.status(), axum::http::StatusCode::OK);
     assert_shape_matches(&json_body(response).await, &fixture("current"));
 }
+
+#[tokio::test]
+async fn an_accepted_heartbeat_has_the_shape_wakatime_has() {
+    // Эталон снят с живого: `{"data": {"id"}}` и ничего больше. Полей
+    // `entity`, `type` и `time` рядом с ним нет, хотя прежняя редакция
+    // спеки их обещала.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    let response = wakode_api::router(state)
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/users/current/heartbeats")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Basic {}", STANDARD.encode(key.to_string())),
+                )
+                .body(axum::body::Body::from(
+                    r#"{"entity":"/дом/проект/файл.rs","type":"file","time":1755500000.0}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    assert_shape_matches(&json_body(response).await, &fixture("heartbeat-single"));
+}
