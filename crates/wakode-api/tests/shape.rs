@@ -68,9 +68,19 @@ fn compare(ours: &Value, theirs: &Value, path: &str, out: &mut Vec<String>) {
                 }
             }
         }
-        // У массива сверяется форма первого элемента: остальные однородны
-        // по построению. Пустой наш массив против непустого чужого — не
-        // расхождение формы: у нас может не быть данных.
+        // У массива сверяется форма **первого** элемента, и только его.
+        //
+        // Однородность остальных — предположение, а не факт, и в этом же
+        // репозитории лежит контрпример: `responses` эталона
+        // `heartbeat-bulk.json` разнороден, `[0]` там повтор, а `[1]`
+        // отказ, и форма отказа этой веткой не проверяется вовсе. Тест
+        // батча закрывает это, зовя `assert_shape_matches` вторым разом на
+        // `responses[1]` явно, — но знание живёт там, а не здесь, поэтому
+        // оговорка стоит на самом помощнике. Сверяешь разнородный массив —
+        // зови помощник поэлементно сам.
+        //
+        // Пустой наш массив против непустого чужого — не расхождение
+        // формы: у нас может не быть данных.
         (Value::Array(a), Value::Array(b)) => {
             if let (Some(x), Some(y)) = (a.first(), b.first()) {
                 compare(x, y, &format!("{path}[]"), out);
@@ -155,6 +165,30 @@ async fn get_with_a_key(state: AppState, key: &ApiKeyValue, uri: &str) -> axum::
                     format!("Basic {}", STANDARD.encode(key.to_string())),
                 )
                 .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// Ответ на `POST` по пути с предъявленным ключом.
+async fn post(
+    state: AppState,
+    key: &ApiKeyValue,
+    uri: &str,
+    body: &str,
+) -> axum::response::Response {
+    wakode_api::router(state)
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Basic {}", STANDARD.encode(key.to_string())),
+                )
+                .body(axum::body::Body::from(body.to_owned()))
                 .unwrap(),
         )
         .await
@@ -311,4 +345,36 @@ async fn an_accepted_heartbeat_has_the_shape_wakatime_has() {
 
     assert_eq!(response.status(), axum::http::StatusCode::CREATED);
     assert_shape_matches(&json_body(response).await, &fixture("heartbeat-single"));
+}
+
+#[tokio::test]
+async fn a_bulk_response_has_the_shape_wakatime_has() {
+    // Эталон снят с живого и разнороден: `responses[0]` — повтор,
+    // `responses[1]` — отказ. Наш батч подобран так, чтобы позиции
+    // совпали: отметка сперва отправляется одиночным эндпоинтом, чтобы в
+    // батче она уже была повтором.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+    let one = r#"{"entity":"/дом/проект/файл.rs","type":"file","time":1755500000.0}"#;
+
+    let first = post(state.clone(), &key, "/api/v1/users/current/heartbeats", one).await;
+    assert_eq!(first.status(), axum::http::StatusCode::CREATED);
+
+    let response = post(
+        state,
+        &key,
+        "/api/v1/users/current/heartbeats.bulk",
+        &format!(r#"[{one},{{"entity":"","type":"file","time":1755500001.0}}]"#),
+    )
+    .await;
+
+    assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+    let ours = json_body(response).await;
+    let theirs = fixture("heartbeat-bulk");
+
+    assert_shape_matches(&ours, &theirs);
+    // Помощник сверяет у массива только первый элемент — остальные
+    // однородны по построению. Здесь они не однородны, и без второго
+    // вызова форма отказа не проверялась бы ничем.
+    assert_shape_matches(&ours["responses"][1], &theirs["responses"][1]);
 }

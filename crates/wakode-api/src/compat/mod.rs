@@ -7,7 +7,7 @@
 pub mod heartbeats;
 pub mod user;
 
-pub use heartbeats::post_heartbeat;
+pub use heartbeats::{post_heartbeat, post_heartbeats_bulk};
 pub use user::current;
 
 /// Момент времени в том виде, в каком его отдаёт WakaTime.

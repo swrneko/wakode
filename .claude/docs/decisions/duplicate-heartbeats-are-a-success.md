@@ -29,6 +29,15 @@ Note the shape of that nil id: `00000000-0000-4000-a000-000000000000` carries th
 
 `errors` is plural and maps a field name to an **array** of messages. The spec's earlier guess allowed a singular `error`; no such form appears.
 
+## Two things in the bulk table that were not measured
+
+The probe sent exactly two elements — a repeat of the heartbeat it had just posted singly, and one with an empty `entity` — so `heartbeat-bulk.json` contains a duplicate and a rejection and **nothing else**. Two values wakode emits therefore rest on extrapolation:
+
+- **The status of an accepted element.** The table above says `2xx` because that is all the capture proves. wakode answers `201`, borrowed from the single endpoint where `201` *is* measured. Cheap to settle: one bulk probe containing a fresh heartbeat.
+- **The key under which a wholly unparseable element reports its error.** The measured form names the offending protocol field (`{"errors": {"entity": [...]}}`), but an element that fails to parse at all — unknown `type`, `time` as a string — has no single offending field. wakode uses `non_field_errors`, the Django REST Framework default, on the reasoning that WakaTime is a DRF application. That is an inference from the framework, not from the wire. Settle it by posting an element with `"time": "полдень"`.
+
+Neither is load-bearing for the plugins we know of, both are one probe away, and both are named here rather than left to be discovered as facts.
+
 ## Caveat
 
 One account, one probe. The duplicate branch fired because the two heartbeats shared an entity and were one second apart; the exact rule WakaTime uses to call something a duplicate was not measured and is not needed here — what the wire says on a duplicate is.

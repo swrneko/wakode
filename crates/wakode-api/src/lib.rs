@@ -113,6 +113,13 @@ pub fn router(state: AppState) -> Router {
                 "/api/v1/users/current/heartbeats",
                 axum::routing::post(compat::post_heartbeat),
             )
+            // Точка в пути — часть имени маршрута, а не расширение файла:
+            // `heartbeats.bulk` это отдельный эндпоинт чужого протокола, и
+            // с `heartbeats` он не пересекается ничем.
+            .route(
+                "/api/v1/users/current/heartbeats.bulk",
+                axum::routing::post(compat::post_heartbeats_bulk),
+            )
             .fallback(|| async { ApiError::NotFound })
             .method_not_allowed_fallback(|| async { ApiError::MethodNotAllowed })
             .with_state(state),

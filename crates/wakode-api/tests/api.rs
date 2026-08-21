@@ -2747,11 +2747,16 @@ async fn a_body_we_cannot_parse_is_refused_with_a_code_the_plugin_drops() {
     // вечно, а очередь копилась бы за счёт отметок, которые ещё можно было
     // бы записать.
     //
-    // Двери в эту ветку две, и вторая неочевидна: незнакомый `type`.
-    // У `EntityKind` нет запасного варианта, в отличие от `Category`
-    // (см. докстринг поля `kind` в `compat/heartbeats.rs`), так что отметка
-    // от плагина новой версии попадает сюда же — и обязана попадать с тем
-    // же кодом.
+    // Дверей в этот код три, и они не одинаковы. Тело, не разобравшееся
+    // как JSON, и незнакомый `type` идут через `JsonRejection`: у
+    // `EntityKind` нет запасного варианта, в отличие от `Category`
+    // (см. докстринг поля `kind` в `compat/heartbeats.rs`), так что
+    // отметка от плагина новой версии попадает именно сюда. А вот
+    // отсутствующая `entity` с задачи 4 идёт **мимо** разбора — через
+    // проверку в `to_store`, ради имени поля в ответе батча, — и приносит
+    // наш собственный текст, а не сообщение serde. Проверяемое утверждение
+    // от этого не меняется: код обязан быть один и тот же, каким бы путём
+    // отказ ни пришёл.
     let dir = tempfile::tempdir().unwrap();
     let (state, key) = a_state_with_a_key(&dir).await;
 
@@ -2847,4 +2852,309 @@ async fn a_category_we_do_not_know_is_forgiven_where_a_type_we_do_not_know_is_no
         .await
         .unwrap();
     assert!(stored.is_empty(), "отвергнутая отметка всё-таки записалась: {stored:?}");
+}
+
+/// Ответ на `POST /api/v1/users/current/heartbeats.bulk` с предъявленным ключом.
+async fn post_bulk_response(state: AppState, key: &ApiKeyValue, body: &str) -> Response {
+    router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/users/current/heartbeats.bulk")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Basic {}", STANDARD.encode(key.to_string())),
+                )
+                .body(Body::from(body.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// Сколько отметок владельца лежит в базе.
+async fn stored_count(state: &AppState) -> usize {
+    let user = state.store.user_by_login("swrneko").await.unwrap().unwrap();
+    state
+        .store
+        .heartbeats_in_range(user.id, Micros::new(i64::MIN), Micros::new(i64::MAX - 1))
+        .await
+        .unwrap()
+        .len()
+}
+
+#[tokio::test]
+async fn a_duplicate_element_is_a_success_with_a_skip_note() {
+    // Форма снята с живого и записана в
+    // `.claude/docs/decisions/duplicate-heartbeats-are-a-success.md`:
+    // повтор — **успешный** элемент с кодом 202, нулевым идентификатором
+    // и полем `skip`. Идентификатор сверяется строкой целиком, а не через
+    // `Uuid::nil()`: в нём стоят нибблы версии 4, и реализация на
+    // `Uuid::nil()` разошлась бы с эталоном на четырёх невидимых битах.
+    //
+    // Одно утверждение ниже с живого **не** снято: код принятого элемента.
+    // В снимке `heartbeat-bulk.json` принятых элементов нет вовсе — проба
+    // слала повтор и негодную отметку, — а сам decision-док пишет в этой
+    // клетке осторожное «2xx». Наш `201` взят у одиночного эндпоинта, где
+    // он измерен. Экстраполяция, а не факт, и здесь она названа.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    // Две одинаковые отметки в одном батче: вторая обязана оказаться
+    // повтором первой.
+    let response = post_bulk_response(
+        state.clone(),
+        &key,
+        r#"[{"entity":"/дом/ф.rs","type":"file","time":1755500000.0},
+            {"entity":"/дом/ф.rs","type":"file","time":1755500000.0}]"#,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = json_body(response).await;
+
+    assert_eq!(body["responses"][0][1], 201, "вставка объявлена не вставкой: {body}");
+    assert_eq!(body["responses"][1][1], 202, "повтор объявлен неуспехом: {body}");
+    assert_eq!(
+        body["responses"][1][0]["id"], "00000000-0000-4000-a000-000000000000",
+        "у повтора обязан быть нулевой идентификатор версии 4 — записи-то не было: {body}"
+    );
+    assert_ne!(
+        body["responses"][0][0]["id"], body["responses"][1][0]["id"],
+        "повтор получил идентификатор вставки: {body}"
+    );
+    assert_eq!(
+        body["responses"][1][0]["skip"], "Too many duplicate heartbeats.",
+        "повтор не объяснён полем skip: {body}"
+    );
+
+    // Без чтения базы весь тест доказывал бы только форму: ответ такой же
+    // формы получается и у реализации, которая не пишет ничего.
+    assert_eq!(stored_count(&state).await, 1, "повтор всё-таки записался");
+}
+
+#[tokio::test]
+async fn a_bad_element_fails_alone_without_failing_the_batch() {
+    // Это и есть весь смысл батча: один негодный элемент не должен
+    // отменять соседние. Реализация, отвечающая 400 на весь запрос,
+    // заставила бы плагин потерять годные отметки — `400` он выбрасывает,
+    // а не копит.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    let response = post_bulk_response(
+        state.clone(),
+        &key,
+        r#"[{"entity":"/дом/ф.rs","type":"file","time":1755500000.0},
+            {"entity":"","type":"file","time":1755500001.0}]"#,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = json_body(response).await;
+
+    assert_eq!(body["responses"][0][1], 201, "{body}");
+    assert_eq!(body["responses"][1][1], 400, "{body}");
+    assert!(
+        body["responses"][1][0]["errors"]["entity"].is_array(),
+        "отказ обязан прийти массивом под именем поля протокола: {body}"
+    );
+    assert!(
+        body["responses"][1][0]["id"].is_null(),
+        "у отвергнутого элемента не может быть идентификатора: {body}"
+    );
+
+    assert_eq!(stored_count(&state).await, 1, "негодный элемент утянул за собой соседа");
+}
+
+#[tokio::test]
+async fn a_mixed_batch_keeps_every_outcome_at_its_own_index() {
+    // Все три исхода разом, и негодный — **первым**. Отвергнутые элементы
+    // до хранилища не доезжают, поэтому позиция отметки в отчёте
+    // хранилища сдвинута относительно позиции в запросе; на однородном
+    // батче такая ошибка не видна вовсе, а клиенту сопоставлять элементы
+    // нечем, кроме индекса.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    let response = post_bulk_response(
+        state.clone(),
+        &key,
+        r#"[{"entity":"","type":"file","time":1755500000.0},
+            {"entity":"/дом/первый.rs","type":"file","time":1755500001.0},
+            {"entity":"/дом/первый.rs","type":"file","time":1755500001.0},
+            {"entity":"/дом/второй.rs","type":"file","time":1755500002.0}]"#,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = json_body(response).await;
+
+    assert_eq!(body["responses"].as_array().unwrap().len(), 4, "{body}");
+    assert_eq!(body["responses"][0][1], 400, "отказ съехал с нулевой позиции: {body}");
+    assert_eq!(body["responses"][1][1], 201, "вставка съехала с первой позиции: {body}");
+    assert_eq!(body["responses"][2][1], 202, "повтор съехал со второй позиции: {body}");
+    assert_eq!(body["responses"][3][1], 201, "вставка съехала с третьей позиции: {body}");
+
+    assert!(body["responses"][0][0]["errors"]["entity"].is_array(), "{body}");
+    assert_eq!(
+        body["responses"][2][0]["id"], "00000000-0000-4000-a000-000000000000",
+        "{body}"
+    );
+
+    // Идентификаторы двух вставок обязаны быть разными настоящими UUID:
+    // равные означали бы, что одну строку приписали двум отметкам.
+    let first = body["responses"][1][0]["id"].as_str().unwrap().to_owned();
+    let second = body["responses"][3][0]["id"].as_str().unwrap().to_owned();
+    assert!(uuid::Uuid::parse_str(&first).is_ok(), "{body}");
+    assert!(uuid::Uuid::parse_str(&second).is_ok(), "{body}");
+    assert_ne!(first, second, "{body}");
+
+    // И ровно те две отметки, что объявлены вставленными, лежат в базе.
+    let user = state.store.user_by_login("swrneko").await.unwrap().unwrap();
+    let stored = state
+        .store
+        .heartbeats_in_range(user.id, Micros::new(i64::MIN), Micros::new(i64::MAX - 1))
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 2, "{stored:?}");
+    let mut entities: Vec<String> = stored
+        .iter()
+        .map(|hb| state.store.resolve(hb.attrs.entity).unwrap().to_string())
+        .collect();
+    entities.sort();
+    assert_eq!(entities, vec!["/дом/второй.rs", "/дом/первый.rs"]);
+}
+
+#[tokio::test]
+async fn an_empty_batch_is_accepted_with_nothing_to_report() {
+    // Пустой батч ничем не плох — он просто ни о чём не просит. Отказ на
+    // нём был бы выдуманной ошибкой, а `202` с пустым `responses` — это
+    // тождественный случай отображения «n отметок на входе, n ответов на
+    // выходе».
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    let response = post_bulk_response(state.clone(), &key, "[]").await;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = json_body(response).await;
+    assert_eq!(body["responses"], serde_json::json!([]), "{body}");
+    assert_eq!(stored_count(&state).await, 0);
+}
+
+#[tokio::test]
+async fn a_batch_where_every_element_is_bad_is_still_accepted() {
+    // Негодность сообщается кодом элемента, и это место у неё
+    // единственное: верхний код, зависящий от содержимого, заставил бы
+    // клиента разветвляться на `202` против `400` с разными формами тела
+    // ещё до разбора. Порога «слишком много негодных» не существует.
+    //
+    // Два разных способа быть негодным: пустая сущность (проверка
+    // `to_store`, имя поля есть) и незнакомый вид (разбор упал, имени
+    // поля нет вовсе).
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    let response = post_bulk_response(
+        state.clone(),
+        &key,
+        r#"[{"entity":"","type":"file","time":1755500000.0},
+            {"entity":"/дом/ф.rs","type":"голограмма","time":1755500001.0}]"#,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = json_body(response).await;
+    assert_eq!(body["responses"][0][1], 400, "{body}");
+    assert_eq!(body["responses"][1][1], 400, "{body}");
+    assert!(body["responses"][0][0]["errors"]["entity"].is_array(), "{body}");
+    assert!(
+        body["responses"][1][0]["errors"]["non_field_errors"].is_array(),
+        "элементу без виноватого поля нужен ключ, у которого поля нет: {body}"
+    );
+    assert_eq!(stored_count(&state).await, 0);
+}
+
+#[tokio::test]
+async fn a_batch_over_the_limit_is_refused_whole_and_stores_nothing() {
+    // Предел — **наш**, а не WakaTime: спека называет 25 клеткой таблицы
+    // без ссылки и без пробы, и похоже это на размер порции клиента, а не
+    // на правило сервера. Довод записан у константы `MAX_BATCH`; здесь
+    // проверяется поведение на границе.
+    //
+    // Ровно предел проходит, предел плюс один отвергается целиком. Без
+    // первой половины тест зеленел бы и на реализации, отвергающей всё
+    // подряд.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    let batch = |count: i64, from: i64| {
+        let elements: Vec<String> = (0..count)
+            .map(|i| {
+                format!(
+                    r#"{{"entity":"/дом/ф.rs","type":"file","time":{}.0}}"#,
+                    from + i
+                )
+            })
+            .collect();
+        format!("[{}]", elements.join(","))
+    };
+
+    let at_limit = post_bulk_response(state.clone(), &key, &batch(1000, 1_755_500_000)).await;
+    assert_eq!(at_limit.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        json_body(at_limit).await["responses"].as_array().unwrap().len(),
+        1000
+    );
+    assert_eq!(stored_count(&state).await, 1000);
+
+    let over = post_bulk_response(state.clone(), &key, &batch(1001, 1_755_600_000)).await;
+    assert_eq!(
+        over.status(),
+        StatusCode::BAD_REQUEST,
+        "батч сверх предела обязан быть отказом всему запросу"
+    );
+    let body = json_body(over).await;
+    assert!(body.get("error").is_some(), "нет поля error: {body}");
+
+    // Ни одной отметки из отвергнутого батча: обработать первые
+    // `MAX_BATCH` и промолчать про хвост значило бы потерять отметки,
+    // не сказав об этом.
+    assert_eq!(
+        stored_count(&state).await,
+        1000,
+        "часть отвергнутого батча всё-таки записалась"
+    );
+}
+
+#[tokio::test]
+async fn a_wrong_method_on_the_bulk_path_is_a_json_error_too() {
+    // Маршрут батча обязан стоять **выше** `method_not_allowed_fallback`:
+    // тот раздаёт запасной обработчик уже зарегистрированным маршрутам, и
+    // добавленный ниже остался бы с пустым `405` axum'а — без тела, мимо
+    // обещания «ответ всегда JSON с полем error». Инвариант из
+    // `.claude/rules/ARCHITECTURE.md`, и ломали его не раз.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, key) = a_state_with_a_key(&dir).await;
+
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/users/current/heartbeats.bulk")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Basic {}", STANDARD.encode(key.to_string())),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let json = json_body(response).await;
+    assert!(json.get("error").is_some(), "нет поля error: {json}");
 }
